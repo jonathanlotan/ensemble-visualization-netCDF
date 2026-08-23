@@ -1,0 +1,13 @@
+data/
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.nc
+*.nc.bz2
+*.imsstats.json
+.DS_Store
+.pytest_cache/
+build/
+dist/
+*.spec

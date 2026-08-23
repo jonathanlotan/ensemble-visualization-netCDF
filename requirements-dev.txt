@@ -1,0 +1,4 @@
+-r requirements.txt
+netCDF4>=1.6      # the oracle that keeps nc3.py's byte math honest
+pytest>=8
+pytest-timeout>=2
