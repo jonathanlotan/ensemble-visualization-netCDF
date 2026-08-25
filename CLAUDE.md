@@ -978,3 +978,222 @@ the dew point pair yields temperature, humidity, `TD_2M` and `T-Td`.
 test's own directory — the fixtures use run `2026082300`, the same number the 407 MB
 reference file carries, so on a developer machine holding `data/` the combo assertions would
 otherwise pass or fail by accident (same reasoning as **G25** and **G30**).
+
+---
+
+# Release 4 — the wind map (wind barbs)
+
+Requested 2026-08-25: *an option for a wind map — it uses the u and v wind models and
+translates them into wind barbs shown on the map; the resolution of the barbs changes
+based on the zoom.* Sections 0 (byte math), R1 (the two-panel viewer), R2 (the one
+transform layer) and R3 (derived fields) are unchanged and still the contract. This is
+v2.md §5.2, built — including the two warnings it left behind (**G16** circular data,
+**G17** member correspondence).
+
+## R4.1 The shape of it
+
+The wind is one quantity read two ways, so one view carries both:
+
+```
+    U_10M ─┐                       ┌── speed = hypot(u, v) ──► image, colorbar,
+           ├──► WindView ──────────┤                           graph, readout, saving
+    V_10M ─┘   (derived.py)        └── u, v vectors ─────────► MapView barb layer
+                                                               (imsicon/barbs.py)
+```
+
+The colours are the **speed**, because the image, the 20 member curves and the six F4
+statistics all need a scalar — and the direction cannot be any of them. **G16**: direction
+is circular data, so a linear mean, min, max or percentile of degrees is wrong, and wrongly
+*plausible* (the linear mean of 350° and 10° is 180°; the answer is 360°). Direction
+therefore reaches the screen only as barbs, which are built from the vectors, and as a
+single value under the cursor in the status bar. There is no `WDIR_10M` map and no
+direction row in the readout: those are exactly the places a circular quantity would be
+silently averaged.
+
+| file | responsibility |
+|---|---|
+| `imsicon/barbs.py` | the glyph: WMO decomposition, staff/feather geometry in pixel space, the zoom→stride rule, `direction_from`. No Qt |
+| `imsicon/derived.py` | `WindView` — speed for every panel, `wind_vectors` for the barbs, `barb_label`, `direction_at` |
+| `imsicon/ui/mapview.py` | the barb layer: sample the visible grid, build, draw over the field |
+| `imsicon/dataset.py` | `sub_frame(t, rows, cols)` — read the cells a barb sample actually wants |
+| `imsicon/transform.py` | `WSPD_10M` in the units registry (m s-1 / kt / km h-1) |
+
+Getting to it, all four the same view: **Map shows → `WSPD_10M - wind speed + barbs`**
+(offered whenever `U_10M` and `V_10M` of the run are on disk), *Derived field…* →
+**Wind map**, `--derive wind`, and **Download… → Select what the wind map needs** (ticks
+both components — one of them alone is half a wind, the R3.11 lesson applied before it
+could be repeated).
+
+## R4.2 The glyph, and why it is built in pixels
+
+Half feather 5 kt, full feather 10 kt, pennant 50 kt, open circle for calm; the speed is
+rounded to the nearest 5 kt first, and a lone half feather is set in from the tip so it
+cannot be misread as a full one. **Barbs are always in knots**, whatever the Units combo
+is set to, because the glyph is *defined* in knots — a half feather cannot mean "5 of
+whatever the toolbar says". The map title says which wind the feathers are counting.
+
+Every glyph is built as **pixel offsets** from its grid point and converted to degrees at
+the end, using the data span of one screen pixel (`ViewBox.viewPixelSize`). Two things
+follow, and both are the reason:
+
+* a barb is the same size on screen at every zoom — its size is defined in pixels, so its
+  footprint in degrees shrinks as you zoom in, which is the opposite of what building it
+  in degrees would do;
+* the angle is right whatever the aspect. A ground direction `(u east, v north)` lands on
+  screen at `(u / (cos_lat · px), v / py)`, which reduces to being parallel to `(u, v)`
+  when the aspect lock of **G8** holds and self-corrects when it does not. A north wind
+  draws exactly vertical and an east wind exactly horizontal, at one glyph size.
+
+**The convention, pinned by test rather than by memory.** The staff points in the
+direction the wind comes FROM (`s = -(u, v)` normalised), and the feathers sit on the
+staff's **right** — with the staff drawn upward for a north wind, they extend east. That
+is matplotlib's `barbs` default and the northern-hemisphere convention; the southern flip
+is deliberately not offered, since this domain is 28–34.5 N. Getting the side backwards
+produces a map that looks completely normal and reads as the wrong hemisphere, which is
+why `test_the_feathers_sit_on_the_right_of_the_staff_northern_hemisphere_style` exists.
+
+## R4.3 Resolution follows the zoom
+
+This is the requested behaviour, and it is one rule: **the stride is whatever puts barbs
+about 34 px apart**, given how many pixels one grid cell spans right now.
+
+* `choose_stride(spacing_px)` snaps to a fixed ladder (1, 2, 3, 4, 5, 6, 8, 10, 12, …).
+  Snapping matters: a stride creeping 7, 8, 9, 10 through a zoom would reshuffle every
+  barb on the map at each step.
+* `sample_indices` is anchored to the **global** lattice (`0, stride, 2·stride, …`), not
+  to the window, so a pan slides the same points across the screen instead of picking a
+  different set of grid cells every frame.
+* The sample is clipped to the visible window plus a cell of margin — at stride 1 a
+  261×161 grid is 42,000 glyphs, and a window showing a tenth of the domain must not pay
+  for the other nine tenths.
+
+Measured on the real grid (261×161, 20 members, a 1500×880 window):
+
+| longitude on screen | stride | barbs drawn |
+|---|---|---|
+| 4.0° (whole domain) | 8 | 378 |
+| 2.0° | 4 | 414 |
+| 1.0° | 2 | 475 |
+| 0.5° | 1 | 475 |
+| 0.25° | 1 | 195 |
+| 0.06° | 1 | 35 |
+
+## R4.4 Measured, not assumed
+
+On this machine, where **a plain field's aggregated map measures 7.2 ms against the
+2.12 ms recorded in R3.5** — i.e. it is about 3× slower than the machine v2 and v3 were
+measured on, so divide by three to compare with the tables above:
+
+| operation | ms |
+|---|---|
+| plain field, aggregated map (R3.5 recorded 2.12) | 7.21 |
+| wind speed, aggregated map | 12.76 |
+| **wind vectors, whole grid, mean** | **10.79** |
+| **wind vectors, whole grid, max** | **19.51** |
+| wind vectors, sampled 33×21, mean | 0.41 |
+| wind vectors, sampled 33×21, max | 0.36 |
+| wind vectors, one point (the status bar) | 0.08 |
+| barb geometry, 693 glyphs (2,942 strokes) | 0.66 |
+| one barb redraw during a zoom or pan | ~2 |
+| `refresh_map` with barbs / without | 16.8 / 13.8 |
+
+The two bold rows are why `MapView` is handed a **source** `f(rows, cols)` rather than two
+full-grid arrays (**G32**): the barbs throw away all but a few hundred of the 42,000 grid
+points, and computing them anyway costs more of a frame than everything else on the map put
+together.
+
+## R4.5 Which wind the barbs show — it is not the same for every aggregation
+
+Aggregating u and v independently is only right for the mean, so the barbs follow what the
+colours under them are showing:
+
+| Map shows | barbs | why |
+|---|---|---|
+| `member N` | that member's vector | |
+| `mean` | the mean **vector** (**G16**) | its length is *not* the mean speed the colours show: `norm(mean(V)) ≤ mean(norm(V))` by Jensen, and the gap is exactly the ensemble's disagreement about direction — barbs all pointing one way under a strong colour means the members agree |
+| `max` / `min` / `median` | the vector of the member the colour came from, per cell | `max(u)` paired with `max(v)` would invent a wind no member forecast |
+| `spread` | the mean vector, and the title says so | a max-minus-min has no member and no direction of its own |
+
+The title carries it — `wind 10m [m s-1] - Ensemble mean - … | barbs (kt): ensemble mean
+vector` — because a map that shows the mean speed and the mean vector at once has to say
+which is which.
+
+**Refusals**, both inherited from R3's pairing rules and both re-tested here: components
+whose `history` gives a different member order are refused (**G17** — pairing `u[i]` with
+another member's `v[i]` gives a wind that never existed and looks entirely ordinary), and a
+component whose units are not `m s-1` is refused rather than converted (a `km h-1` file
+would draw every barb at 3.6× the real speed).
+
+**Saving.** `Save field…` / `--write` writes `WSPD_10M` in **m s-1**, its canonical space,
+so it reopens as an ordinary speed field with the registry's kt / km h-1 options. It
+reopens *without* barbs, honestly: a speed file no longer knows which way the wind was
+blowing, and the UI decides whether to draw barbs by asking the view for vectors.
+
+## R4.6 Gotchas found while building v4
+
+* **G32 — a full-grid aggregation to draw a few hundred glyphs is the whole frame budget.**
+  `wind_vectors` over 20×261×161 measures 10.8 ms (mean) and 19.5 ms (max) against a
+  16.7 ms frame; the same values for the points actually drawn measure 0.4 ms. So the map
+  is given a **source** rather than arrays, and `EnsembleFile.sub_frame` reads only the
+  sampled cells instead of copying 3.4 MB per component. The test that keeps this honest
+  is `test_sampling_a_subgrid_gives_exactly_the_same_vectors_as_the_whole_one`: the
+  sampling must be an optimisation, never a different answer.
+* **G33 — a programmatic `setRange` in a UI test is silently undone by the domain refit.**
+  `MapView` keeps re-fitting the whole domain until `_user_zoomed` is set, and that flag is
+  only set by `sigRangeChangedManually` — a real wheel or drag. A test that sets a range
+  directly gets it reverted by the next layout pass, so a zoom assertion reads the *domain*
+  stride and passes or fails by accident. Tests set `map._user_zoomed = True` first. (Same
+  family as **G25** and **G30**: the harness must not silently differ from the app.)
+* **G34 — `np.rint` rounds halves to even, which is the wrong rounding for a barb.**
+  12.5 kt would draw as 10 kt and 17.5 kt as 20 kt — a half feather appearing and
+  disappearing depending on which side of even the value fell. `barb_counts` uses
+  `floor(x + 0.5)`.
+* **A `QGraphicsPathItem` added to a ViewBox lives in data coordinates**, so a pen width of
+  1.2 would be 1.2 *degrees* — five times the width of the domain. The pennant layer relies
+  on pyqtgraph's `mkPen` defaulting to a cosmetic pen. It is also added with
+  `ignoreBounds=True`, along with the barb polylines: geometry computed *from* the view
+  range must never be able to feed back into the range that produced it.
+
+## R4.7 Verified
+
+`364 passed, 30 skipped` (283 from R1+v2+v3, unchanged and green, + 81 new). The skips are
+the tests needing the 407 MB reference file or `netCDF4`, neither present here.
+
+| what | where | verified by |
+|---|---|---|
+| the glyph | `barbs.py` | `test_barbs.py` (40) — the WMO table from 0 to 100 kt, half-up rounding, calm circle, lone half feather set in, staff into the wind for all four cardinals, feathers on the right, constant pixel size across a 160× zoom range, a north wind vertical and an east wind horizontal, NaN winds dropped, a degenerate view returning nothing instead of raising |
+| the view | `derived.WindView` | `test_wind.py` (23) — speed is `hypot(u, v)` everywhere, units rescale the cached range instead of rescanning, barbs stay in knots when the colours do not, `max`/`min`/`median` draw a real member's vector at every cell, the mean barb is never longer than the mean speed (Jensen), 350°+10° averages north not south (**G16**), scrambled member order refused (**G17**), `km h-1` components refused, written and reopened in m s-1 |
+| the zoom rule | `ui/mapview.py` | `test_ui_wind.py` (18) — on the real widgets: strides fall 8→4→2→1 as the view narrows, the count stays bounded, panning does not reshuffle the lattice, a glyph stays `SHAFT_PX` long in pixels while shrinking in degrees, unticking removes the barbs and leaves the colours, scrubbing time turns the staffs, switching to a plain field takes the barbs down with it |
+
+End-to-end under `QT_QPA_PLATFORM=offscreen`, on a 4-step file at the real 261×161×20
+resolution: `--derive wind` renders speed + barbs over the bundled coastline; `--units kt`
+moves the map, colorbar, y axis, readout and status bar together while the barbs stay in
+knots; `--derive wind --write` produces a `WSPD_10M.nc` that reopens as an ordinary speed
+field; and `--derive wind` with only `U_10M` beside it exits **2** with one sentence.
+
+## R4.8 Deliberately not done
+
+* **An on-map key.** The barb scale lives in the *Wind barbs* tooltip and the dialog rather
+  than in a corner of the map. A drawn key is a good idea and a separate one.
+* **Barbs over another field** (wind over CAPE, say). The plumbing is duck-typed — any view
+  exposing `wind_vectors` gets barbs — so this is a pairing question, not a drawing one:
+  it needs a second view alongside the one on screen, which is v2.md 6.1's shared-cursor
+  workspace.
+* **A direction map, and direction statistics in the readout.** Refused on purpose:
+  **G16** says min / max / P10 / P90 of a direction are not meaningful, and a panel with
+  four `n/a (circular)` rows teaches less than barbs do.
+* **Streamlines and a gust overlay** (`VMAX_10M` is already per-interval and needs no
+  de-accumulation — **G14** — so it would drop straight in as a second layer).
+
+## R4.9 Running it
+
+```bash
+venv/bin/python -m imsicon                                    # Map shows -> WSPD_10M
+venv/bin/python -m imsicon --derive wind data/ICON_ENS_..._U_10M.nc
+venv/bin/python -m imsicon --derive wind --units kt --screenshot wind.png <U_10M file>
+venv/bin/python -m imsicon --derive wind --write out/WSPD.nc  <U_10M file>
+```
+
+Wheel-zoom the map and the barbs fill in; zoom out and they thin. **Wind barbs** on
+toolbar row 2 turns them off without losing the speed map, and hovering the map reads
+`31.250°N  35.000°E   17.8 m s-1   from 289°`.

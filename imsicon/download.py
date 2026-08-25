@@ -92,6 +92,9 @@ GROUPS = tuple(dict.fromkeys(p.group for p in PRODUCTS))
 
 # The two fields the dew point is derived from (derived.dew_point).
 DEW_POINT_FIELDS = ('T_2M', 'RELHUM_2M')
+# ...and the two the wind map is (derived.wind). Both pairs are useless one file at a
+# time, which is why the dialog offers a one-click tick for each.
+WIND_FIELDS = ('U_10M', 'V_10M')
 
 
 def product_label(field):

@@ -156,6 +156,12 @@ class DownloadDialog(QtWidgets.QDialog):
             'humidity, the dew point TD_2M and the depression T-Td.')
         self.dewpoint_button.clicked.connect(self._select_dew_point)
         row.addWidget(self.dewpoint_button)
+        self.wind_button = QtWidgets.QPushButton('Select what the wind map needs')
+        self.wind_button.setToolTip(
+            'Ticks U_10M and V_10M, the two components the wind map is built from. One '
+            'of them on its own is half a wind: the barbs need both.')
+        self.wind_button.clicked.connect(self._select_wind)
+        row.addWidget(self.wind_button)
         outer.addLayout(row)
 
         self.field_list = QtWidgets.QTreeWidget()
@@ -272,8 +278,14 @@ class DownloadDialog(QtWidgets.QDialog):
                 for i in range(self.field_list.topLevelItemCount())]
 
     def _select_dew_point(self):
+        self._select_fields(download.DEW_POINT_FIELDS)
+
+    def _select_wind(self):
+        self._select_fields(download.WIND_FIELDS)
+
+    def _select_fields(self, fields):
         for item in self._items():
-            if item.text(1) in download.DEW_POINT_FIELDS:
+            if item.text(1) in fields:
                 item.setCheckState(0, QtCore.Qt.CheckState.Checked)
 
     def selected(self):

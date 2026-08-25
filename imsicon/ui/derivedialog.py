@@ -1,4 +1,4 @@
-"""Choosing a derived field: the dew point, or the difference between two fields.
+"""Choosing a derived field: the dew point, the wind map, or the difference of two fields.
 
 The dialog only *chooses*. Opening the files it names can mean decompressing 262 MB, so
 `MainWindow` does that on a worker thread -- keeping every long operation in one place
@@ -18,15 +18,20 @@ for _product in download.PRODUCTS:
     FIELD_ORDER.append(_product.field)
     if _product.field == 'T_S':
         FIELD_ORDER.append(derived.DEW_POINT_FIELD)
+    if _product.field == 'V_10M':
+        FIELD_ORDER.append(derived.WIND_FIELD)
 
 
 def field_sort_key(field):
     return (FIELD_ORDER.index(field) if field in FIELD_ORDER else len(FIELD_ORDER), field)
 
 
+WIND_FIELDS = {role: field for role, (field, _units) in derived.WIND_INPUTS.items()}
+
 DEW_POINT = 'dewpoint'
 DEPRESSION = 'depression'
 DIFFERENCE = 'difference'
+WIND = 'wind'
 
 
 class DerivedRequest:
@@ -42,7 +47,7 @@ class DerivedRequest:
 
 
 class DerivedDialog(QtWidgets.QDialog):
-    """Pick a dew point / depression / A-B difference from the fields on disk."""
+    """Pick a dew point / depression / wind map / A-B difference from the files on disk."""
 
     def __init__(self, parent=None, near=None, run=None, roots=None):
         super().__init__(parent)
@@ -58,6 +63,7 @@ class DerivedDialog(QtWidgets.QDialog):
         layout.addWidget(self._build_run_row())
         self.kind_group = QtWidgets.QButtonGroup(self)
         layout.addWidget(self._build_dewpoint_box())
+        layout.addWidget(self._build_wind_box())
         layout.addWidget(self._build_difference_box())
 
         self.status = QtWidgets.QLabel('')
@@ -118,6 +124,25 @@ class DerivedDialog(QtWidgets.QDialog):
         self.inputs_label.setStyleSheet('color:#666;')
         self.inputs_label.setWordWrap(True)
         form.addWidget(self.inputs_label)
+        return box
+
+    def _build_wind_box(self):
+        box = QtWidgets.QGroupBox('From the wind components')
+        form = QtWidgets.QVBoxLayout(box)
+        self.wind_radio = QtWidgets.QRadioButton(
+            'Wind map (U_10M + V_10M) - wind speed, with wind barbs for the direction')
+        self.kind_group.addButton(self.wind_radio, 3)
+        form.addWidget(self.wind_radio)
+        note = QtWidgets.QLabel(
+            'The colours are the speed; the barbs are the direction, in knots (half '
+            'feather 5, full 10, pennant 50). They thin out or fill in as you zoom.')
+        note.setStyleSheet('color:#666;')
+        note.setWordWrap(True)
+        form.addWidget(note)
+        self.wind_inputs_label = QtWidgets.QLabel('')
+        self.wind_inputs_label.setStyleSheet('color:#666;')
+        self.wind_inputs_label.setWordWrap(True)
+        form.addWidget(self.wind_inputs_label)
         return box
 
     def _build_difference_box(self):
@@ -188,6 +213,15 @@ class DerivedDialog(QtWidgets.QDialog):
         return ([self.available[(self.run, 'T_2M')],
                  self.available[(self.run, 'RELHUM_2M')]], None)
 
+    def _wind_inputs(self):
+        """The two paths the wind map needs, or None with a reason."""
+        fields = [WIND_FIELDS[role] for role in ('zonal', 'meridional')]
+        missing = [field for field in fields if (self.run, field) not in self.available]
+        if missing:
+            return None, (f'{" and ".join(missing)} for run {self.run} is not on disk. '
+                          'Download it first (Download from IMS...), then come back.')
+        return [self.available[(self.run, field)] for field in fields], None
+
     def _refresh(self):
         """Keep OK honest: it is only enabled when the choice can actually be built."""
         kind = self.kind()
@@ -196,6 +230,11 @@ class DerivedDialog(QtWidgets.QDialog):
             paths, problem = self._dew_point_inputs()
             self.inputs_label.setText(
                 'Needs T_2M and RELHUM_2M from this run' if problem else
+                'Using ' + ' + '.join(p.name for p in paths))
+        elif kind == WIND:
+            paths, problem = self._wind_inputs()
+            self.wind_inputs_label.setText(
+                'Needs U_10M and V_10M from this run' if problem else
                 'Using ' + ' + '.join(p.name for p in paths))
         else:
             a, b = self.a_combo.currentData(), self.b_combo.currentData()
@@ -211,7 +250,8 @@ class DerivedDialog(QtWidgets.QDialog):
         ok.setEnabled(problem is None)
 
     def kind(self):
-        return {0: DEW_POINT, 1: DEPRESSION, 2: DIFFERENCE}[self.kind_group.checkedId()]
+        return {0: DEW_POINT, 1: DEPRESSION, 2: DIFFERENCE,
+                3: WIND}[self.kind_group.checkedId()]
 
     def request(self):
         """-> DerivedRequest, or None if the dialog was cancelled or cannot be satisfied."""
@@ -223,6 +263,10 @@ class DerivedDialog(QtWidgets.QDialog):
             title = ('Dew point TD_2M' if kind == DEW_POINT
                      else 'Dew point depression T_2M - TD_2M')
             return DerivedRequest(kind, paths, title)
+        if kind == WIND:
+            paths, problem = self._wind_inputs()
+            return None if problem else DerivedRequest(
+                kind, paths, 'Wind U_10M + V_10M')
         a, b = self.a_combo.currentData(), self.b_combo.currentData()
         if not a or not b or a == b or not derived.units_look_compatible(a, b):
             return None
@@ -248,6 +292,8 @@ def build(request, opened=None):
         view = derived.dew_point(*views)
     elif request.kind == DEPRESSION:
         view = derived.dew_point_depression(*views)
+    elif request.kind == WIND:
+        view = derived.wind(*views)
     else:
         view = derived.difference(*views)
     # Stamped here rather than at each call site, so the "Map shows" combo names what is
