@@ -919,3 +919,62 @@ fixture — it loads, spans the whole domain, keeps disputed lines separate, sur
 deleted or corrupted — plus the z-order, the halo contrast and the dashed styling on the
 real widgets. `tests/test_ui_derived.py` grew the field-combo cases, including the one that
 caught the `--derive` labelling bug.
+
+## R3.11 Follow-up — every downloaded map is selectable (2026-08-25)
+
+Two things reported after the R3.10 review: downloading more than three maps left only one
+of them reachable, and *Select what the dew point needs* fetched `T_2M` and `RELHUM_2M` but
+the viewer then offered the temperature and the dew point without the humidity.
+
+Both were the same gap. **Map shows** listed exactly three things — the open file, `TD_2M`
+and `T-Td` — so every other map of the run, however it got onto disk, could only be reached
+through the file dialog. The list is now built from what is actually on disk:
+
+* `_field_entries` scans the run and offers **every field it finds**, keyed `file:<FIELD>`,
+  followed by the derived entries as before. Five downloaded maps give seven entries;
+  the dew point pair gives four (`T_2M`, `RELHUM_2M`, `TD_2M`, `T-Td`).
+* Entries keep **catalogue order** (`derivedialog.field_sort_key`) whichever field is open,
+  so picking one does not reshuffle the list under the cursor. The open field is always the
+  `base` entry, wherever it sits in that order.
+* Names come from the download catalogue (`TOT_PREC - Precipitation - total`), which
+  answers "what is this map" **without opening the file** — most of the list is still
+  compressed, and expanding one to read its `long_name` costs 16 s. A field the catalogue
+  has never heard of (a `TD_2M` written by *Save field…*) falls back to `EXTRA_FIELD_LABELS`
+  and then to its own header.
+* Picking a file-backed entry reuses the view if this window has already mapped it (so
+  flipping between two fields of a run is free after the first look at each), decompresses
+  it on the `Open…` worker if it is still a `.nc.bz2`, and otherwise loads it. The
+  selection is put back if that fails or is cancelled — the combo moves the instant the
+  user picks an entry, so a failed open would otherwise name a field the map is not showing.
+* **One run only.** Another run shares neither the valid times nor, in principle, the grid,
+  and `check_pairable` already refuses to mix them (R3.6).
+
+**G31 — discovery must remember where the user opened from, not just where the open file
+is.** `search_roots(base_ds.path)` looks beside the open file — but a `.nc.bz2` is expanded
+into the cache, so the moment the user picked a downloaded map, "beside the open file"
+became the cache directory and the rest of the run vanished from the list. `MainWindow`
+now keeps `_roots`, the last 8 directories it has been pointed at, newest first, and
+`_search_roots()` puts them ahead of `ingest.search_roots`. The *Derived field…* dialog
+takes the same list (`DerivedDialog(roots=...)`) so the two selectors cannot disagree about
+which files exist. Caught by `test_a_compressed_map_is_expanded_when_it_is_chosen`, which
+fails on the old one-root scan.
+
+Also: the combo sizes to its contents (the labels are longer now, and the list is rebuilt
+after first show, which the default policy does not measure), and a multi-file download
+reports `downloaded 4 maps (CAPE_ML, TOT_PREC, T_2M, RELHUM_2M) - choose between them under
+"Map shows"` rather than a list of file names that says nothing about where they went.
+
+### Verified
+
+`283 passed, 30 skipped` here (the count differs from R3.10's because `netCDF4` is not
+installed in this environment, so its oracle tests skip). Seven new cases in
+`tests/test_ui_derived.py`: five maps give seven entries in catalogue order; picking one
+moves the map, the status bar and the Rate control to that field; switching back reuses the
+already-open view; another run's files are not offered; a compressed map is expanded on
+selection *and the rest of the run survives it*; an unreadable map puts the label back; and
+the dew point pair yields temperature, humidity, `TD_2M` and `T-Td`.
+
+`tests/test_ui_derived.py` also grew an autouse guard that pins `ingest.search_roots` to the
+test's own directory — the fixtures use run `2026082300`, the same number the 407 MB
+reference file carries, so on a developer machine holding `data/` the combo assertions would
+otherwise pass or fail by accident (same reasoning as **G25** and **G30**).

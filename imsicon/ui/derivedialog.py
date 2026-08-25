@@ -44,11 +44,14 @@ class DerivedRequest:
 class DerivedDialog(QtWidgets.QDialog):
     """Pick a dew point / depression / A-B difference from the fields on disk."""
 
-    def __init__(self, parent=None, near=None, run=None):
+    def __init__(self, parent=None, near=None, run=None, roots=None):
         super().__init__(parent)
         self.setWindowTitle('Derived field')
         self.setMinimumWidth(560)
-        self.available = ingest.scan_for_fields(ingest.search_roots(near))
+        # `roots` lets the window hand over everywhere it has looked, so this dialog and
+        # the "Map shows" combo never disagree about which files exist.
+        self.available = ingest.scan_for_fields(roots if roots is not None
+                                                else ingest.search_roots(near))
         self.run = run or self._default_run()
 
         layout = QtWidgets.QVBoxLayout(self)
