@@ -161,22 +161,7 @@ class FieldView:
         `spread` (a max-min DIFFERENCE, where the affine offset must cancel -- G15) and a
         hypothetical negative scale, which would swap max and min.
         """
-        stack = self.ens_frame(t)
-        if np.isnan(stack).all():
-            # The window edge of a rate view: an all-NaN frame is intended, so do not
-            # let numpy warn about it on every redraw.
-            return np.full(stack.shape[1:], np.nan, dtype=np.float32)
-        if mode == 'mean':
-            return np.nanmean(stack, axis=0)
-        if mode == 'max':
-            return np.nanmax(stack, axis=0)
-        if mode == 'min':
-            return np.nanmin(stack, axis=0)
-        if mode == 'median':
-            return np.nanmedian(stack, axis=0)
-        if mode == 'spread':
-            return np.nanmax(stack, axis=0) - np.nanmin(stack, axis=0)
-        raise ValueError(f'unknown aggregation {mode!r}')
+        return transform.aggregate(self.ens_frame(t), mode)
 
     def series(self, iy, ix):
         raw = self.raw.series(iy, ix)
@@ -192,6 +177,12 @@ class FieldView:
     @property
     def long_name(self):
         return self.raw.long_name
+
+    @property
+    def display_name(self):
+        """What the map title and the y axis call this. A derived view overrides it --
+        `T-Td` reads better than `T_2M-TD_2M` -- so every caller can just ask for it."""
+        return self.field
 
     @property
     def transform_signature(self):
@@ -219,6 +210,21 @@ class FieldView:
         lo, hi = float(cached[0]), float(cached[1])
         return (self._units.apply_delta_range(lo, hi) if self.is_difference_view
                 else self._units.apply_range(lo, hi))
+
+    # ---- saving: for a file-backed field, what you see is what you save ---------------
+    @property
+    def canonical_units(self):
+        """`ncwrite.write_canonical` writes a plain field exactly as displayed.
+
+        A derived view overrides this to name a unit-independent space of its own (Kelvin
+        for the dew point). A field read from a file has no such space worth preferring --
+        saving a rate view back in its cumulative form would be a different quantity, not
+        a different unit -- so the honest answer is the one on screen.
+        """
+        return self.units
+
+    def canonical_ens_frame(self, t):
+        return self.ens_frame(t)
 
     def label_for(self, t):
         """A rate is BACKWARD-looking; a reader who takes it as instantaneous is off by

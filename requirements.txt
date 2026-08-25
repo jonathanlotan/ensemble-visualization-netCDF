@@ -1,3 +1,11 @@
 numpy>=1.26
 PySide6>=6.6
 pyqtgraph>=0.13
+
+# Optional -- the built-in downloader only (Download... in the toolbar). The viewer opens
+# and derives fields without them, and they are imported lazily so a frozen build that
+# leaves them out simply reports what to install.
+# G7: the IMS server speaks NTLM/Negotiate, so plain HTTP Basic auth returns 401.
+# requests>=2.31
+# requests-ntlm>=1.2
+# keyring>=24        # store the IMS password in the OS keychain, never in QSettings

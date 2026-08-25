@@ -1,9 +1,9 @@
 -r requirements.txt
-netCDF4>=1.6      # the oracle that keeps nc3.py's byte math honest
+netCDF4>=1.6      # the oracle that keeps nc3.py's byte math -- and ncwrite.py's -- honest
 pytest>=8
 pytest-timeout>=2
 
-# tools/sniff_headers.py only (dev-only; the app itself needs no HTTP stack).
-# G7: the IMS server speaks NTLM/Negotiate, so plain requests auth returns 401.
-# requests>=2.31
-# requests-ntlm>=1.2
+# The downloader's own dependencies, needed to run it for real (not to run its tests:
+# tests/test_download.py drives a fake session and needs no HTTP stack).
+requests>=2.31
+requests-ntlm>=1.2
