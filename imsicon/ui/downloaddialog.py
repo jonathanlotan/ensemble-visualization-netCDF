@@ -150,8 +150,10 @@ class DownloadDialog(QtWidgets.QDialog):
         row.addWidget(self.run_combo)
         row.addStretch(1)
         self.dewpoint_button = QtWidgets.QPushButton('Select what the dew point needs')
-        self.dewpoint_button.setToolTip('Ticks T_2M and RELHUM_2M, the two fields the '
-                                        'derived dew point is computed from.')
+        self.dewpoint_button.setToolTip(
+            'Ticks T_2M and RELHUM_2M, the two fields the derived dew point is computed '
+            'from. With both on disk the viewer offers four maps: the temperature, the '
+            'humidity, the dew point TD_2M and the depression T-Td.')
         self.dewpoint_button.clicked.connect(self._select_dew_point)
         row.addWidget(self.dewpoint_button)
         outer.addLayout(row)

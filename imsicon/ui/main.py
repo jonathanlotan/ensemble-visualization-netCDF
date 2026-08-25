@@ -4,7 +4,7 @@ from pathlib import Path
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .. import derived, geo, ingest, nc3, ncwrite, transform
+from .. import derived, download, geo, ingest, nc3, ncwrite, transform
 from ..dataset import EnsembleFile, member_stats
 from ..fieldview import FieldView
 from . import derivedialog, downloaddialog
@@ -22,6 +22,35 @@ COLORMAPS = ['turbo', 'viridis', 'inferno', 'plasma', 'magma', 'CET-L17',
              'CET-D1A', 'CET-D9', 'CET-D3']
 DIVERGING_DEFAULT = 'CET-D1A'
 SEQUENTIAL_DEFAULT = 'turbo'
+
+
+# Menu names for the fields the download catalogue does not carry. A `TD_2M` written by
+# "Save field..." opens like any other file, and listing it as a bare code would make the
+# one map the user built by hand the only one in the menu without a name.
+EXTRA_FIELD_LABELS = {derived.DEW_POINT_FIELD: 'dew point'}
+
+
+def _field_label(field, view=None):
+    """`FIELD - what it is`, for the Map shows combo.
+
+    The catalogue answers this without opening the file, which matters: most of the maps
+    in the list are still compressed on disk and expanding one costs 16 s. A file whose
+    field the catalogue has never heard of falls back to its own header once it is open.
+    """
+    product = download.BY_FIELD.get(field)
+    if product is not None:
+        return f'{field} - {product.label}'[:60]
+    if field in EXTRA_FIELD_LABELS:
+        return f'{field} - {EXTRA_FIELD_LABELS[field]}'[:60]
+    if view is not None:
+        return f'{view.display_name} - {view.long_name}'[:60]
+    return field
+
+
+def _field_of(path):
+    """The FIELD in an `ICON_ENS_<run>_<FIELD>.nc[.bz2]` name, else the name itself."""
+    match = ingest.RUN_FILE_RE.match(Path(path).name)
+    return match.group('field') if match else Path(path).name
 
 
 def _finite_max(frame, fallback):
@@ -134,7 +163,12 @@ class MainWindow(QtWidgets.QMainWindow):
         # The view that came from a file. A derived map replaces `ds` but not this, so the
         # "Map shows" combo can switch back without reopening 407 MB.
         self.base_ds = None
-        self._field_requests = {}
+        self._field_requests = {}       # derived entries -> DerivedRequest
+        self._field_files = {}          # file-backed entries -> Path
+        # Directories this window has been pointed at, newest first. A decompressed file
+        # lives in the cache, so once the user switches to one, the directory they opened
+        # from would otherwise be forgotten -- and the rest of the run with it.
+        self._roots = []
         self._progress = None
         # Every file-backed view this window has opened, so building a derived field on
         # the field already on screen does not map another 407 MB of the same bytes.
@@ -266,6 +300,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # not a one-off setup step.
         self.field_combo = QtWidgets.QComboBox()
         self.field_combo.setMinimumWidth(150)
+        # The list is rebuilt whenever a file is opened and a run can hold 15 maps, so it
+        # has to widen to whatever is in it -- the default only measures once, at first show.
+        self.field_combo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
         self.field_combo.currentIndexChanged.connect(self._on_field_changed)
         tb.addWidget(self.field_combo)
 
@@ -342,6 +380,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._error(f'File not found:\n{path}')
             return
         self.settings.setValue('last_dir', str(path.parent))
+        self._remember_root(path)
         if ingest.is_compressed(path):
             self._start_decompress(path)
         else:
@@ -367,14 +406,37 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._progress is not None:
             self._progress.reset()
             self._progress = None
-        if target is not None:
-            self._load(Path(target))
+        if target is None:
+            self._sync_field_combo()        # cancelled: name the field still on screen
+            return
+        self._load(Path(target))
 
     def _on_decompress_failed(self, message):
         if self._progress is not None:
             self._progress.reset()
             self._progress = None
         self._error(f'Could not decompress the file:\n{message}')
+        self._sync_field_combo()
+
+    def _remember_root(self, path):
+        """Note the directory a file came from, newest first.
+
+        Capped, so a long session cannot turn the field scan into a walk of everywhere the
+        user has ever browsed.
+        """
+        directory = Path(path).parent
+        self._roots = [directory] + [r for r in self._roots if r != directory]
+        del self._roots[8:]
+
+    def _search_roots(self):
+        """Where to look for the other maps of this run.
+
+        `ingest.search_roots` covers the caches, ./data and whatever is beside the open
+        file; the directories the user actually opened from come first, and stay in the
+        list after a `.nc.bz2` has been expanded into the cache.
+        """
+        near = self.base_ds.path if self.base_ds is not None else None
+        return list(dict.fromkeys(self._roots + ingest.search_roots(near)))
 
     def _load(self, path):
         try:
@@ -383,9 +445,11 @@ class MainWindow(QtWidgets.QMainWindow):
             ds = FieldView(raw, units_label=saved)
         except nc3.UnsupportedFormat as exc:
             self._error(str(exc))
+            self._sync_field_combo()
             return
         except Exception as exc:
             self._error(f'Could not open {Path(path).name}:\n{exc}')
+            self._sync_field_combo()
             return
         self.opened[Path(path)] = ds
         self.base_ds = ds
@@ -439,23 +503,44 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---- the "Map shows" field selector -------------------------------------------
     def _field_entries(self):
-        """-> [(key, label, request)] for the Map shows combo. `base` has no request.
+        """-> [(key, label, target)] for the Map shows combo.
 
-        The derived entries are checked against the files actually on disk rather than
-        offered blindly, because a menu entry that always fails is worse than one that is
-        not there. Whatever is currently on screen is always listed, even when it is an
-        ad-hoc `A - B` the standard entries do not cover -- otherwise the combo would name
-        one field while the map shows another.
+        **Every map of this run that is on disk is listed**, not only the file that was
+        opened. Downloading four maps and then being able to look at one of them is not a
+        viewer, and "open the other one again" is a file dialog the user should not have
+        to visit to compare two fields of the same forecast.
+
+        `target` is the `Path` of a file-backed entry (key `file:<FIELD>`), the
+        `DerivedRequest` of a computed one, or None for the field already on screen
+        (key `base`). The derived entries are checked against the files actually on disk
+        rather than offered blindly, because a menu entry that always fails is worse than
+        one that is not there. Whatever is currently on screen is always listed, even when
+        it is an ad-hoc `A - B` the standard entries do not cover -- otherwise the combo
+        would name one field while the map shows another.
+
+        One run only: fields of another run share neither the valid times nor, in
+        principle, the grid, so offering them here would be offering a comparison the
+        rest of the app is careful to refuse (v3 R3.6).
         """
         if self.base_ds is None:
             return []
-        entries = [('base',
-                    f'{self.base_ds.display_name} - {self.base_ds.long_name}'[:60], None)]
         run = f'{self.base_ds.run_init:%Y%m%d%H}'
-        available = ingest.scan_for_fields(ingest.search_roots(self.base_ds.path))
+        available = ingest.scan_for_fields(self._search_roots())
+        on_disk = {field: path for (found, field), path in available.items()
+                   if found == run}
+        # The open file itself may sit somewhere the scan does not look.
+        on_disk.setdefault(self.base_ds.field, self.base_ds.path)
+
+        entries = []
+        for field in sorted(on_disk, key=derivedialog.field_sort_key):
+            if field == self.base_ds.field:
+                entries.append(('base', _field_label(field, self.base_ds), None))
+            else:
+                entries.append((f'file:{field}', _field_label(field), on_disk[field]))
+
         needed = [derived.DEW_POINT_INPUTS[role][0] for role in ('temperature', 'humidity')]
-        if all((run, field) in available for field in needed):
-            paths = [available[(run, field)] for field in needed]
+        if all(field in on_disk for field in needed):
+            paths = [on_disk[field] for field in needed]
             for kind, label in ((derivedialog.DEW_POINT,
                                  f'{derived.DEW_POINT_FIELD} - dew point'),
                                 (derivedialog.DEPRESSION,
@@ -464,7 +549,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                 derivedialog.DerivedRequest(kind, paths, label)))
 
         current = getattr(self.ds, 'derived_kind', 'base')
-        if current != 'base' and not any(key == current for key, _l, _r in entries):
+        if current != 'base' and not any(key == current for key, _l, _t in entries):
             entries.append((current,
                             f'{self.ds.display_name} - {self.ds.long_name}'[:60],
                             getattr(self.ds, 'derived_request', None)))
@@ -474,14 +559,21 @@ class MainWindow(QtWidgets.QMainWindow):
         """Rebuild the field list and select whatever is actually on screen."""
         current = getattr(self.ds, 'derived_kind', 'base')
         entries = self._field_entries()
-        self._field_requests = {key: request for key, _label, request in entries}
+        self._field_requests = {key: target for key, _label, target in entries
+                                if not key.startswith('file:')}
+        self._field_files = {key: target for key, _label, target in entries
+                             if key.startswith('file:')}
         self.field_combo.blockSignals(True)
         self.field_combo.clear()
-        for key, label, _request in entries:
+        for key, label, _target in entries:
             self.field_combo.addItem(label, key)
         self.field_combo.setCurrentIndex(max(0, self.field_combo.findData(current)))
         self.field_combo.setEnabled(self.field_combo.count() > 1)
         self.field_combo.blockSignals(False)
+        self.field_combo.setToolTip(
+            f'Maps of run {self.base_ds.run_init:%Y-%m-%d %H}Z found beside the open '
+            'file, in ./data or in the download cache, plus the fields that can be '
+            'derived from them.' if self.base_ds is not None else '')
 
     def _on_field_changed(self, _index):
         key = self.field_combo.currentData()
@@ -492,11 +584,40 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._install(self.base_ds, self.base_ds.path.name,
                               near=self.base_ds.path)
             return
+        if key.startswith('file:'):
+            path = self._field_files.get(key)
+            if path is None:
+                self._sync_field_combo()    # nothing to open: put the label back
+                return
+            self._open_field_file(path)
+            return
         request = self._field_requests.get(key)
         if request is None:
             self._sync_field_combo()        # nothing to rebuild it from: put the label back
             return
         self._start_derive(request)
+
+    def _open_field_file(self, path):
+        """Switch the map to another field of this run that is already on disk.
+
+        A view this window has opened before is reinstalled rather than mapped again, so
+        flipping between the maps of one run is free after the first look at each; a
+        `.nc.bz2` still has to be expanded, on the same worker `Open...` uses.
+
+        Unlike `open_path` this does not move the Open dialog's remembered directory:
+        the file usually comes from the download cache, which is not where the user
+        browses for the next one.
+        """
+        path = Path(path)
+        self._remember_root(path)
+        existing = self.opened.get(path)
+        if existing is not None:
+            self.base_ds = existing
+            self._install(existing, path.name, near=path)
+        elif ingest.is_compressed(path):
+            self._start_decompress(path)
+        else:
+            self._load(path)
 
     # ---- downloading, deriving, saving ------------------------------------------
     def download_dialog(self):
@@ -508,17 +629,22 @@ class MainWindow(QtWidgets.QMainWindow):
         if not fetched:
             return
         # Several fields can be fetched at once (the dew point needs two). Open the first
-        # so the download lands the user in the viewer, and say what else arrived.
+        # so the download lands the user in the viewer, and point at where the rest are:
+        # they are all in the "Map shows" list, which is not obvious from a status line
+        # that only names files.
         if len(fetched) > 1:
+            names = ', '.join(_field_of(path) for path in fetched)
             self.status_right.setText(
-                f'downloaded {len(fetched)} files: ' + ', '.join(p.name for p in fetched))
+                f'downloaded {len(fetched)} maps ({names}) - choose between them under '
+                '"Map shows"')
         self.open_path(fetched[0])
 
     def derive_dialog(self):
         """Dew point, dew point depression, or an A-B difference map."""
         near = self.ds.path if self.ds is not None else None
         run = f'{self.ds.run_init:%Y%m%d%H}' if self.ds is not None else None
-        dialog = derivedialog.DerivedDialog(self, near=near, run=run)
+        dialog = derivedialog.DerivedDialog(self, near=near, run=run,
+                                            roots=self._search_roots())
         if not dialog.available:
             self._error('No ICON ensemble files were found beside the open file, in '
                         './data, or in the cache. Open or download a run first.')

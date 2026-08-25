@@ -5,13 +5,16 @@ The claim `derived.py` makes is that `MainWindow`, `MapView`, `PlotView` and
 map title, colorbar, y axis, readout and status bar read at one instant, the same way
 `test_ui_v2.py` checks the units switch.
 """
+import bz2
+from pathlib import Path
+
 import numpy as np
 import pytest
 from PySide6 import QtWidgets
 from PySide6.QtTest import QTest
 
 import synth
-from imsicon import derived, ncwrite
+from imsicon import derived, ingest, ncwrite
 from imsicon.ui import derivedialog, downloaddialog
 from imsicon.ui.main import MainWindow, _symmetric
 
@@ -33,6 +36,26 @@ def no_real_environment(monkeypatch):
                         staticmethod(lambda *a, **k: ('', '')))
     monkeypatch.setattr(downloaddialog.download, 'stored_credentials', lambda: None)
     monkeypatch.setattr(downloaddialog.download, 'keyring_module', lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def only_this_test_s_files(monkeypatch):
+    """Keep field discovery hermetic.
+
+    `ingest.search_roots` deliberately looks in ./data and in the caches as well as beside
+    the open file, so on a developer machine holding the 407 MB reference run -- which
+    carries the same run number the fixtures use -- the "Map shows" combo would grow
+    entries no test wrote, and the assertions below would pass or fail by accident. Same
+    reasoning as G25 and the picker guard above: a test must not read the machine it runs
+    on. It also stops `cache_dir()`/`download_dir()` being created in the developer's home.
+    """
+    def beside_the_file(near=None):
+        if near is None:
+            return []
+        near = Path(near)
+        return [near if near.is_dir() else near.parent]
+
+    monkeypatch.setattr(ingest, 'search_roots', beside_the_file)
 
 
 def settle(app, ms=30, rounds=5):
@@ -76,6 +99,42 @@ def install(window, app, kind, title):
     settle(app)
     finish_scan(window, app)
     return view
+
+
+def open_window(app, path):
+    w = MainWindow(str(path))
+    w.show()
+    settle(app)
+    finish_scan(w, app)
+    assert w.ds is not None
+    return w
+
+
+def choose(window, app, key):
+    """Pick an entry in "Map shows" the way a user does, and let the work finish."""
+    keys = [window.field_combo.itemData(i) for i in range(window.field_combo.count())]
+    assert key in keys, keys
+    window.field_combo.setCurrentIndex(keys.index(key))
+    settle(app)
+    for worker in (window.decompressor, window.builder):
+        if worker is not None and worker.isRunning():
+            worker.wait(30000)
+    settle(app)
+    finish_scan(window, app)
+    return window.ds
+
+
+def a_run_of_five_maps(directory, run='2026082300'):
+    """More than three maps of one run on disk -- what a download session leaves behind."""
+    shape = synth.SHAPE
+    cape = np.linspace(0.0, 3000.0, int(np.prod(shape)), dtype=np.float32).reshape(shape)
+    synth.write_nc3(directory / f'ICON_ENS_{run}_CAPE_ML.nc', 'CAPE_ML', 'J kg-1', cape,
+                    history=synth.HISTORY_TEMPLATE.format(field='CAPE_ML'),
+                    long_name='cape of mean surface layer parcel')
+    synth.accumulated_precip(directory / f'ICON_ENS_{run}_TOT_PREC.nc')
+    synth.cloud(directory / f'ICON_ENS_{run}_CLCT.nc', encoding='percent', units='%')
+    synth.pair(directory, run=run)
+    return directory
 
 
 def surfaces(w):
@@ -314,14 +373,39 @@ def test_an_unknown_run_falls_back_to_the_newest_on_disk(qapp, tmp_path):
 
 # ---- "Map shows": the field selector ----------------------------------------------------
 def test_the_map_shows_combo_offers_the_derived_maps(window, qapp):
+    """Downloading "what the dew point needs" must give all four maps.
+
+    T_2M and RELHUM_2M are the two files fetched; TD_2M and T-Td are what they make
+    possible. Offering the temperature and the dew point but not the humidity that was
+    downloaded alongside them is exactly the half-a-feature this checks against.
+    """
     keys = [window.field_combo.itemData(i) for i in range(window.field_combo.count())]
     labels = [window.field_combo.itemText(i) for i in range(window.field_combo.count())]
-    assert keys == ['base', derivedialog.DEW_POINT, derivedialog.DEPRESSION]
+    assert keys == ['base', 'file:RELHUM_2M',
+                    derivedialog.DEW_POINT, derivedialog.DEPRESSION]
     assert labels[0].startswith('T_2M')
-    assert 'TD_2M' in labels[1]
+    assert labels[1].startswith('RELHUM_2M')
+    assert 'TD_2M' in labels[2]
     # The depression is named the way a forecaster reads it, not by its machine name.
-    assert labels[2].startswith('T-Td') and 'T_2M-TD_2M' not in labels[2]
+    assert labels[3].startswith('T-Td') and 'T_2M-TD_2M' not in labels[3]
     assert window.field_combo.isEnabled()
+
+
+def test_the_humidity_downloaded_with_the_temperature_can_be_put_on_the_map(window, qapp):
+    """...and picking it actually shows the humidity, not just names it."""
+    choose(window, qapp, 'file:RELHUM_2M')
+    assert window.ds.field == 'RELHUM_2M'
+    assert window.base_ds is window.ds
+    assert window.map.plot.titleLabel.text.startswith('RELHUM_2M')
+    assert window.plot.getAxis('left').labelText == 'RELHUM_2M'
+    # The temperature it was opened from is still one click away, now as a file entry.
+    # The list keeps catalogue order whichever field is open, so the entries do not
+    # reshuffle under the cursor each time one is picked.
+    keys = [window.field_combo.itemData(i) for i in range(window.field_combo.count())]
+    assert keys == ['file:T_2M', 'base',
+                    derivedialog.DEW_POINT, derivedialog.DEPRESSION]
+    assert window.field_combo.currentData() == 'base'
+    assert window.field_combo.currentText().startswith('RELHUM_2M')
 
 
 def test_only_the_open_field_is_offered_when_the_humidity_is_missing(qapp, tmp_path):
@@ -383,6 +467,125 @@ def test_the_combo_names_whatever_is_on_screen_even_for_an_ad_hoc_difference(win
     # ...and the standard entries are still there to switch back to.
     keys = [window.field_combo.itemData(i) for i in range(window.field_combo.count())]
     assert 'base' in keys and derivedialog.DEPRESSION in keys
+
+
+# ---- "Map shows": every map of the run that is on disk ----------------------------------
+def test_more_than_three_downloaded_maps_are_all_offered(qapp, tmp_path):
+    """Five maps fetched, five maps (plus the two derived ones) to choose from.
+
+    Before this, only the file that happened to be opened was listed, so a session that
+    downloaded CAPE, precipitation, temperature, humidity and cloud could look at exactly
+    one of them without going back to the file dialog.
+    """
+    a_run_of_five_maps(tmp_path)
+    w = open_window(qapp, tmp_path / 'ICON_ENS_2026082300_CAPE_ML.nc')
+    try:
+        keys = [w.field_combo.itemData(i) for i in range(w.field_combo.count())]
+        # Catalogue order, so CAPE and precipitation lead (derivedialog.field_sort_key).
+        assert keys == ['base', 'file:TOT_PREC', 'file:T_2M', 'file:RELHUM_2M',
+                        'file:CLCT', derivedialog.DEW_POINT, derivedialog.DEPRESSION]
+        labels = [w.field_combo.itemText(i) for i in range(w.field_combo.count())]
+        # Named the way the download dialog names them, without opening 407 MB to find out.
+        assert labels[1] == 'TOT_PREC - Precipitation - total'
+        assert labels[4] == 'CLCT - Cloud cover - total'
+        assert w.field_combo.isEnabled()
+    finally:
+        w.close()
+
+
+def test_choosing_another_map_switches_the_whole_window_to_it(qapp, tmp_path):
+    a_run_of_five_maps(tmp_path)
+    w = open_window(qapp, tmp_path / 'ICON_ENS_2026082300_CAPE_ML.nc')
+    try:
+        choose(w, qapp, 'file:TOT_PREC')
+        assert w.ds.field == 'TOT_PREC'
+        assert w.base_ds is w.ds                 # it is a file now, not a derived view
+        assert w.map.plot.titleLabel.text.startswith('TOT_PREC')
+        assert 'TOT_PREC (total precipitation)' in w.status_left.text()
+        # ...and the controls follow the field: precipitation is the one that accumulates.
+        assert w.rate_combo.isEnabled()
+        assert w.field_combo.currentData() == 'base'
+        assert w.field_combo.currentText().startswith('TOT_PREC')
+    finally:
+        w.close()
+
+
+def test_switching_between_maps_reuses_the_views_already_open(qapp, tmp_path):
+    """Flipping between two fields of a run must not re-map 407 MB each way."""
+    a_run_of_five_maps(tmp_path)
+    w = open_window(qapp, tmp_path / 'ICON_ENS_2026082300_CAPE_ML.nc')
+    try:
+        cape = w.ds
+        precip = choose(w, qapp, 'file:TOT_PREC')
+        assert precip is not cape
+        assert choose(w, qapp, 'file:CAPE_ML') is cape
+        assert choose(w, qapp, 'file:TOT_PREC') is precip
+        assert len(w.opened) == 2
+    finally:
+        w.close()
+
+
+def test_maps_of_another_run_are_not_offered(qapp, tmp_path):
+    """One run only: another run shares neither the valid times nor, in principle, the
+    grid, and the rest of the app refuses to mix them (R3.6)."""
+    synth.temperature(tmp_path / 'ICON_ENS_2026082300_T_2M.nc')
+    synth.temperature(tmp_path / 'ICON_ENS_2026082400_T_2M.nc')
+    synth.cloud(tmp_path / 'ICON_ENS_2026082400_CLCT.nc')
+    w = open_window(qapp, tmp_path / 'ICON_ENS_2026082300_T_2M.nc')
+    try:
+        keys = [w.field_combo.itemData(i) for i in range(w.field_combo.count())]
+        assert keys == ['base']
+        assert not w.field_combo.isEnabled()
+    finally:
+        w.close()
+
+
+def test_a_compressed_map_is_expanded_when_it_is_chosen(qapp, tmp_path, monkeypatch):
+    """A downloaded map is still a `.nc.bz2`; picking it decompresses it as Open... does."""
+    cache = tmp_path / 'cache'
+    cache.mkdir()
+    monkeypatch.setattr(ingest, 'cache_dir', lambda: cache)
+    synth.temperature(tmp_path / 'ICON_ENS_2026082300_T_2M.nc')
+    plain = tmp_path / 'ICON_ENS_2026082300_CLCT.nc'
+    synth.cloud(plain, encoding='percent', units='%')
+    (tmp_path / 'ICON_ENS_2026082300_CLCT.nc.bz2').write_bytes(
+        bz2.compress(plain.read_bytes()))
+    plain.unlink()                                # only the compressed one is on disk
+
+    w = open_window(qapp, tmp_path / 'ICON_ENS_2026082300_T_2M.nc')
+    try:
+        choose(w, qapp, 'file:CLCT')
+        assert w.ds.field == 'CLCT'
+        assert w.ds.path.parent == cache          # expanded into the cache, not beside it
+        assert w.map.plot.titleLabel.text.startswith('CLCT')
+        # ...and the run does not vanish with it: the open file now lives in the cache,
+        # so a scan that only looked beside it would have lost the directory the user
+        # opened from, and with it every other map of the run.
+        keys = [w.field_combo.itemData(i) for i in range(w.field_combo.count())]
+        assert 'file:T_2M' in keys
+        assert choose(w, qapp, 'file:T_2M').field == 'T_2M'
+    finally:
+        w.close()
+
+
+def test_a_map_that_cannot_be_opened_puts_the_label_back(qapp, tmp_path, monkeypatch):
+    """The selection moves the instant the user picks an entry, so a failed open has to
+    return the combo to the field that is actually on screen."""
+    seen = []
+    monkeypatch.setattr(QtWidgets.QMessageBox, 'critical',
+                        staticmethod(lambda *a, **k: seen.append(a[-1])))
+    synth.temperature(tmp_path / 'ICON_ENS_2026082300_T_2M.nc')
+    (tmp_path / 'ICON_ENS_2026082300_CLCT.nc').write_bytes(b'not a netcdf file at all')
+    w = open_window(qapp, tmp_path / 'ICON_ENS_2026082300_T_2M.nc')
+    try:
+        before = w.ds
+        choose(w, qapp, 'file:CLCT')
+        assert seen and 'CLCT' in seen[-1]
+        assert w.ds is before                     # still showing the temperature
+        assert w.field_combo.currentData() == 'base'
+        assert w.field_combo.currentText().startswith('T_2M')
+    finally:
+        w.close()
 
 
 def test_a_derived_view_carries_its_kind_however_it_was_built(run_dir):
