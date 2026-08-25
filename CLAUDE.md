@@ -676,6 +676,9 @@ panel keeps working. `MainWindow._load` was split into `_load` (file → `FieldV
 | `imsicon/ncwrite.py` | NetCDF-3 64-bit-offset **writer**, promoted out of `tests/synth.py` |
 | `imsicon/ui/downloaddialog.py` | run × field picker, sizes, cached state, sequential fetch |
 | `imsicon/ui/derivedialog.py` | dew point / depression / A−B picker, and the build worker |
+| `imsicon/geo.py` | loads the bundled overlay; keeps the `fr_land` contour as the fallback |
+| `imsicon/mapdata/levant_10m.json` | Natural Earth coastline + borders, clipped and committed (85 kB) |
+| `tools/build_mapdata.py` | dev-only: rebuild that file from the Natural Earth sources |
 
 ## R3.2 D1 — the downloader
 
@@ -816,7 +819,7 @@ from a fresh one. ~1 s off the UI thread is a fair price for not inventing a two
 
 ## R3.8 Status — shipped and verified 2026-08-25
 
-`272 passed, 28 skipped` (169 from R1+v2, unchanged and green, + 103 new). The skips are
+`298 passed, 28 skipped` (169 from R1+v2, unchanged and green, + 129 new). The skips are
 the tests that need the 407 MB reference file, which is gitignored.
 
 | item | where | verified by |
@@ -844,4 +847,75 @@ venv/bin/python -m imsicon --difference T_2M T_S --units C       data/ICON_ENS_.
 
 `--derive` and `--difference` find the other field(s) of the run beside the file you name,
 the same way the dialog does. Toolbar row 1 now carries **Open**, **Download…** (`Ctrl+D`),
-**Derived field…** (`Ctrl+R`) and **Save field…** (`Ctrl+S`).
+**Derived field…** (`Ctrl+R`) and **Save field…** (`Ctrl+S`), then **Map shows**: a field
+combo (the open field, `TD_2M`, `T-Td`) followed by the aggregation combo.
+
+## R3.10 Follow-up — naming, the field selector, and the map overlay (2026-08-25)
+
+Three requests after the first v3 review.
+
+### The difference is called `T-Td`
+
+`T_2M-TD_2M` is the machine name — the `QSettings` units key, the NetCDF variable name
+after sanitising — and it is not what a forecaster reads. Views now carry a
+**`display_name`** alongside `field`: `FieldView.display_name` is just the field, and
+`dew_point_depression` sets `T-Td`. The map title, the graph's y axis, the readout subtitle
+and the status summary all use `display_name`; nothing that has to be parsed back into an
+identity does. Keeping the two separate is the point — renaming `field` itself would have
+put a hyphenated label into the settings keys and the written variable name.
+
+### `T-Td` is a map you can pick, not only one you can build
+
+**Map shows** now has a *field* combo before the aggregation combo: the open field, then
+`TD_2M - dew point` and `T-Td - dew point depression` when the run's `T_2M` and
+`RELHUM_2M` are actually on disk. Switching between the temperature and the depression is
+something a forecaster does while reading, so it belongs in the toolbar rather than behind
+a dialog; the *Derived field…* dialog stays for the general `A − B`.
+
+* `MainWindow.base_ds` holds the file-backed view, so switching back to it is instant
+  rather than re-mapping 407 MB.
+* Entries are checked against the disk before being offered — a menu entry that always
+  fails is worse than one that is not there.
+* `derivedialog.build` stamps `derived_kind` and `derived_request` on every view it makes,
+  so the combo names what is on screen whether it came from the dialog, the combo, or
+  `--derive`. **This was a real bug the first time round:** `--derive depression` painted
+  `T-Td` while the combo still read `T_2M`.
+* A view the standard entries do not cover — an ad-hoc `--difference T_2M T_S` — is added
+  to the combo as its own entry rather than leaving the combo pointing at the wrong field.
+
+### Coastlines and borders, drawn over the field
+
+`CLAUDE.md` Phase 4.3 asked for a bundled Natural Earth overlay and R1 shipped without it,
+so outside the inner box the map had **no coastline at all** (**G6**). Now:
+
+* `tools/build_mapdata.py` clips Natural Earth 1:10 m coastline and admin-0 boundary lines
+  to 30.5–39.5 E / 24.5–38 N — the full pan range, not just the domain, or the outline
+  stops mid-pan and looks like a bug — rounds to 4 decimals (~11 m, against a 2.5 km grid)
+  and writes `imsicon/mapdata/levant_10m.json`. **85 kB**, committed, no runtime download.
+* `geo.overlay_for` returns every layer at once and falls back to the `fr_land` contour
+  when the bundle is missing, so a lost data file costs the map its outlines rather than
+  stopping a forecast opening.
+* **Drawn over the model map by explicit z-value**, not by insertion order: field 0,
+  coastline 10/11, borders 12/13, marker 20/21.
+* Every outline is drawn twice — a white halo under a thin ink line. Over turbo, and over
+  a diverging ramp, there is no single ink colour legible at both ends of the scale, and an
+  outline that vanishes exactly where you are looking is worse than none.
+
+**On the borders themselves.** Natural Earth's own `FEATURECLA` is carried through
+unmodified. In this domain the source marks 6 lines `Disputed`, 38 `Indefinite`, 20
+`Line of control` and 112 `International boundary`; the settled ones are drawn solid and
+everything the source flags as less than settled is drawn dashed. Nothing in this app
+decides where a border is — it renders a public-domain reference dataset with the source's
+own uncertainty intact, which is the only defensible thing to do for this region.
+
+**Packaging (Phase 9).** `imsicon/mapdata/levant_10m.json` is read by path, so a PyInstaller
+build needs `--add-data "imsicon/mapdata;imsicon/mapdata"`. Without it the app still runs;
+it just loses its outlines, which is exactly the failure the fallback is written to survive.
+
+### Verified
+
+`298 passed, 28 skipped`. `tests/test_geo.py` (16) checks the shipped file rather than a
+fixture — it loads, spans the whole domain, keeps disputed lines separate, survives being
+deleted or corrupted — plus the z-order, the halo contrast and the dashed styling on the
+real widgets. `tests/test_ui_derived.py` grew the field-combo cases, including the one that
+caught the `--derive` labelling bug.

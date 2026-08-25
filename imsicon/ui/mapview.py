@@ -8,6 +8,34 @@ pg.setConfigOption('imageAxisOrder', 'row-major')
 pg.setConfigOption('background', 'w')
 pg.setConfigOption('foreground', 'k')
 
+# Explicit stacking, because "drawn over the model map" must not depend on the order the
+# items happened to be added in. The field is the bottom layer; every outline sits above
+# it, and the picked-point marker above those.
+Z_FIELD = 0
+Z_COAST = 10
+Z_BORDER = 12
+Z_MARKER = 20
+
+
+class _Outline:
+    """A halo line and an ink line kept together, so a layer is set or cleared as one."""
+
+    __slots__ = ('under', 'over')
+
+    def __init__(self, under, over):
+        self.under, self.over = under, over
+
+    def setData(self, xs, ys):
+        self.under.setData(xs, ys)
+        self.over.setData(xs, ys)
+
+    def clear(self):
+        self.under.clear()
+        self.over.clear()
+
+    def isVisible(self):
+        return self.over.isVisible()
+
 
 class MapView(pg.GraphicsLayoutWidget):
     """Ensemble field as an image in true degrees, with coastline and a picked-point marker."""
@@ -28,17 +56,25 @@ class MapView(pg.GraphicsLayoutWidget):
         self.plot.setMenuEnabled(False)
 
         self.img = pg.ImageItem(axisOrder='row-major')
+        self.img.setZValue(Z_FIELD)
         self.plot.addItem(self.img)
-        self.coast = pg.PlotDataItem(pen=pg.mkPen('#111111', width=1.3),
-                                     connect='finite')
-        self.plot.addItem(self.coast)
+        # Coastline and borders, each drawn twice: a pale halo underneath and the line on
+        # top. Over turbo or a diverging ramp there is no single ink colour that stays
+        # legible against both ends of the scale, and an outline that disappears over the
+        # values you are looking at is worse than none.
+        self.coast = self._outline(Z_COAST, '#101010', 1.4, halo=3.2)
+        self.borders = self._outline(Z_BORDER, '#7d1f1f', 1.5, halo=3.2)
+        # Natural Earth marks these as disputed / indefinite / line of control. Dashed,
+        # because drawing them identically to a settled boundary would overstate them.
+        self.borders_uncertain = self._outline(Z_BORDER, '#7d1f1f', 1.4, halo=2.8,
+                                               style=QtCore.Qt.PenStyle.DashLine)
         self.marker = pg.ScatterPlotItem(size=17, symbol='+', pen=pg.mkPen('#ffffff', width=2.5),
                                          brush=None)
-        self.marker.setZValue(20)
+        self.marker.setZValue(Z_MARKER + 1)
         self.plot.addItem(self.marker)
         self.marker_halo = pg.ScatterPlotItem(size=17, symbol='+', pen=pg.mkPen('#000000', width=4.5),
                                               brush=None)
-        self.marker_halo.setZValue(19)
+        self.marker_halo.setZValue(Z_MARKER)
         self.plot.addItem(self.marker_halo)
 
         self.cmap = pg.colormap.get('turbo')
@@ -55,7 +91,19 @@ class MapView(pg.GraphicsLayoutWidget):
         self.scene().sigMouseMoved.connect(self._on_move)
 
     # ---- setup -----------------------------------------------------------------
-    def set_dataset(self, ds, coastline=None):
+    def _outline(self, z, colour, width, halo, style=QtCore.Qt.PenStyle.SolidLine):
+        """A halo line and an ink line as one object, so callers set data once."""
+        under = pg.PlotDataItem(connect='finite', pen=pg.mkPen(
+            '#ffffff', width=halo, style=style))
+        over = pg.PlotDataItem(connect='finite', pen=pg.mkPen(
+            colour, width=width, style=style))
+        under.setZValue(z)
+        over.setZValue(z + 1)
+        self.plot.addItem(under)
+        self.plot.addItem(over)
+        return _Outline(under, over)
+
+    def set_dataset(self, ds, overlay=None):
         self.ds = ds
         lon0, lat0 = ds.lon[0], ds.lat[0]
         tr = QtGui.QTransform()
@@ -72,11 +120,20 @@ class MapView(pg.GraphicsLayoutWidget):
         # G8: 1 deg of longitude covers cos(lat) of the pixels that 1 deg of latitude does
         self.plot.setAspectLocked(True, ratio=float(np.cos(np.deg2rad(ds.lat.mean()))))
         self._user_zoomed = False
-        if coastline is not None and coastline[0] is not None:
-            self.coast.setData(coastline[0], coastline[1])
-        else:
-            self.coast.clear()
+        self.set_overlay(overlay)
         self.reset_view()
+
+    def set_overlay(self, overlay):
+        """Draw the coastline and border layers (`geo.overlay_for`) over the field."""
+        overlay = overlay or {}
+        for name, item in (('coastline', self.coast), ('borders', self.borders),
+                           ('borders_uncertain', self.borders_uncertain)):
+            xs, ys = overlay.get(name) or (None, None)
+            if xs is not None and len(xs):
+                item.setData(xs, ys)
+            else:
+                item.clear()
+        self.overlay_source = overlay.get('source', '')
 
     def reset_view(self):
         """Fit the whole domain. Aspect lock means one axis gets slack, not a crop."""

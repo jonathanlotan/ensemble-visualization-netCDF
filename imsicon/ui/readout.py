@@ -66,7 +66,7 @@ class ReadoutPanel(QtWidgets.QFrame):
         self.units = ds.units
         self.span = span
         self.subtitle.setText(
-            f'{ds.field} - {ds.long_name} [{ds.units}] | {ds.n_members} members | '
+            f'{ds.display_name} - {ds.long_name} [{ds.units}] | {ds.n_members} members | '
             f'run {ds.run_init:%Y-%m-%d %H:%M}Z')
 
     def set_point(self, lat, lon):

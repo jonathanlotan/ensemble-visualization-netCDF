@@ -38,6 +38,9 @@ ZERO_C = 273.15
 # rather than guesses (the same policy as the v2 registry, v2.md 1.3).
 DEW_POINT_INPUTS = {'temperature': ('T_2M', 'K'), 'humidity': ('RELHUM_2M', '%')}
 DEW_POINT_FIELD = 'TD_2M'
+# What the dew point depression is called on screen. `T_2M-TD_2M` is the machine name;
+# `T-Td` is what a forecaster reads it as, and the map is for reading.
+DEPRESSION_NAME = 'T-Td'
 
 
 class PairError(Exception):
@@ -200,10 +203,14 @@ class DerivedView:
     rate_note = None
     window_steps = 0
 
-    def __init__(self, operands, field, long_name, provenance):
+    def __init__(self, operands, field, long_name, provenance, display_name=None):
         self.operands = tuple(operands)
         self.ref = self.operands[0]
         self.field = field
+        # What the map title and the graph's y axis call this. `field` stays the machine
+        # identity -- the settings key, the written variable name -- so a friendlier label
+        # never has to be parsed back into one.
+        self.display_name = display_name or field
         self.long_name = long_name
         self.provenance = provenance
         self.note = None
@@ -350,7 +357,7 @@ class DerivedView:
 
     def summary(self):
         sources = ' | '.join(self.source_files)
-        return (f'{self.field} ({self.long_name}) [{self.units}] | '
+        return (f'{self.display_name} ({self.long_name}) [{self.units}] | '
                 f'run {self.run_init:%Y-%m-%d %H:%M}Z | {self.n_members} members | '
                 f'{self.n_times} steps | {self.ny}x{self.nx} grid | from {sources}')
 
@@ -583,6 +590,7 @@ def dew_point_depression(temperature, humidity):
     """
     td = dew_point(temperature, humidity)
     view = difference(td.temperature, td)
+    view.display_name = DEPRESSION_NAME
     view.long_name = 'dew point depression (T - Td)'
     view.provenance = (f'dew point depression from {td.temperature.path.name} and '
                        f'{td.humidity.path.name}')

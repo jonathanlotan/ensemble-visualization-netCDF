@@ -179,6 +179,12 @@ class FieldView:
         return self.raw.long_name
 
     @property
+    def display_name(self):
+        """What the map title and the y axis call this. A derived view overrides it --
+        `T-Td` reads better than `T_2M-TD_2M` -- so every caller can just ask for it."""
+        return self.field
+
+    @property
     def transform_signature(self):
         """Identifies the view a cached range belongs to (G19). Units are NOT part of it:
         a unit change is affine and transforms the cached range instead of rescanning."""

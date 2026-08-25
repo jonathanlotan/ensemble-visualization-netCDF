@@ -4,7 +4,7 @@ from pathlib import Path
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .. import geo, ingest, nc3, ncwrite, transform
+from .. import derived, geo, ingest, nc3, ncwrite, transform
 from ..dataset import EnsembleFile, member_stats
 from ..fieldview import FieldView
 from . import derivedialog, downloaddialog
@@ -131,6 +131,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.decompressor = None
         self.builder = None
         self.writer = None
+        # The view that came from a file. A derived map replaces `ds` but not this, so the
+        # "Map shows" combo can switch back without reopening 407 MB.
+        self.base_ds = None
+        self._field_requests = {}
         self._progress = None
         # Every file-backed view this window has opened, so building a derived field on
         # the field already on screen does not map another 407 MB of the same bytes.
@@ -257,6 +261,14 @@ class MainWindow(QtWidgets.QMainWindow):
         tb.addSeparator()
 
         tb.addWidget(QtWidgets.QLabel(' Map shows: '))
+        # Which field. The derived maps are here rather than only behind a dialog because
+        # switching between T_2M and T-Td is something you do while reading a forecast,
+        # not a one-off setup step.
+        self.field_combo = QtWidgets.QComboBox()
+        self.field_combo.setMinimumWidth(150)
+        self.field_combo.currentIndexChanged.connect(self._on_field_changed)
+        tb.addWidget(self.field_combo)
+
         self.agg_combo = QtWidgets.QComboBox()
         for label, key in AGG_CHOICES:
             self.agg_combo.addItem(label, key)
@@ -376,6 +388,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._error(f'Could not open {Path(path).name}:\n{exc}')
             return
         self.opened[Path(path)] = ds
+        self.base_ds = ds
         self._install(ds, path.name, near=path)
 
     def _install(self, ds, title, near=None):
@@ -393,11 +406,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle(f'IMS ICON Ensemble Viewer - {title}')
         self.status_left.setText(ds.summary())
 
-        self.map.set_dataset(ds, geo.coastline_for(near or ds.path))
+        self.map.set_dataset(ds, geo.overlay_for(near or ds.path))
         self.plot.set_dataset(ds)
         self.readout.configure(ds)
         self._sync_colormap(ds)
 
+        self._sync_field_combo()
         self._sync_units_combo()
         self._sync_rate_combo()
         # Cleared as well as set: this runs again for every field the user opens, and a
@@ -422,6 +436,67 @@ class MainWindow(QtWidgets.QMainWindow):
         iy, ix = ds.ny // 2, ds.nx // 2
         self.select_point(iy, ix)
         self.set_time(0)
+
+    # ---- the "Map shows" field selector -------------------------------------------
+    def _field_entries(self):
+        """-> [(key, label, request)] for the Map shows combo. `base` has no request.
+
+        The derived entries are checked against the files actually on disk rather than
+        offered blindly, because a menu entry that always fails is worse than one that is
+        not there. Whatever is currently on screen is always listed, even when it is an
+        ad-hoc `A - B` the standard entries do not cover -- otherwise the combo would name
+        one field while the map shows another.
+        """
+        if self.base_ds is None:
+            return []
+        entries = [('base',
+                    f'{self.base_ds.display_name} - {self.base_ds.long_name}'[:60], None)]
+        run = f'{self.base_ds.run_init:%Y%m%d%H}'
+        available = ingest.scan_for_fields(ingest.search_roots(self.base_ds.path))
+        needed = [derived.DEW_POINT_INPUTS[role][0] for role in ('temperature', 'humidity')]
+        if all((run, field) in available for field in needed):
+            paths = [available[(run, field)] for field in needed]
+            for kind, label in ((derivedialog.DEW_POINT,
+                                 f'{derived.DEW_POINT_FIELD} - dew point'),
+                                (derivedialog.DEPRESSION,
+                                 f'{derived.DEPRESSION_NAME} - dew point depression')):
+                entries.append((kind, label,
+                                derivedialog.DerivedRequest(kind, paths, label)))
+
+        current = getattr(self.ds, 'derived_kind', 'base')
+        if current != 'base' and not any(key == current for key, _l, _r in entries):
+            entries.append((current,
+                            f'{self.ds.display_name} - {self.ds.long_name}'[:60],
+                            getattr(self.ds, 'derived_request', None)))
+        return entries
+
+    def _sync_field_combo(self):
+        """Rebuild the field list and select whatever is actually on screen."""
+        current = getattr(self.ds, 'derived_kind', 'base')
+        entries = self._field_entries()
+        self._field_requests = {key: request for key, _label, request in entries}
+        self.field_combo.blockSignals(True)
+        self.field_combo.clear()
+        for key, label, _request in entries:
+            self.field_combo.addItem(label, key)
+        self.field_combo.setCurrentIndex(max(0, self.field_combo.findData(current)))
+        self.field_combo.setEnabled(self.field_combo.count() > 1)
+        self.field_combo.blockSignals(False)
+
+    def _on_field_changed(self, _index):
+        key = self.field_combo.currentData()
+        if key is None or self.base_ds is None:
+            return
+        if key == 'base':
+            if self.ds is not self.base_ds:
+                self._install(self.base_ds, self.base_ds.path.name,
+                              near=self.base_ds.path)
+            return
+        request = self._field_requests.get(key)
+        if request is None:
+            self._sync_field_combo()        # nothing to rebuild it from: put the label back
+            return
+        self._start_derive(request)
 
     # ---- downloading, deriving, saving ------------------------------------------
     def download_dialog(self):
@@ -451,8 +526,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return
         request = dialog.request()
-        if request is None:
-            return
+        if request is not None:
+            self._start_derive(request)
+
+    def _start_derive(self, request):
+        """Build a derived view off the UI thread -- opening a second file can be 16 s."""
         self._progress = QtWidgets.QProgressDialog(
             f'Building {request.title}...', 'Cancel', 0, 0, self)
         self._progress.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
@@ -591,7 +669,8 @@ class MainWindow(QtWidgets.QMainWindow):
             lo, hi = _symmetric(lo, hi)
         units = f' [{self.ds.units}]' if self.ds.units else ''
         self.map.set_frame(frame, (lo, hi),
-                           f'{self.ds.field}{units} - {what} - {self.ds.label_for(self.t)}')
+                           f'{self.ds.display_name}{units} - {what} - '
+                           f'{self.ds.label_for(self.t)}')
 
     def set_time(self, t):
         if self.ds is None:
@@ -678,7 +757,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ds = self.ds
         self.status_left.setText(ds.summary())
         self.plot.getAxis('left').enableAutoSIPrefix(False)   # G12: never 'kJ kg-1'
-        self.plot.setLabel('left', ds.field, units=ds.units or None)
+        self.plot.setLabel('left', ds.display_name, units=ds.units or None)
         self.readout.configure(ds)          # select_point below restores the point label
         self.time_label.setText(ds.label_for(self.t))
         if ds.value_range is not None:

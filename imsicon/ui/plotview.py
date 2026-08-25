@@ -60,7 +60,7 @@ class PlotView(pg.PlotWidget):
             self.addItem(curve)
             self._curves.append(curve)
         self.getAxis('left').enableAutoSIPrefix(False)   # J kg-1, never 'kJ kg-1'
-        self.setLabel('left', ds.field, units=ds.units or None)
+        self.setLabel('left', ds.display_name, units=ds.units or None)
         self.setLabel('bottom', f'forecast hour from {ds.run_init:%Y-%m-%d %H:%M}Z run')
         self.setXRange(float(ds.forecast_hours[0]), float(ds.forecast_hours[-1]), padding=0.01)
 

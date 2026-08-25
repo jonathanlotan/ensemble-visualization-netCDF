@@ -242,10 +242,16 @@ def build(request, opened=None):
 
     views = [field_view(path) for path in request.paths]
     if request.kind == DEW_POINT:
-        return derived.dew_point(*views)
-    if request.kind == DEPRESSION:
-        return derived.dew_point_depression(*views)
-    return derived.difference(*views)
+        view = derived.dew_point(*views)
+    elif request.kind == DEPRESSION:
+        view = derived.dew_point_depression(*views)
+    else:
+        view = derived.difference(*views)
+    # Stamped here rather than at each call site, so the "Map shows" combo names what is
+    # on screen whether it was built from the dialog, the combo itself, or --derive.
+    view.derived_kind = request.kind
+    view.derived_request = request
+    return view
 
 
 class BuildWorker(QtCore.QThread):

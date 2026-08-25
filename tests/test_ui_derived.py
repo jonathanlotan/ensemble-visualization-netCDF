@@ -67,6 +67,7 @@ def window(qapp, run_dir):
 
 
 def install(window, app, kind, title):
+    """Build a derived view the way the window does, and put it on screen."""
     paths = [window.ds.path.parent / 'ICON_ENS_2026082300_T_2M.nc',
              window.ds.path.parent / 'ICON_ENS_2026082300_RELHUM_2M.nc']
     view = derivedialog.build(derivedialog.DerivedRequest(kind, paths, title),
@@ -309,3 +310,86 @@ def test_an_unknown_run_falls_back_to_the_newest_on_disk(qapp, tmp_path):
     assert dialog.run == '2026082400'
     assert dialog.request() is not None
     dialog.close()
+
+
+# ---- "Map shows": the field selector ----------------------------------------------------
+def test_the_map_shows_combo_offers_the_derived_maps(window, qapp):
+    keys = [window.field_combo.itemData(i) for i in range(window.field_combo.count())]
+    labels = [window.field_combo.itemText(i) for i in range(window.field_combo.count())]
+    assert keys == ['base', derivedialog.DEW_POINT, derivedialog.DEPRESSION]
+    assert labels[0].startswith('T_2M')
+    assert 'TD_2M' in labels[1]
+    # The depression is named the way a forecaster reads it, not by its machine name.
+    assert labels[2].startswith('T-Td') and 'T_2M-TD_2M' not in labels[2]
+    assert window.field_combo.isEnabled()
+
+
+def test_only_the_open_field_is_offered_when_the_humidity_is_missing(qapp, tmp_path):
+    synth.temperature(tmp_path / 'ICON_ENS_2026082300_T_2M.nc')
+    w = MainWindow(str(tmp_path / 'ICON_ENS_2026082300_T_2M.nc'))
+    w.show()
+    settle(qapp)
+    finish_scan(w, qapp)
+    try:
+        assert [w.field_combo.itemData(i) for i in range(w.field_combo.count())] == ['base']
+        assert not w.field_combo.isEnabled()
+    finally:
+        w.close()
+
+
+def test_picking_a_derived_map_from_the_combo_installs_it(window, qapp):
+    keys = [window.field_combo.itemData(i) for i in range(window.field_combo.count())]
+    window.field_combo.setCurrentIndex(keys.index(derivedialog.DEPRESSION))
+    settle(qapp)
+    if window.builder is not None:
+        window.builder.wait(30000)
+    settle(qapp)
+    finish_scan(window, qapp)
+    assert window.ds.display_name == derived.DEPRESSION_NAME
+    assert window.ds.field == 'T_2M-TD_2M'          # the machine name is unchanged
+    assert window.map.plot.titleLabel.text.startswith('T-Td')
+    assert window.plot.getAxis('left').labelText == 'T-Td'
+
+
+def test_switching_back_to_the_file_reuses_the_view_already_open(window, qapp):
+    base = window.ds
+    install(window, qapp, derivedialog.DEPRESSION, 'Depression')
+    assert window.ds is not base
+    keys = [window.field_combo.itemData(i) for i in range(window.field_combo.count())]
+    window.field_combo.setCurrentIndex(keys.index('base'))
+    settle(qapp)
+    assert window.ds is base                        # not reopened, the same object
+    assert window.map.plot.titleLabel.text.startswith('T_2M')
+
+
+def test_the_combo_names_whatever_is_on_screen_even_for_an_ad_hoc_difference(window, qapp):
+    """A `--difference A B` view is not one of the standard entries, and the combo must
+    still not claim the map is showing the plain field."""
+    directory = window.ds.path.parent
+    synth.write_nc3(directory / 'ICON_ENS_2026082300_T_S.nc', 'T_S', 'K',
+                    np.full((6, 3, 4, 5), 295.0, dtype=np.float32),
+                    history=synth.HISTORY_TEMPLATE.format(field='T_S'))
+    request = derivedialog.DerivedRequest(
+        derivedialog.DIFFERENCE,
+        [directory / 'ICON_ENS_2026082300_T_2M.nc',
+         directory / 'ICON_ENS_2026082300_T_S.nc'], 'T_2M - T_S')
+    view = derivedialog.build(request, dict(window.opened))
+    window._install(view, request.title)
+    settle(qapp)
+    finish_scan(window, qapp)
+    assert view.derived_kind == derivedialog.DIFFERENCE
+    assert window.field_combo.currentData() == derivedialog.DIFFERENCE
+    assert window.field_combo.currentText().startswith('T_2M-T_S')
+    # ...and the standard entries are still there to switch back to.
+    keys = [window.field_combo.itemData(i) for i in range(window.field_combo.count())]
+    assert 'base' in keys and derivedialog.DEPRESSION in keys
+
+
+def test_a_derived_view_carries_its_kind_however_it_was_built(run_dir):
+    """`build` stamps it, so the dialog, the combo and --derive all agree."""
+    paths = [run_dir / 'ICON_ENS_2026082300_T_2M.nc',
+             run_dir / 'ICON_ENS_2026082300_RELHUM_2M.nc']
+    for kind in (derivedialog.DEW_POINT, derivedialog.DEPRESSION):
+        view = derivedialog.build(derivedialog.DerivedRequest(kind, paths, kind))
+        assert view.derived_kind == kind
+        assert view.derived_request.kind == kind
