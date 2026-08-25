@@ -30,18 +30,27 @@ File name: `ICON_ENS_<YYYYMMDDHH>_<FIELD>.nc.bz2`
 
 ### 0.2 The 15 fields (one file each, per run)
 
-| Field | Description | Units | Note |
+**All 15 units strings MEASURED 2026-08-24** against run `2026082400`, with
+`tools/sniff_headers.py --all` (60 MB of prefixes, not 3.9 GB of files). The `units`
+column below is now the literal string in the file header, not the PDF's rendering of it.
+Two of them are **not** what this file previously claimed — see the bold notes.
+
+| Field | Description | `units` (verbatim) | Note |
 |---|---|---|---|
-| `CAPE_ML` | CAPE of mean surface layer parcel | J kg⁻¹ | **the "cape index"** |
-| `T_2M` | 2 m air temperature | K | offer °C display |
-| `T_S` | surface soil temperature | K | offer °C display |
-| `RELHUM_2M` | 2 m relative humidity | % | |
-| `TOT_PREC` | total precipitation | kg m⁻² | **accumulated since model start** |
-| `U_10M`, `V_10M` | 10 m wind components | m s⁻¹ | can derive speed/direction |
-| `VMAX_10M` | max 10 m gust | m s⁻¹ | max over previous 1 h |
-| `CLCT`,`CLCL`,`CLCM`,`CLCH` | total/low/mid/high cloud cover | 0–1 | |
-| `ASWDIFD_S`,`ASWDIR_S` | diffuse / direct downward SW radiation | W m⁻² | **averaged since model start** |
-| `H_SNOW` | snow depth | m | ~all zeros in summer |
+| `CAPE_ML` | CAPE of mean surface layer parcel | `J kg-1` | **the "cape index"** |
+| `T_2M` | 2 m air temperature | `K` | displayed as °C by default (v2) |
+| `T_S` | weighted surface temperature | `K` | displayed as °C by default (v2) |
+| `RELHUM_2M` | relative humidity in 2m | `%` | |
+| `TOT_PREC` | total precip | `kg m-2` | **accumulated since model start**; `sum` kind (**G14**) |
+| `U_10M`, `V_10M` | zonal / meridional wind in 10m | `m s-1` | can derive speed/direction |
+| `VMAX_10M` | gust at 10 m *since end of previous full 01H interval* | `m s-1` | already per-interval — **never de-accumulate** |
+| `CLCT`,`CLCL`,`CLCM`,`CLCH` | total/low/mid/high cloud cover | `%` | **⚠ CORRECTION: these are 0–100 %, NOT the 0–1 fraction previously documented here.** Measured range 0..100 on every one. Still decided from the data at load (**G22**), because the header alone cannot settle it |
+| `ASWDIFD_S`,`ASWDIR_S` | Surface down solar diff./direct rad. *mean since model start* | `W/m**2` | **⚠ the spelling is `W/m**2`, not `W m-2`** — handled by the **G21** normaliser, not by widening the registry. `mean` kind: `np.diff` is wrong (**G14**) |
+| `H_SNOW` | weighted snow depth | `m` | ~all zeros in summer (measured max 2.0 mm) |
+
+The `long_name`s settle the two accumulation kinds beyond doubt: the radiation fields say
+**"mean since model start"** and `VMAX_10M` says **"since end of previous full 01H
+interval"**. Neither is a guess any more.
 
 Constant fields live in `topo_icon_web.nc`: `topography_c` (m), `fr_land` (0–1).
 
@@ -434,6 +443,170 @@ paint) and reuses the cache on the next open.
   `os.utime(path, None)`, which rewrote mtime and so invalidated the `.imsstats.json`
   sidecar (keyed on size+mtime) on every reopen. It now touches atime only, in `ns` form
   so no sub-microsecond drift creeps in. Caught by `test_decompress_...reuses_it`.
+* **G26 — a file shorter than its header claims is a SEGFAULT, not an exception.**
+  `numrecs` lives in the header, so an interrupted download (or a deliberately truncated
+  prefix) leaves a `.nc` that parses as 121 steps while holding 9. `nc3.view` builds the
+  window with `as_strided`, which does **not** bounds-check, so touching the missing tail
+  crashes the interpreter with nothing to catch. `nc3.parse` now clamps `numrecs` to the
+  records the file actually holds (keeping `declared_numrecs` and `truncated` for
+  diagnostics), and `nc3.view` drops a partial trailing element so the dtype cast cannot
+  fail. `EnsembleFile.truncation_note` tells the user the file stops early.
+
+## R1.7 Gotchas from v2 (units and de-accumulation) — promoted here as the durable record
+
+* **G14 — `TOT_PREC` is accumulated; `ASWDIFD_S`/`ASWDIR_S` are AVERAGED. The formula
+  differs, and `np.diff` is wrong for radiation.** With hours-since-init `h[t]`:
+  `sum` kind → `A[t] − A[t−k]`; `mean` kind → `(A[t]·h[t] − A[t−k]·h[t−k]) / (h[t] − h[t−k])`.
+  Measured on a synthetic running mean of a known hourly signal `[0,100,400,800,300,50]`:
+  `np.diff` returns `[100, 150, 183.3, −33.3, −70]` — plausible-looking W m⁻² and wrong —
+  while the `mean` formula returns the true signal exactly. Detection guard: an accumulated
+  field is monotonically non-decreasing; an averaged one is not.
+* **G15 — an affine conversion must not apply its offset to a difference.** K→°C is
+  `a=1, b=−273.15`; on a difference only `a` contributes. A 5 K rise is a 5 °C rise, not
+  −268.15 °C. Note the asymmetry with G14: an averaged field's window value is a *mean*,
+  which is absolute and takes the **full** affine — only the `sum` branch is a difference.
+  `spread` (max−min) is a difference too, which is why `FieldView.agg_frame` converts the
+  member stack *before* aggregating rather than after.
+* **G19 — the `.imsstats.json` sidecar is keyed by transform signature.** A rate view
+  cannot reuse the raw range. Schema v2 is
+  `{"schema": 2, "key": {...}, "ranges": {"raw": {...}, "rate:sum:1": {...}}}`; v1 blobs
+  (a bare `{min, max}`) are read as `{"raw": ...}` so no cache is lost. A **unit** change
+  never rescans: the cached range is stored pre-units and transformed affinely on read.
+* **G20 — `float(np.nanmax(frame)) or 1.0` does not do what it looks like.** `bool(nan)` is
+  `True`, so `nan or 1.0` is `nan`, and a downstream `if hi <= lo` guard never fires because
+  `nan <= 0.0` is `False`. Fixed with explicit `np.isfinite` checks (`_finite_max/_finite_min`
+  in `ui/main.py`). Not theoretical: the first `k` steps of a rate view are legitimately
+  all-NaN.
+* **G21 — units strings have many spellings; compare normalised, and never raise.**
+  `transform.normalise_units` strips/lowercases, deletes `**` and `^`, rewrites `a/b` to
+  `a b-1`, then aliases to a canonical token. It must be **total** — an unrecognised string
+  returns itself and lands in the "no conversion" branch. A units string must not be able to
+  crash a file open.
+* **G22 — cloud-cover encoding is undecidable from the units string alone.** A file may say
+  `1` and store 0–100. Decide from the data range: any value > 1 ⇒ stored as %; max ≈ 1 with
+  spread ⇒ fraction, offer ×100; all ≈ 0 (clear sky) ⇒ **undecidable, refuse to convert**.
+  This is a permanent runtime guard, not a one-off check.
+* **G23 — difference in float64, not float32.** Differencing two large near-equal
+  accumulations is catastrophic cancellation. The upcast is unconditional and costs nothing
+  at these array sizes.
+* **G24 — clamp float noise, surface real negatives.** A `sum`-kind rate must be ≥ 0.
+  Clamp `|x| < eps` (eps = 8 ulp at the accumulation's magnitude) to 0; anything larger is
+  evidence the field is not actually accumulated, so it is **surfaced as a warning** — else
+  the fix for G23 hides the G14 bug it exists to expose.
+* **G25 — QSettings in tests writes the developer's real preferences.** v2 persists a units
+  choice per field, so an unisolated test run silently changes what the app shows on the next
+  real launch, and reads back whatever a previous run left behind. `tests/conftest.py` now
+  redirects `QSettings` to a temp dir and clears it per test.
+
+---
+
+# Release 2 — units and de-accumulation (v2)
+
+Shipped 2026-08-24. Plan and rationale live in `v2.md`; this section is the durable record
+of what exists. **A** unit conversion (°C by default), **B** correct units for every field,
+**C** de-accumulation to 1 h / 3 h windows.
+
+## R2.1 The one transform layer
+
+Both A and C are transformations *between the file and the screen*, and there were already
+four consumers of raw values — the map, the graph, the readout and the status bar. Applying
+conversions at each call site is four chances to drift, and the failure mode (map in °C,
+readout in K) is worse than no conversion at all. So there is exactly one place values are
+produced:
+
+```
+memmap ─► EnsembleFile ──────────────► raw physical values   (R1 code, UNMODIFIED)
+               │                        tests/test_dataset.py stays green untouched
+               ▼
+          FieldView  ◄── Transform (rate ∘ units)
+               │
+    ┌──────────┼──────────┬───────────────┐
+    ▼          ▼          ▼               ▼
+ MapView   PlotView   ReadoutPanel   status bar
+```
+
+`main.py` wraps the dataset in one line (`FieldView(EnsembleFile(path))`) and `MapView` /
+`ReadoutPanel` needed no change at all. `EnsembleFile` stays pure as the raw-truth layer,
+which is what lets every transform be tested by round-tripping against it.
+
+**Ordering rule — do not reorder, the transforms do not commute:**
+
+```
+raw ──► [1] time-differencing ──► [2] unit conversion ──► display
+```
+
+and step [2] is *told* what step [1] produced: a window **sum** is a difference and takes
+`apply_delta` (scale only, **G15**); an instantaneous value or a window **mean** is absolute
+and takes the full affine.
+
+| file | responsibility |
+|---|---|
+| `imsicon/transform.py` | `Affine`, `normalise_units` (**G21**), the units registry, `ACCUMULATION`, the two **G14** window formulas |
+| `imsicon/fieldview.py` | `FieldView` — the decorator; `__getattr__` delegates everything not transformed |
+| `tests/synth.py` | a real NetCDF-3 64-bit-offset **writer**, so 13 untested fields become testable without the 407 MB file |
+| `tools/sniff_headers.py` | dev-only: settle a field's units from a 4 MiB prefix instead of a 262 MB download |
+
+## R2.2 Registry policy — field name is the key, units string is a guard
+
+If a file's units string does not match what the registry expects for that field, the app
+**warns and offers no conversion**, falling back to R1 behaviour. A mismatch means IMS
+changed something, and the safe response to "my assumption may be stale" is to stop
+converting, not to guess. An unknown field likewise opens normally with no conversion.
+
+Defaults: **°C** for `T_2M`/`T_S`, **mm** for `TOT_PREC` (exact — 1 kg m⁻² of water is 1 mm,
+so only the label changes), **cm** for `H_SNOW`, **%** for cloud *when the data says it is a
+fraction* (**G22**). `VMAX_10M` stays in file units — guessing a forecaster wants knots is a
+preference, not a fact.
+
+## R2.3 De-accumulation
+
+Only `TOT_PREC` (`sum`), `ASWDIFD_S` and `ASWDIR_S` (`mean`) accumulate; for everything else
+the Rate control is **disabled, not hidden** (a stable layout beats a jumping toolbar).
+The window is computed in *steps* — `round(hours / median(diff(forecast_hours)))` — never
+assuming 1 step = 1 hour. The first `k` steps are **NaN, not a partial window**: losing 3 of
+121 steps is nothing, while a silently-partial "3-hourly" total is a misread waiting to
+happen, so the curves use `connect='finite'` and the gap renders as a gap. Switching into a
+rate mode jumps to `t = k` so nobody lands on a blank map and concludes the app is broken.
+
+The units label follows the kind and is **not cosmetic**: `sum` k=1 → `mm h-1`, k=3 →
+`mm/3h`, while `mean` stays `W m-2` (a window mean is still a mean). `label_for` names the
+window — `2026-08-27 14:00Z (+110 h) [1 h to 14:00Z]` — because a rate is **backward
+looking** and a reader who takes it as instantaneous is off by one interval.
+
+## R2.4 Measured, not assumed
+
+| claim | measurement |
+|---|---|
+| 4 MiB of a `.nc.bz2` yields the header + 2 time steps; 16 MiB yields 8 | reproduced 2026-08-24: 1,637,625 / 8,177,912 / 17,475,602 / 27,221,957 B |
+| a prefix frame is the real file's frame | `np.array_equal` against the full 407 MB file, t=0 |
+| `np.diff` is wrong for an averaged field | see **G14** — recovers `[100,150,183,−33,−70]` instead of `[100,400,800,300,50]` |
+| the rate path stays inside a 60 fps scrub | on the real CAPE file: identity 0.12 ms, affine 0.33 ms, 1 h rate frame 3.47 ms, 3 h aggregated map 4.77 ms, point series 0.04 ms — budget is 16.7 ms |
+| no frame caching is needed | ⇒ confirmed; R1's "every read is a plain numpy slice" is intact |
+| **all 15 units strings** | measured against run `2026082400` — §0.2 is now observation, not documentation |
+| the `mean` formula on **real** `ASWDIR_S` | 23 real time steps: 0 at night, peak **1000.7 W m⁻² at 10 UTC** (local solar noon ≈ 09:40 UTC at 35°E), back to 0 by 17 UTC |
+| `np.diff` on the same real data | peaks at **76 W m⁻²** and goes **negative all afternoon** — impossible for a downward flux, and *plausible-looking all morning*, which is what makes G14 dangerous |
+| the `sum` round-trip on **real** `TOT_PREC` | `cumsum(hourly) − stored` max abs error **0.0**; 3 h rate exactly `A[t] − A[t−3]` |
+
+**Data quirk worth knowing:** on real `ASWDIR_S`, about **74 cells in 18.5 million**
+(0.0004 %) have a stored running mean whose *implied cumulative total decreases*, which a
+non-negative flux cannot do. That is in the file, not in the arithmetic. The rate view
+surfaces them as a warning rather than clamping them away (**G24**); the float32 rounding
+noise around them — 4.7 M values at ≈ −1e-4 — is clamped silently.
+
+## R2.5 Running it
+
+```bash
+venv/bin/python -m imsicon                                    # ask for a file
+venv/bin/python -m imsicon --units C data/ICON_ENS_..._T_2M.nc
+venv/bin/python -m imsicon --rate 1h data/ICON_ENS_..._TOT_PREC.nc
+venv/bin/python -m imsicon --screenshot out.png --units C --rate 1h <file>
+python tools/sniff_headers.py --local data/*.nc.bz2           # offline
+IMS_USER=... IMS_PASS=... python tools/sniff_headers.py --all --deep    # measures §0.2
+```
+
+Toolbar row 2 carries **Units** and **Rate**; each is disabled when the registry says it
+does not apply. A units choice is remembered per field, so Kelvin is never shown unless
+asked for.
 
 ## R1.6 Running it
 

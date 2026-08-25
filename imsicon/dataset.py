@@ -42,7 +42,12 @@ class EnsembleFile:
 
         self.member_labels = nc3.member_labels(self.hdr['attrs'].get('history'),
                                                self.n_members)
-        self._range = None
+        # G26: the file may hold fewer records than its header declares (interrupted
+        # download). It opens and reads correctly, but the user has to be told they are
+        # looking at part of a forecast.
+        self.truncated = bool(self.hdr.get('truncated'))
+        self.declared_times = int(self.hdr.get('declared_numrecs', self.n_times))
+        self._ranges = {}
 
     # ---- reads -----------------------------------------------------------------
     def frame(self, t, member):
@@ -98,24 +103,56 @@ class EnsembleFile:
         st = self.path.stat()
         return {'size': st.st_size, 'mtime': int(st.st_mtime), 'var': self.field_var}
 
-    def cached_range(self):
-        """Global (min, max) from the sidecar cache, or None if absent/stale."""
+    def _load_ranges(self):
+        """Sidecar contents, or {} when absent or stale.
+
+        Schema v2 (G19) keys ranges by transform signature, because a de-accumulated view
+        has its own range and cannot reuse the raw one. A v1 blob -- a bare {min, max} --
+        is read as the raw range, so no existing cache is thrown away.
+        """
         try:
             blob = json.loads(self.stats_path.read_text())
         except (OSError, ValueError):
-            return None
+            return {}
         if blob.get('key') != self._cache_key():
-            return None
-        self._range = (blob['min'], blob['max'])
-        return self._range
+            return {}
+        ranges = blob.get('ranges')
+        if ranges is None:
+            if 'min' in blob and 'max' in blob:            # v1
+                return {'raw': {'min': blob['min'], 'max': blob['max']}}
+            return {}
+        return ranges if isinstance(ranges, dict) else {}
 
-    def scan_range(self, progress=None, cancel=None):
-        """One full pass for the global min/max (~0.6 s for 407 MB). Caches the result."""
+    def cached_range(self, signature='raw'):
+        """Cached (min, max) for one transform view, or None if absent/stale."""
+        entry = self._load_ranges().get(signature)
+        if not isinstance(entry, dict) or 'min' not in entry or 'max' not in entry:
+            return None
+        self._ranges[signature] = (entry['min'], entry['max'])
+        return self._ranges[signature]
+
+    def _store_range(self, signature, lo, hi):
+        """Merge one signature into the sidecar, leaving the others intact."""
+        ranges = self._load_ranges()
+        ranges[signature] = {'min': lo, 'max': hi}
+        try:
+            self.stats_path.write_text(json.dumps(
+                {'schema': 2, 'key': self._cache_key(), 'ranges': ranges}))
+        except OSError:
+            pass                      # read-only location: cache is an optimisation only
+
+    def scan_range(self, progress=None, cancel=None, signature='raw', frame_source=None):
+        """One full pass for the global min/max (~0.6 s for 407 MB). Caches the result.
+
+        `frame_source` lets a transformed view be scanned in its own values while the
+        result is still filed against this file's sidecar.
+        """
+        source = frame_source if frame_source is not None else self.ens_frame
         lo, hi = np.inf, -np.inf
         for t in range(self.n_times):
             if cancel is not None and cancel():
                 return None
-            block = self.ens_frame(t)
+            block = source(t)
             if np.isfinite(block).any():
                 lo = min(lo, float(np.nanmin(block)))
                 hi = max(hi, float(np.nanmax(block)))
@@ -125,22 +162,33 @@ class EnsembleFile:
             lo, hi = 0.0, 1.0
         if hi <= lo:
             hi = lo + 1.0
-        self._range = (lo, hi)
-        try:
-            self.stats_path.write_text(json.dumps(
-                {'key': self._cache_key(), 'min': lo, 'max': hi}))
-        except OSError:
-            pass                      # read-only location: cache is an optimisation only
-        return self._range
+        self._ranges[signature] = (lo, hi)
+        self._store_range(signature, lo, hi)
+        return self._ranges[signature]
+
+    def range_for(self, signature='raw'):
+        """In-memory range for one transform view (None until cached or scanned)."""
+        return self._ranges.get(signature)
 
     @property
     def value_range(self):
-        return self._range
+        return self._ranges.get('raw')
+
+    @property
+    def truncation_note(self):
+        if not self.truncated:
+            return None
+        return (f'{self.path.name} holds only {self.n_times} of the '
+                f'{self.declared_times} forecast steps its header declares -- the file '
+                'looks incomplete (interrupted download?). Everything shown is correct, '
+                'but it stops early.')
 
     def summary(self):
+        short = (f' | INCOMPLETE: {self.n_times}/{self.declared_times} steps'
+                 if self.truncated else '')
         return (f'{self.path.name} | {self.field} ({self.long_name}) [{self.units}] | '
                 f'run {self.run_init:%Y-%m-%d %H:%M}Z | {self.n_members} members | '
-                f'{self.n_times} steps | {self.ny}x{self.nx} grid')
+                f'{self.n_times} steps{short} | {self.ny}x{self.nx} grid')
 
 
 def member_stats(values):

@@ -4,8 +4,9 @@ from pathlib import Path
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .. import geo, ingest, nc3
+from .. import geo, ingest, nc3, transform
 from ..dataset import EnsembleFile, member_stats
+from ..fieldview import FieldView
 from .mapview import MapView
 from .plotview import PlotView
 from .readout import ReadoutPanel
@@ -15,6 +16,21 @@ AGG_CHOICES = [('Ensemble mean', 'mean'), ('Ensemble max', 'max'), ('Ensemble mi
                ('Ensemble median', 'median'), ('Spread (max-min)', 'spread'),
                ('Single member', 'member')]
 COLORMAPS = ['turbo', 'viridis', 'inferno', 'plasma', 'magma', 'CET-L17']
+
+
+def _finite_max(frame, fallback):
+    """G20: `float(np.nanmax(f)) or 1.0` is nan for an all-NaN frame, because bool(nan)
+    is True -- and the `hi <= lo` guard downstream never fires, since `nan <= 0.0` is
+    False. So an all-NaN frame used to reach cbar.setLevels(high=nan)."""
+    values = np.asarray(frame)
+    good = values[np.isfinite(values)]
+    return float(good.max()) if good.size else float(fallback)
+
+
+def _finite_min(frame, fallback):
+    values = np.asarray(frame)
+    good = values[np.isfinite(values)]
+    return float(good.min()) if good.size else float(fallback)
 
 
 class ScanWorker(QtCore.QThread):
@@ -200,6 +216,29 @@ class MainWindow(QtWidgets.QMainWindow):
         self.scale_combo.currentIndexChanged.connect(lambda _: self.refresh_map())
         tb.addWidget(self.scale_combo)
 
+        self.addToolBarBreak()          # v2: display controls get their own row
+        row2 = self.addToolBar('Display')
+        row2.setMovable(False)
+        row2.addWidget(QtWidgets.QLabel(' Units: '))
+        self.units_combo = QtWidgets.QComboBox()
+        self.units_combo.setMinimumWidth(110)
+        self.units_combo.setEnabled(False)
+        self.units_combo.currentTextChanged.connect(self._on_units_changed)
+        row2.addWidget(self.units_combo)
+        row2.addWidget(QtWidgets.QLabel('   Rate: '))
+        self.rate_combo = QtWidgets.QComboBox()
+        self.rate_combo.setMinimumWidth(110)
+        self.rate_combo.setEnabled(False)
+        for hours in transform.RATE_HOURS:
+            self.rate_combo.addItem(transform.rate_label(hours), hours)
+        self.rate_combo.currentIndexChanged.connect(self._on_rate_changed)
+        row2.addWidget(self.rate_combo)
+
+        self.units_warning = QtWidgets.QLabel('')
+        self.units_warning.setStyleSheet('color:#a05000;')
+        self.units_warning.hide()
+        row2.addWidget(self.units_warning)
+
         reset = QtGui.QAction('Reset view', self)
         reset.setShortcut(QtGui.QKeySequence('Home'))
         reset.triggered.connect(self.map.reset_view)
@@ -262,7 +301,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _load(self, path):
         try:
-            ds = EnsembleFile(path)
+            raw = EnsembleFile(path)
+            saved = self.settings.value(f'units/{raw.field}', None)
+            ds = FieldView(raw, units_label=saved)
         except nc3.UnsupportedFormat as exc:
             self._error(str(exc))
             return
@@ -282,6 +323,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot.set_dataset(ds)
         self.readout.configure(ds)
 
+        self._sync_units_combo()
+        self._sync_rate_combo()
+        if ds.truncation_note:
+            self.status_right.setText('\u26a0 incomplete file')
+            self.status_right.setToolTip(ds.truncation_note)
+
         self.member_combo.blockSignals(True)
         self.member_combo.clear()
         self.member_combo.addItems(ds.member_labels)
@@ -293,23 +340,33 @@ class MainWindow(QtWidgets.QMainWindow):
         self.slider.setEnabled(True)
         self.slider.blockSignals(False)
 
-        cached = ds.cached_range()
-        if cached is None:
-            self.status_right.setText('scanning for dataset range...')
-            self.scan = ScanWorker(ds, self)
-            self.scan.finished_range.connect(self._on_scan_done)
-            self.scan.start()
-        else:
-            self._apply_range(cached)
+        self._ensure_range()
 
         iy, ix = ds.ny // 2, ds.nx // 2
         self.select_point(iy, ix)
         self.set_time(0)
 
+    def _ensure_range(self):
+        """Range for the CURRENT transform view: cached, or one background scan (G19).
+
+        A unit change never lands here -- its range is the cached one, transformed.
+        """
+        if self.ds is None:
+            return
+        cached = self.ds.cached_range()
+        if cached is not None:
+            self._apply_range(self.ds.value_range)
+            return
+        self._stop_scan()
+        self.status_right.setText('scanning for dataset range...')
+        self.scan = ScanWorker(self.ds, self)
+        self.scan.finished_range.connect(self._on_scan_done)
+        self.scan.start()
+
     def _on_scan_done(self, result):
         self.status_right.setText('')
-        if result is not None:
-            self._apply_range(result)
+        if result is not None and self.ds is not None:
+            self._apply_range(self.ds.value_range)
 
     def _apply_range(self, value_range):
         lo, hi = value_range
@@ -337,11 +394,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.scale_combo.currentIndex() == 0 and self.ds.value_range is not None:
             lo, hi = self.ds.value_range
             if mode == 'spread':
-                lo, hi = 0.0, float(np.nanmax(frame)) or 1.0
+                lo, hi = 0.0, _finite_max(frame, 1.0)
         else:
-            lo, hi = float(np.nanmin(frame)), float(np.nanmax(frame))
+            lo, hi = _finite_min(frame, 0.0), _finite_max(frame, 1.0)
+        units = f' [{self.ds.units}]' if self.ds.units else ''
         self.map.set_frame(frame, (lo, hi),
-                           f'{self.ds.field} - {what} - {self.ds.label_for(self.t)}')
+                           f'{self.ds.field}{units} - {what} - {self.ds.label_for(self.t)}')
 
     def set_time(self, t):
         if self.ds is None:
@@ -400,6 +458,74 @@ class MainWindow(QtWidgets.QMainWindow):
         self.member = max(0, index)
         if self.agg_combo.currentData() == 'member':
             self.refresh_map()
+
+    def _sync_units_combo(self):
+        """Reflect what the registry offers for this field (v2 1.3/1.4)."""
+        self.units_combo.blockSignals(True)
+        self.units_combo.clear()
+        self.units_combo.addItems(self.ds.unit_labels)
+        self.units_combo.setCurrentText(self.ds.units)
+        # Disabled, not hidden: a stable layout beats a jumping toolbar.
+        self.units_combo.setEnabled(self.ds.can_convert_units)
+        self.units_combo.blockSignals(False)
+        note = self.ds.units_note
+        self.units_combo.setToolTip(note or f'Display units for {self.ds.field}')
+        self.units_warning.setText(' \u26a0 no unit conversion offered' if note else '')
+        self.units_warning.setToolTip(note or '')
+        self.units_warning.setVisible(bool(note))
+
+    def _on_units_changed(self, label):
+        """One switch has to move the map, colorbar, y axis, readout and status bar
+        together -- which is exactly why the conversion lives in FieldView and not here."""
+        if self.ds is None or not label or not self.ds.set_units(label):
+            return
+        self.settings.setValue(f'units/{self.ds.field}', label)
+        self._refresh_units()
+
+    def _refresh_units(self):
+        ds = self.ds
+        self.status_left.setText(ds.summary())
+        self.plot.getAxis('left').enableAutoSIPrefix(False)   # G12: never 'kJ kg-1'
+        self.plot.setLabel('left', ds.field, units=ds.units or None)
+        self.readout.configure(ds)          # select_point below restores the point label
+        self.time_label.setText(ds.label_for(self.t))
+        if ds.value_range is not None:
+            self._apply_range(ds.value_range)
+        if self.point is not None:
+            self.select_point(*self.point)
+        else:
+            self.refresh_map()
+
+    def _sync_rate_combo(self):
+        """Disabled, not hidden, when the field is not accumulated -- a stable layout."""
+        self.rate_combo.blockSignals(True)
+        self.rate_combo.setCurrentIndex(max(0, self.rate_combo.findData(self.ds.rate_hours)))
+        self.rate_combo.setEnabled(self.ds.can_rate)
+        self.rate_combo.blockSignals(False)
+        self.rate_combo.setToolTip(
+            f'{self.ds.field} accumulates since model start ({self.ds.accum_kind}-kind): '
+            'show the value over a 1 h or 3 h window instead'
+            if self.ds.can_rate else
+            f'{self.ds.field} is not an accumulated field, so it has no window rate')
+
+    def _on_rate_changed(self, _index):
+        if self.ds is None:
+            return
+        hours = self.rate_combo.currentData() or 0
+        if not self.ds.set_rate(hours):
+            self._sync_rate_combo()
+            return
+        # V2.4.4: landing on a blank map reads as a broken app, so skip past the gap.
+        k = self.ds.window_steps
+        if self.t < k:
+            self.t = k
+            self.slider.blockSignals(True)
+            self.slider.setValue(k)
+            self.slider.blockSignals(False)
+        self._refresh_units()
+        self._ensure_range()
+        if self.ds.rate_note:
+            self.status_right.setText('\u26a0 ' + self.ds.rate_note)
 
     def _on_cmap_changed(self, name):
         self.map.set_colormap(name)

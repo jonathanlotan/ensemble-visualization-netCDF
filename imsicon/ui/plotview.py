@@ -21,12 +21,13 @@ class PlotView(pg.PlotWidget):
         self.setLabel('bottom', 'forecast hour')
         self.setMenuEnabled(False)
 
-        self._lo = pg.PlotDataItem(pen=None)
-        self._hi = pg.PlotDataItem(pen=None)
+        self._lo = pg.PlotDataItem(pen=None, connect='finite')
+        self._hi = pg.PlotDataItem(pen=None, connect='finite')
         self.envelope = pg.FillBetweenItem(self._lo, self._hi,
                                            brush=pg.mkBrush(60, 60, 60, 38))
         self.addItem(self.envelope)
-        self.mean_curve = pg.PlotDataItem(pen=pg.mkPen('#000000', width=2.6))
+        self.mean_curve = pg.PlotDataItem(pen=pg.mkPen('#000000', width=2.6),
+                                          connect='finite')
         self.mean_curve.setZValue(10)
         self.addItem(self.mean_curve)
 
@@ -54,7 +55,8 @@ class PlotView(pg.PlotWidget):
         self._curves = []
         for m in range(ds.n_members):
             pen = pg.mkPen(pg.intColor(m, hues=ds.n_members, alpha=190), width=1.1)
-            curve = pg.PlotDataItem(pen=pen, name=ds.member_labels[m])
+            curve = pg.PlotDataItem(pen=pen, name=ds.member_labels[m],
+                                    connect='finite')
             self.addItem(curve)
             self._curves.append(curve)
         self.getAxis('left').enableAutoSIPrefix(False)   # J kg-1, never 'kJ kg-1'
@@ -68,9 +70,17 @@ class PlotView(pg.PlotWidget):
         hours = self.ds.forecast_hours
         for m, curve in enumerate(self._curves):
             curve.setData(hours, series[:, m])
-        self.mean_curve.setData(hours, np.nanmean(series, axis=1))
-        self._lo.setData(hours, np.nanmin(series, axis=1))
-        self._hi.setData(hours, np.nanmax(series, axis=1))
+        with np.errstate(invalid='ignore'):
+            import warnings
+            with warnings.catch_warnings():
+                # An all-NaN time step is the window edge, not a problem.
+                warnings.simplefilter('ignore', RuntimeWarning)
+                mean = np.nanmean(series, axis=1)
+                lo = np.nanmin(series, axis=1)
+                hi = np.nanmax(series, axis=1)
+        self.mean_curve.setData(hours, mean)
+        self._lo.setData(hours, lo)
+        self._hi.setData(hours, hi)
 
     def clear_series(self):
         self.series = None

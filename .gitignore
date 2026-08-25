@@ -11,3 +11,6 @@ __pycache__/
 build/
 dist/
 *.spec
+
+# CLAUDE.md 0.1: the IMS product PDFs carry the server credentials.
+ims_products_*.pdf

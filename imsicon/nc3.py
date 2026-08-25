@@ -5,6 +5,7 @@ No netCDF4/HDF5/xarray needed. Verified element-for-element against netCDF4.Data
 on ICON_ENS_2026082300_CAPE_ML.nc (2026-08-23). See CLAUDE.md sections 0.4 and 0.5.
 """
 import datetime as dt
+import os
 import re
 import struct
 
@@ -81,14 +82,40 @@ def parse(path, header_bytes=1 << 20):
 
     # GOTCHA G2: every record variable contributes to the per-record stride.
     recsize = sum(v['vsize'] for v in variables.values() if v['record'])
-    return dict(version=version, numrecs=numrecs, dims=dict(dims),
+
+    # G26: a file shorter than its header claims -- an interrupted download, or a
+    # deliberately truncated prefix (tools/sniff_headers.py) -- would make view() build an
+    # as_strided window running past the end of the mapping. as_strided does NOT
+    # bounds-check, so that is a segfault rather than an exception. Clamp to the records
+    # the file actually holds, and keep what the header claimed for diagnostics.
+    declared = numrecs
+    record_vars = [v for v in variables.values() if v['record']]
+    if record_vars and recsize > 0:
+        record_start = min(v['begin'] for v in record_vars)
+        try:
+            available = max(0, (os.path.getsize(path) - record_start) // recsize)
+        except OSError:
+            available = numrecs
+        if available < numrecs:
+            numrecs = int(available)
+            for var in variables.values():
+                if var['record']:
+                    var['shape'][0] = numrecs
+
+    return dict(version=version, numrecs=numrecs, declared_numrecs=declared,
+                truncated=numrecs < declared, dims=dict(dims),
                 vars=variables, attrs=gattrs, recsize=recsize)
 
 
 def view(path, hdr, varname):
     """Zero-copy big-endian ndarray view of a variable. Slicing it reads from disk lazily."""
     v = hdr['vars'][varname]
-    base = np.memmap(path, dtype=np.uint8, mode='r')[v['begin']:].view(v['dtype'])
+    raw = np.memmap(path, dtype=np.uint8, mode='r')[v['begin']:]
+    # A truncated file (G26) usually stops mid-record, and numpy refuses a dtype cast that
+    # does not divide the buffer evenly. Drop the partial element; parse() has already
+    # clamped `numrecs`, so nothing the view exposes lives in the discarded tail.
+    usable = (raw.size // v['itemsize']) * v['itemsize']
+    base = raw[:usable].view(v['dtype'])
     shape = tuple(v['shape'])
     it = v['itemsize']
     inner = [int(np.prod(shape[i + 1:])) * it for i in range(len(shape))]
