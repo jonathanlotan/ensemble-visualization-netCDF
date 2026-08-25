@@ -4,9 +4,10 @@ from pathlib import Path
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .. import geo, ingest, nc3, transform
+from .. import geo, ingest, nc3, ncwrite, transform
 from ..dataset import EnsembleFile, member_stats
 from ..fieldview import FieldView
+from . import derivedialog, downloaddialog
 from .mapview import MapView
 from .plotview import PlotView
 from .readout import ReadoutPanel
@@ -15,7 +16,12 @@ FILE_FILTER = 'ICON ensemble (*.nc *.nc.bz2);;NetCDF (*.nc);;Compressed (*.nc.bz
 AGG_CHOICES = [('Ensemble mean', 'mean'), ('Ensemble max', 'max'), ('Ensemble min', 'min'),
                ('Ensemble median', 'median'), ('Spread (max-min)', 'spread'),
                ('Single member', 'member')]
-COLORMAPS = ['turbo', 'viridis', 'inferno', 'plasma', 'magma', 'CET-L17']
+COLORMAPS = ['turbo', 'viridis', 'inferno', 'plasma', 'magma', 'CET-L17',
+             # Diverging, for a difference map: a single hue ramp cannot show which side
+             # of zero a value is on, which is the only thing a difference map is for.
+             'CET-D1A', 'CET-D9', 'CET-D3']
+DIVERGING_DEFAULT = 'CET-D1A'
+SEQUENTIAL_DEFAULT = 'turbo'
 
 
 def _finite_max(frame, fallback):
@@ -31,6 +37,12 @@ def _finite_min(frame, fallback):
     values = np.asarray(frame)
     good = values[np.isfinite(values)]
     return float(good.min()) if good.size else float(fallback)
+
+
+def _symmetric(lo, hi):
+    """The smallest range about 0 containing (lo, hi) -- a difference map's scale."""
+    reach = max(abs(float(lo)), abs(float(hi)))
+    return (-reach, reach) if reach > 0 else (-1.0, 1.0)
 
 
 class ScanWorker(QtCore.QThread):
@@ -76,6 +88,33 @@ class DecompressWorker(QtCore.QThread):
             self.failed.emit(str(exc))
 
 
+class WriteWorker(QtCore.QThread):
+    """`ncwrite.write_canonical` off the UI thread: a full field is 407 MB."""
+    progressed = QtCore.Signal(int, int)
+    finished_path = QtCore.Signal(object)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, ds, path, parent=None):
+        super().__init__(parent)
+        self.ds = ds
+        self.path = path
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        try:
+            written = ncwrite.write_canonical(
+                self.path, self.ds, progress=self.progressed.emit,
+                cancel=lambda: self._cancel)
+            self.finished_path.emit(written)
+        except ncwrite.Cancelled:
+            self.finished_path.emit(None)
+        except Exception as exc:
+            self.failed.emit(f'{type(exc).__name__}: {exc}')
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, path=None):
         super().__init__()
@@ -90,7 +129,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.point = None            # (iy, ix)
         self.scan = None
         self.decompressor = None
+        self.builder = None
+        self.writer = None
         self._progress = None
+        # Every file-backed view this window has opened, so building a derived field on
+        # the field already on screen does not map another 407 MB of the same bytes.
+        self.opened = {}
 
         self._build_ui()
         self._pending = path
@@ -189,6 +233,27 @@ class MainWindow(QtWidgets.QMainWindow):
         open_action.setShortcut(QtGui.QKeySequence.StandardKey.Open)
         open_action.triggered.connect(self.open_dialog)
         tb.addAction(open_action)
+
+        self.download_action = QtGui.QAction('Download...', self)
+        self.download_action.setShortcut(QtGui.QKeySequence('Ctrl+D'))
+        self.download_action.setToolTip('Fetch a map for a chosen run straight from the '
+                                        'IMS server')
+        self.download_action.triggered.connect(self.download_dialog)
+        tb.addAction(self.download_action)
+
+        self.derive_action = QtGui.QAction('Derived field...', self)
+        self.derive_action.setShortcut(QtGui.QKeySequence('Ctrl+R'))
+        self.derive_action.setToolTip('Dew point from temperature and humidity, or the '
+                                      'difference between two fields')
+        self.derive_action.triggered.connect(self.derive_dialog)
+        tb.addAction(self.derive_action)
+
+        self.save_action = QtGui.QAction('Save field...', self)
+        self.save_action.setShortcut(QtGui.QKeySequence.StandardKey.Save)
+        self.save_action.setToolTip('Write what is on screen to a NetCDF file')
+        self.save_action.setEnabled(False)
+        self.save_action.triggered.connect(self.save_dialog)
+        tb.addAction(self.save_action)
         tb.addSeparator()
 
         tb.addWidget(QtWidgets.QLabel(' Map shows: '))
@@ -310,29 +375,41 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as exc:
             self._error(f'Could not open {Path(path).name}:\n{exc}')
             return
+        self.opened[Path(path)] = ds
+        self._install(ds, path.name, near=path)
 
+    def _install(self, ds, title, near=None):
+        """Put any view -- a file-backed FieldView or a derived one -- on screen.
+
+        A derived field is not a special case anywhere below this line: `derived.py`
+        mirrors `FieldView`'s surface precisely so that the map, the graph, the readout
+        and the toolbar keep working on it unchanged.
+        """
         self._stop_scan()
         self.ds = ds
         self.t = 0
         self.member = 0
         self.stack.setCurrentIndex(1)
-        self.setWindowTitle(f'IMS ICON Ensemble Viewer - {path.name}')
+        self.setWindowTitle(f'IMS ICON Ensemble Viewer - {title}')
         self.status_left.setText(ds.summary())
 
-        self.map.set_dataset(ds, geo.coastline_for(path))
+        self.map.set_dataset(ds, geo.coastline_for(near or ds.path))
         self.plot.set_dataset(ds)
         self.readout.configure(ds)
+        self._sync_colormap(ds)
 
         self._sync_units_combo()
         self._sync_rate_combo()
-        if ds.truncation_note:
-            self.status_right.setText('\u26a0 incomplete file')
-            self.status_right.setToolTip(ds.truncation_note)
+        # Cleared as well as set: this runs again for every field the user opens, and a
+        # warning left over from the previous one would be pointing at nothing.
+        self.status_right.setText('\u26a0 incomplete file' if ds.truncation_note else '')
+        self.status_right.setToolTip(ds.truncation_note or '')
 
         self.member_combo.blockSignals(True)
         self.member_combo.clear()
         self.member_combo.addItems(ds.member_labels)
         self.member_combo.blockSignals(False)
+        self.save_action.setEnabled(True)
 
         self.slider.blockSignals(True)
         self.slider.setRange(0, ds.n_times - 1)
@@ -345,6 +422,116 @@ class MainWindow(QtWidgets.QMainWindow):
         iy, ix = ds.ny // 2, ds.nx // 2
         self.select_point(iy, ix)
         self.set_time(0)
+
+    # ---- downloading, deriving, saving ------------------------------------------
+    def download_dialog(self):
+        """Phase 8 / v2.md 6.2: choose a run and a map, fetch it, open it."""
+        dialog = downloaddialog.DownloadDialog(self)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        fetched = list(dialog.downloaded)
+        if not fetched:
+            return
+        # Several fields can be fetched at once (the dew point needs two). Open the first
+        # so the download lands the user in the viewer, and say what else arrived.
+        if len(fetched) > 1:
+            self.status_right.setText(
+                f'downloaded {len(fetched)} files: ' + ', '.join(p.name for p in fetched))
+        self.open_path(fetched[0])
+
+    def derive_dialog(self):
+        """Dew point, dew point depression, or an A-B difference map."""
+        near = self.ds.path if self.ds is not None else None
+        run = f'{self.ds.run_init:%Y%m%d%H}' if self.ds is not None else None
+        dialog = derivedialog.DerivedDialog(self, near=near, run=run)
+        if not dialog.available:
+            self._error('No ICON ensemble files were found beside the open file, in '
+                        './data, or in the cache. Open or download a run first.')
+            return
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        request = dialog.request()
+        if request is None:
+            return
+        self._progress = QtWidgets.QProgressDialog(
+            f'Building {request.title}...', 'Cancel', 0, 0, self)
+        self._progress.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+        self._progress.setMinimumDuration(0)
+        self.builder = derivedialog.BuildWorker(request, dict(self.opened), self)
+        self.builder.progressed.connect(
+            lambda text: self._progress and self._progress.setLabelText(text))
+        self.builder.finished_view.connect(lambda view: self._on_derived(view, request))
+        self.builder.failed.connect(self._on_derive_failed)
+        self._progress.canceled.connect(self.builder.cancel)
+        self.builder.start()
+
+    def _on_derived(self, view, request):
+        if self._progress is not None:
+            self._progress.reset()
+            self._progress = None
+        if view is None:
+            return
+        saved = self.settings.value(f'units/{view.field}', None)
+        if saved:
+            view.set_units(saved)
+        self._install(view, request.title)
+        if view.note:
+            self.status_right.setText('⚠ ' + view.note)
+
+    def _on_derive_failed(self, message):
+        if self._progress is not None:
+            self._progress.reset()
+            self._progress = None
+        self._error(message)
+
+    def save_dialog(self):
+        """Write what is on screen to a real NetCDF-3 file (the "writes" half of F5)."""
+        if self.ds is None:
+            return
+        run = f'{self.ds.run_init:%Y%m%d%H}'
+        name = f'ICON_ENS_{run}_{ncwrite.nc_variable_name(self.ds.field)}.nc'
+        start = self.settings.value('last_dir', '') or str(Path.cwd())
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, 'Write field to NetCDF', str(Path(start) / name), 'NetCDF (*.nc)')
+        if not path:
+            return
+        units = self.ds.canonical_units
+        self._progress = QtWidgets.QProgressDialog(
+            f'Writing {Path(path).name} in {units}...', 'Cancel', 0,
+            self.ds.n_times, self)
+        self._progress.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+        self._progress.setMinimumDuration(0)
+        self.writer = WriteWorker(self.ds, path, self)
+        self.writer.progressed.connect(self._on_write_progress)
+        self.writer.finished_path.connect(self._on_written)
+        self.writer.failed.connect(self._on_write_failed)
+        self._progress.canceled.connect(self.writer.cancel)
+        self.writer.start()
+
+    def _on_write_progress(self, done, total):
+        if self._progress is not None:
+            self._progress.setValue(done)
+
+    def _on_written(self, path):
+        if self._progress is not None:
+            self._progress.reset()
+            self._progress = None
+        if path is not None:
+            self.status_right.setText(f'wrote {Path(path).name}')
+
+    def _on_write_failed(self, message):
+        if self._progress is not None:
+            self._progress.reset()
+            self._progress = None
+        self._error(f'Could not write the field:\n{message}')
+
+    def _sync_colormap(self, ds):
+        """A difference wants a diverging ramp; anything else wants a sequential one."""
+        wanted = DIVERGING_DEFAULT if getattr(ds, 'diverging', False) else SEQUENTIAL_DEFAULT
+        if self.cmap_combo.currentText() != wanted:
+            self.cmap_combo.setCurrentText(wanted)      # fires _on_cmap_changed
+        else:
+            self.map.set_colormap(wanted)
 
     def _ensure_range(self):
         """Range for the CURRENT transform view: cached, or one background scan (G19).
@@ -397,6 +584,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 lo, hi = 0.0, _finite_max(frame, 1.0)
         else:
             lo, hi = _finite_min(frame, 0.0), _finite_max(frame, 1.0)
+        if getattr(self.ds, 'diverging', False) and mode != 'spread':
+            # A difference map has to be symmetric about zero, or the colour that means
+            # "no difference" moves with the data and +2 K reads as the same colour as
+            # -2 K did a frame earlier. `spread` is excluded: it is non-negative already.
+            lo, hi = _symmetric(lo, hi)
         units = f' [{self.ds.units}]' if self.ds.units else ''
         self.map.set_frame(frame, (lo, hi),
                            f'{self.ds.field}{units} - {what} - {self.ds.label_for(self.t)}')
@@ -553,9 +745,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, ev):
         self._stop_scan()
-        if self.decompressor is not None and self.decompressor.isRunning():
-            self.decompressor.cancel()
-            self.decompressor.wait(3000)
+        for worker in (self.decompressor, self.builder, self.writer):
+            if worker is not None and worker.isRunning():
+                worker.cancel()
+                worker.wait(3000)
         super().closeEvent(ev)
 
     def _error(self, message):

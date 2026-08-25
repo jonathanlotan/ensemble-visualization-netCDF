@@ -4,6 +4,7 @@
 thread with progress and a cancel hook.
 """
 import bz2
+import re
 import os
 import time
 import shutil
@@ -13,6 +14,8 @@ from pathlib import Path
 CHUNK = 1 << 22                 # 4 MiB
 MIN_FREE_BYTES = 1 << 30        # refuse to decompress with under 1 GB free
 DEFAULT_CACHE_BUDGET = 4 << 30  # LRU-evict above 4 GB (one full run is ~6 GB)
+# Downloads are the compressed originals (~262 MB each), kept so a re-open never refetches.
+DEFAULT_DOWNLOAD_BUDGET = 4 << 30
 
 
 class DiskFull(Exception):
@@ -32,6 +35,18 @@ def cache_dir():
     return path
 
 
+def download_dir():
+    """Where the built-in downloader puts the compressed originals it fetched.
+
+    A sibling of the decompressed cache, not the same directory: the two hold different
+    things, expire on their own budgets, and mixing them would make an eviction glob
+    delete whichever the user actually wanted to keep.
+    """
+    path = cache_dir().parent / 'downloads'
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def is_compressed(path):
     return str(path).lower().endswith('.bz2')
 
@@ -40,9 +55,9 @@ def expected_target(path):
     return cache_dir() / Path(path).name[:-4]      # drop '.bz2'
 
 
-def evict(budget=DEFAULT_CACHE_BUDGET):
-    """Drop least-recently-used cached .nc files until the cache fits the budget."""
-    files = sorted(cache_dir().glob('*.nc'), key=lambda f: f.stat().st_atime)
+def _evict_glob(root, pattern, budget):
+    """Drop least-recently-used files matching `pattern` until `root` fits `budget`."""
+    files = sorted(root.glob(pattern), key=lambda f: f.stat().st_atime)
     total = sum(f.stat().st_size for f in files)
     for f in files:
         if total <= budget:
@@ -51,8 +66,24 @@ def evict(budget=DEFAULT_CACHE_BUDGET):
         try:
             f.unlink()
             total -= size
+            # The stats sidecar is worthless once its .nc is gone, and it is keyed on that
+            # file's size+mtime, so it can never be reused by anything else.
+            f.with_suffix(f.suffix + '.imsstats.json').unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def evict(budget=DEFAULT_CACHE_BUDGET):
+    """Drop least-recently-used cached .nc files until the cache fits the budget."""
+    _evict_glob(cache_dir(), '*.nc', budget)
+
+
+def evict_downloads(budget=DEFAULT_DOWNLOAD_BUDGET):
+    """The same, for the compressed originals the downloader fetched.
+
+    `.part` files are deliberately spared: an interrupted transfer is meant to resume.
+    """
+    _evict_glob(download_dir(), '*.nc.bz2', budget)
 
 
 def decompress(path, progress=None, cancel=None):
@@ -96,3 +127,50 @@ def resolve(path, progress=None, cancel=None):
     """Accept either `.nc` or `.nc.bz2` and return a path that nc3 can memmap."""
     path = Path(path)
     return decompress(path, progress, cancel) if is_compressed(path) else path
+
+
+# ---- finding the other fields of a run --------------------------------------------------
+# Same strictness as the server listing (download.NAME_RE): a file is only treated as an
+# ensemble product if its name says exactly what run and field it is.
+RUN_FILE_RE = re.compile(r'^ICON_ENS_(?P<run>\d{10})_(?P<field>[A-Z0-9_]+)\.nc(?P<bz2>\.bz2)?$')
+
+
+def search_roots(near=None):
+    """Where to look for the other fields of a run: beside the open file, then the caches."""
+    roots = []
+    if near is not None:
+        near = Path(near)
+        roots.append(near if near.is_dir() else near.parent)
+    roots += [Path.cwd() / 'data', Path.cwd()]
+    try:
+        roots += [cache_dir(), download_dir()]
+    except OSError:
+        pass
+    seen, unique = set(), []
+    for root in roots:
+        key = str(root)
+        if key not in seen and root.is_dir():
+            seen.add(key)
+            unique.append(root)
+    return unique
+
+
+def scan_for_fields(roots):
+    """-> {(run, field): Path} over `roots`, in priority order.
+
+    An already-decompressed `.nc` always wins over the `.nc.bz2` it came from -- opening
+    the second field of a pair should not spend 16 s re-expanding a file that is sitting
+    in the cache. Earlier roots win over later ones, so the directory the user is actually
+    working in beats a stale copy in the cache.
+    """
+    found = {}
+    for root in roots:
+        for path in sorted(root.iterdir() if root.is_dir() else []):
+            match = RUN_FILE_RE.match(path.name)
+            if not match or not path.is_file():
+                continue
+            key = (match.group('run'), match.group('field'))
+            previous = found.get(key)
+            if previous is None or (is_compressed(previous) and not match.group('bz2')):
+                found[key] = path
+    return found

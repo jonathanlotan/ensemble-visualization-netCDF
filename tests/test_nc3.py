@@ -83,8 +83,10 @@ def test_hdf5_is_rejected_clearly(tmp_path):
 
 def test_prototype_cli_runs_without_arguments():
     """B1: `python prototype/nc3.py` used to die with IndexError on sys.argv[1]."""
-    if not (ROOT / 'data').glob('*.nc'):
-        pytest.skip('no data files')
+    # `Path.glob` returns a GENERATOR, which is always truthy -- so this guard used to let
+    # the test run (and fail on exit code 2) on any checkout without a `data/` directory.
+    if not any((ROOT / 'data').glob('*.nc')):
+        pytest.skip('no data files: the CLI has nothing to auto-discover')
     done = subprocess.run([sys.executable, str(ROOT / 'prototype' / 'nc3.py')],
                           capture_output=True, text=True, cwd=ROOT)
     assert done.returncode == 0, done.stderr

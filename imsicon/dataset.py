@@ -8,9 +8,8 @@ import json
 import numpy as np
 from pathlib import Path
 
-from . import nc3
-
-AGGREGATIONS = ('mean', 'max', 'min', 'spread', 'median')
+from . import nc3, transform
+from .transform import AGGREGATIONS      # noqa: F401  (re-exported: v1 import site)
 
 
 class EnsembleFile:
@@ -60,18 +59,7 @@ class EnsembleFile:
 
     def agg_frame(self, t, mode):
         """Map of an across-member aggregation at time index t."""
-        stack = self.ens_frame(t)
-        if mode == 'mean':
-            return np.nanmean(stack, axis=0)
-        if mode == 'max':
-            return np.nanmax(stack, axis=0)
-        if mode == 'min':
-            return np.nanmin(stack, axis=0)
-        if mode == 'median':
-            return np.nanmedian(stack, axis=0)
-        if mode == 'spread':
-            return np.nanmax(stack, axis=0) - np.nanmin(stack, axis=0)
-        raise ValueError(f'unknown aggregation {mode!r}')
+        return transform.aggregate(self.ens_frame(t), mode)
 
     def series(self, iy, ix):
         """All members through time at one grid point -> (n_times, n_members) float32."""

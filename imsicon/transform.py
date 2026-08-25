@@ -30,10 +30,20 @@ class Affine(NamedTuple):
         return (self.a, self.b) == (1.0, 0.0)
 
     def apply(self, x):
-        """An ABSOLUTE value: instantaneous, or the mean over a window."""
+        """An ABSOLUTE value: instantaneous, or the mean over a window.
+
+        The two degenerate cases are split out because they are the common ones, not the
+        rare ones: K->degC is a pure offset (a = 1) and mm->kg m-2 a pure scale, and
+        `x * 1.0 + b` walks a 3.4 MB frame twice to do one addition's work.
+        """
         if self.is_identity:
             return x
-        return np.asarray(x) * self.a + self.b
+        x = np.asarray(x)
+        if self.a == 1.0:
+            return x + self.b
+        if self.b == 0.0:
+            return x * self.a
+        return x * self.a + self.b
 
     def apply_delta(self, d):
         """A DIFFERENCE (G15): the offset does not apply to a change in the quantity."""
@@ -123,6 +133,10 @@ UNITS = {
     'CAPE_ML':   FieldUnits(('J kg-1',), []),
     'T_2M':      FieldUnits(('K',), _TEMPERATURE),
     'T_S':       FieldUnits(('K',), _TEMPERATURE),
+    # Not an IMS product: derived.DewPointView computes it from T_2M and RELHUM_2M and
+    # ncwrite can save it. Registered as a Kelvin temperature so a written TD_2M file
+    # reopens with exactly the treatment T_2M gets, degC default included.
+    'TD_2M':     FieldUnits(('K',), _TEMPERATURE),
     'RELHUM_2M': FieldUnits(('%',), []),
     # kg m-2 -> mm is exact and free: 1 kg m-2 of water over 1 m2 is 1 mm depth.
     'TOT_PREC':  FieldUnits(('kg m-2',), [Affine('mm'), Affine('kg m-2')]),
@@ -203,6 +217,36 @@ def choices_for(field, file_units, sample=None):
         # spelling: the server sends 'W/m**2' and 'W m-2' is what everything else says.
         return [Affine(canonical)], None
     return list(entry.choices), None
+
+
+# ---- across-member aggregation ----------------------------------------------------------
+AGGREGATIONS = ('mean', 'max', 'min', 'median', 'spread')
+
+
+def aggregate(stack, mode):
+    """Aggregate a (n_members, ...) stack across members.
+
+    One copy, because three layers need it -- `EnsembleFile`, `FieldView` and the derived
+    views -- and three copies of a ladder like this drift. Note that callers convert the
+    member stack BEFORE aggregating, which is what makes `spread` (a max-min DIFFERENCE,
+    where an affine offset must cancel -- G15) correct by construction.
+    """
+    stack = np.asarray(stack)
+    if stack.size and np.isnan(stack).all():
+        # The window edge of a rate view: an all-NaN frame is intended, so do not let
+        # numpy warn about it on every redraw.
+        return np.full(stack.shape[1:], np.nan, dtype=stack.dtype)
+    if mode == 'mean':
+        return np.nanmean(stack, axis=0)
+    if mode == 'max':
+        return np.nanmax(stack, axis=0)
+    if mode == 'min':
+        return np.nanmin(stack, axis=0)
+    if mode == 'median':
+        return np.nanmedian(stack, axis=0)
+    if mode == 'spread':
+        return np.nanmax(stack, axis=0) - np.nanmin(stack, axis=0)
+    raise ValueError(f'unknown aggregation {mode!r}')
 
 
 # ---- de-accumulation (v2 section 3 / V2.3) ---------------------------------------------

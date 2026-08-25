@@ -622,3 +622,226 @@ Controls: **wheel** zooms the map, **drag** pans, **click** picks the grid point
 feeds the graph, **Home** / *Reset view* refits the domain, the slider and ←/→
 (shift = 6 h) move through the 121 forecast hours, **Play** animates, and hovering the
 graph fills the readout. Dropping a file on the window opens it.
+
+---
+
+# Release 3 — downloader, dew point, difference map (v3)
+
+Scope: three items requested on 2026-08-25 — **D1** a downloader that lets the user choose
+a map (CAPE, precipitation or any of the other 13), **D2** an option that *visualizes and
+writes* the dew point temperature from temperature and humidity, and **D3** a map that
+shows the difference. Sections 0 (byte math), R1 (the two-panel viewer) and R2 (the one
+transform layer) are unchanged and still the contract.
+
+**A1 (v3) — "a map that shows the difference".** Read as the difference between two
+fields of one run, with the **dew point depression `T_2M − TD_2M`** as the flagship case,
+since it is what the dew point item makes newly possible and it is the quantity a
+forecaster actually reads. The implementation is the general `A − B`, so it also covers
+"the same field two ways". If "the difference" meant something else — between two *runs*,
+or between a member and the ensemble mean — the pairing rule changes but `DifferenceView`
+does not; see R3.6.
+
+## R3.1 The shape of it
+
+Every item is the same problem twice over: **one run's files belong together.** The
+downloader fetches several fields of one run, and both derived fields combine two files of
+one run. So there is one discovery function (`ingest.scan_for_fields`), one pairing check
+(`derived.check_pairable`), and one view base class.
+
+```
+        IMS server  ──download.py──►  ICON_ENS_<run>_<FIELD>.nc.bz2
+                                              │ ingest.decompress (R1, unchanged)
+                                              ▼
+                                      EnsembleFile ──► FieldView       (R1 / v2, unchanged)
+                                              │
+                    ┌─────────────────────────┼─────────────────────────┐
+                    ▼                         ▼                         ▼
+              DewPointView              DifferenceView             ncwrite.py
+           (T_2M + RELHUM_2M)               (A − B)            write it back as .nc
+                    └──────────► both mirror FieldView's surface ◄──────────┘
+                                              │
+                              MapView · PlotView · ReadoutPanel · status bar
+                                     (no special case anywhere)
+```
+
+The last line is the design claim, and `tests/test_ui_derived.py` is what holds it: the
+window installs a derived view through the same `_install` the file path uses, and every
+panel keeps working. `MainWindow._load` was split into `_load` (file → `FieldView`) and
+`_install` (any view → screen); nothing else in the UI knows derived fields exist.
+
+| file | responsibility |
+|---|---|
+| `imsicon/download.py` | field catalogue, credentials, listing parse, resumable transfer. No Qt |
+| `imsicon/derived.py` | Magnus dew point, `check_pairable` (**G17**), `DewPointView`, `DifferenceView`. No Qt |
+| `imsicon/ncwrite.py` | NetCDF-3 64-bit-offset **writer**, promoted out of `tests/synth.py` |
+| `imsicon/ui/downloaddialog.py` | run × field picker, sizes, cached state, sequential fetch |
+| `imsicon/ui/derivedialog.py` | dew point / depression / A−B picker, and the build worker |
+
+## R3.2 D1 — the downloader
+
+`CLAUDE.md` Phase 8 and `v2.md` 6.2, built. **Download…** (`Ctrl+D`) → credentials →
+listing → tick maps → fetch → the first one opens in the viewer.
+
+* 15 products with menu labels (`CAPE - instability`, `Precipitation - total`, …) so the
+  choice is a *map*, not a variable name. Catalogue order, not alphabetical.
+* **Several fields at once**, downloaded one at a time. The dew point needs two files, and
+  a *Select what the dew point needs* button ticks exactly `T_2M` and `RELHUM_2M`.
+* **Resumable.** `Range` into `<name>.part`, atomic rename only after a size check against
+  the listing. A cancelled or dropped transfer deliberately **keeps** the `.part`.
+* Downloads land in their own directory beside the decompressed cache, with their own LRU
+  budget; `.part` files are spared from eviction.
+* Credentials: keyring → `IMS_USER`/`IMS_PASS` → prompt. **Never `QSettings`.**
+
+## R3.3 D2 — the dew point
+
+Alduchov & Eskridge (1996), the modern refit of Magnus–Tetens, better than 0.1 °C over
+−40…+50 °C and 1–100 % RH:
+
+```
+gamma = ln(RH/100) + a·T/(b + T)          a = 17.625,  b = 243.04 °C
+Td    = b·gamma / (a − gamma)
+```
+
+Verified against published values at (20 °C, 50 %) → 9.3, (30 °C, 60 %) → 21.4,
+(−10 °C, 80 %) → −12.8, (35 °C, 20 %) → 8.7, (5 °C, 90 %) → 3.5.
+
+Three edge cases decide whether it survives real model output, and all three are enforced
+rather than assumed:
+
+| input | why it matters | what happens |
+|---|---|---|
+| RH > 100 % | float noise at saturation gives **Td > T**, which is impossible | clamped to 100, where the formula collapses **exactly** to Td = T |
+| RH ≤ 0 % | `ln(0)` is −inf; a huge negative Td still colours a map convincingly | **NaN**, and the count is reported once |
+| T ≤ −243.04 °C | the formula's pole | masked; a pole that is "unreachable" is what turns up in a file one day |
+
+`Td ≤ T` is enforced at the end, so rounding cannot produce a supersaturated pixel.
+
+**Canonical space is Kelvin.** `TD_2M` joins the v2 registry as a Kelvin temperature, so it
+gets °C by default and °C/K/°F on the combo — and a *written* `TD_2M` file reopens with
+exactly the treatment `T_2M` gets, rather than a "these units look stale" warning.
+
+**Writing it.** `ncwrite.write_canonical` streams the field out as a genuine NetCDF-3
+64-bit-offset file — `netCDF4` reads it, and so does this app. Measured: values round-trip
+**bit-identically**, member labels survive (**G1**), and `T_2M − TD_2M` built from the
+written file equals the live computation. The file carries an `imsicon_provenance`
+attribute naming both inputs and the formula. **Save field…** (`Ctrl+S`) writes whatever is
+on screen; `--write PATH` does it headlessly.
+
+## R3.4 D3 — the difference map
+
+`DifferenceView` subtracts the operands' **display** values, member by member. That is not
+laziness: for a shared affine `y = s·x + o`, `(s·a + o) − (s·b + o) = s·(a − b)` — the
+offset cancels on its own, so **G15** is satisfied by construction rather than by a special
+case, and the same identity is why a unit change only ever *rescales* the cached range by
+`s'/s` instead of forcing a rescan. Both operands are therefore held to one unit selection.
+
+* **Member by member, then aggregate.** `max(a) − max(b) ≠ max(a − b)`, and only the
+  latter is the question asked. `agg_frame` aggregates the stack of differences.
+* **Diverging colormap, symmetric scale.** `CET-D1A`, levels pinned to ±max|v|. A
+  sequential ramp cannot show which side of zero a value is on, and an asymmetric scale
+  moves the colour that means "no difference" as the data changes. `spread` is excluded —
+  it is non-negative already.
+* **Unlike quantities are refused**, with a cheap registry pre-check
+  (`derived.units_look_compatible`) so the dialog greys out `RELHUM_2M − T_2M` *before*
+  spending 16 s decompressing to find out.
+
+## R3.5 Measured, not assumed
+
+Timings on the real spatial grid (20 members × 261 × 161 = 840,420 values per frame),
+against v2's 16.7 ms 60 fps budget:
+
+| operation | before | after | note |
+|---|---|---|---|
+| dew point kernel | 13.22 ms | **4.73 ms** | in-place numpy; see **G28** |
+| dew point, aggregated map | 16.54 ms | **6.87 ms** | |
+| dew point, spread map | 16.77 ms ⚠ | **6.12 ms** | was over budget |
+| difference (T − Td), aggregated map | 22.61 ms ⚠ | **14.05 ms** | was over budget |
+| plain field, aggregated map | 2.76 ms | **2.12 ms** | `Affine.apply` fix helps every view |
+| point time series (either) | — | **0.03 ms** | |
+| dew point range scan | — | **~1.1 s** for 121 steps | background, no sidecar (see below) |
+| writing a full field | — | **~2 s** for 407 MB | streamed, one frame at a time |
+
+Where the kernel time went, before the rewrite: `np.where` for the guards was **8.2 ms** of
+13.2, and the logarithm only **0.47 ms**. The formula is not the expensive part; the
+allocations are.
+
+**Derived views cache their range in memory only, never in the `.imsstats.json` sidecar.**
+The sidecar is keyed on *one* file's size and mtime (`EnsembleFile._cache_key`), which
+cannot identify a value depending on two files — a stale entry would be indistinguishable
+from a fresh one. ~1 s off the UI thread is a fair price for not inventing a two-file key.
+
+## R3.6 Deliberately not done
+
+* **Cross-run differences.** `check_pairable` refuses two runs by name, because aligning
+  them needs *valid* time rather than forecast hour (`v2.md` 6.1.5). The view would not
+  change; only the pairing rule would.
+* **The 4 MiB prefix sniff in the download dialog** (`v2.md` 6.2.5) — showing a field's
+  units and range before committing to 262 MB. `tools/sniff_headers.py` still does it from
+  the command line.
+* **No live server test.** Every downloader test drives a fake session with real `Range`
+  semantics; the IMS credentials were not available here, so the transfer logic is verified
+  but the NTLM handshake against the real server is not.
+* Probability of exceedance and wind (`v2.md` §5), side-by-side fields (`v2.md` 6.1).
+
+## R3.7 Gotchas found while building v3
+
+* **G27 — a name from the server listing must never become a local path.** The listing is
+  attacker-controlled in principle and sloppy in practice. `RemoteFile.local_name()`
+  **rebuilds** the name from the two validated capture groups (`run`, `field`) rather than
+  sanitising what was sent, so `../../evil.nc.bz2` cannot survive even in the forms
+  `Path(name).name` lets through.
+* **G28 — `np.clip` on a 0-d input returns an immutable `np.float32`, not an array.** An
+  in-place numpy pipeline written for speed then dies with `TypeError` the moment someone
+  passes scalars — which the unit tests do, since that is how you check a formula against a
+  published value. Allocate the buffers with `np.empty(np.broadcast(...).shape)` and mask
+  with `np.copyto(..., where=)` rather than `a[mask] = x`; both are 0-d safe.
+* **G29 — G23's "difference in float64" does not apply to a plain elementwise
+  difference.** G23 is right about `transform.window_value`, where the subtraction has
+  float64 *intermediates* (`A[t]·h[t]`) whose bits the upcast preserves. `a − b` on two
+  float32 arrays has none: the IEEE result is already correctly rounded, and the view casts
+  back to float32 anyway, so a float64 intermediate cannot survive to be seen. **Measured:
+  bit-identical output (max difference 0.0 K) for 3.16 ms against 0.56 ms.** The rule is
+  about intermediates, not about the word "difference".
+* **G30 — an unpatched modal dialog under `QT_QPA_PLATFORM=offscreen` hangs the test run
+  forever.** `MainWindow(None)` schedules a `QFileDialog`, which never returns and never
+  fails, so the suite times out with no failing test to point at. Any UI test that
+  constructs a window without a path must patch `getOpenFileName`/`getSaveFileName` — and
+  must stub `download.stored_credentials`, or a developer with `keyring` installed has
+  their real IMS password read (and on some platforms prompted for) by the test suite.
+  Same reasoning as **G25**.
+* **A `Path.glob` in a skip guard is always truthy.**
+  `if not (ROOT / 'data').glob('*.nc'): pytest.skip(...)` never skips: `glob` returns a
+  generator. `test_prototype_cli_runs_without_arguments` therefore *failed* on any checkout
+  without a `data/` directory instead of skipping. Fixed with `any(...)`.
+
+## R3.8 Status — shipped and verified 2026-08-25
+
+`272 passed, 28 skipped` (169 from R1+v2, unchanged and green, + 103 new). The skips are
+the tests that need the 407 MB reference file, which is gitignored.
+
+| item | where | verified by |
+|---|---|---|
+| **D1** downloader | `download.py`, `ui/downloaddialog.py` | `test_download.py` (21) — IIS/nginx/one-line listings, junk and traversal ignored, resume asks `bytes=40000-` and transfers only the remainder, a short file is refused rather than renamed, a range-ignoring server restarts cleanly, auth failure echoes neither password nor URL |
+| **D2** dew point | `derived.py`, `ncwrite.py` | `test_derived.py` (41), `test_ncwrite.py` (21) — published values, `Td ≤ T` over 50 k random inputs, RH>100 clamped, RH≤0 NaN, netCDF4 reads what was written, values round-trip bit-identically |
+| **D3** difference | `derived.py`, `ui/main.py` | `test_derived.py`, `test_ui_derived.py` (22) — member-by-member not aggregate-of-aggregates, °C and K give the same number (**G15**), °F scales by 1.8, symmetric colorbar, diverging map on and off |
+| the design claim | `ui/main.py` `_install` | `test_ui_derived.py` — map title, colorbar, y axis, readout and status bar all read at one instant on a derived view |
+
+End-to-end under `QT_QPA_PLATFORM=offscreen`, on a 12-step file at the real 261×161
+resolution: a plain field renders; `--derive dewpoint --write` renders **and** writes a
+40 MB `TD_2M.nc`; that file reopens as an ordinary `TD_2M` in °C; `--difference T_2M TD_2M
+--units F` renders the depression against it; and `--difference T_2M RELHUM_2M` exits **2**
+with one readable sentence.
+
+## R3.9 Running it
+
+```bash
+venv/bin/python -m imsicon                                  # Download... / Derived field...
+# headless, and scriptable:
+venv/bin/python -m imsicon --derive dewpoint  --write out/TD.nc  data/ICON_ENS_..._T_2M.nc
+venv/bin/python -m imsicon --derive depression --screenshot dep.png data/ICON_ENS_..._T_2M.nc
+venv/bin/python -m imsicon --difference T_2M T_S --units C       data/ICON_ENS_..._T_2M.nc
+```
+
+`--derive` and `--difference` find the other field(s) of the run beside the file you name,
+the same way the dialog does. Toolbar row 1 now carries **Open**, **Download…** (`Ctrl+D`),
+**Derived field…** (`Ctrl+R`) and **Save field…** (`Ctrl+S`).
