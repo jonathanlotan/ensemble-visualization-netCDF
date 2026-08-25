@@ -23,11 +23,12 @@ def main(argv=None):
     ap.add_argument('--rate', metavar='WINDOW', default=None,
                     help='de-accumulate to a window: 1h, 3h, or 0 for the stored values '
                          '(accumulated fields only)')
-    ap.add_argument('--derive', choices=('dewpoint', 'depression'), default=None,
+    ap.add_argument('--derive', choices=('dewpoint', 'depression', 'wind'), default=None,
                     help='show a derived field instead of the file itself: dewpoint is '
-                         'TD_2M from T_2M and RELHUM_2M, depression is T_2M - TD_2M. The '
-                         "second input is found beside the given file, by the run in its "
-                         'name')
+                         'TD_2M from T_2M and RELHUM_2M, depression is T_2M - TD_2M, and '
+                         'wind is the speed map with wind barbs from U_10M and V_10M. The '
+                         'other input files are found beside the given file, by the run '
+                         'in its name')
     ap.add_argument('--difference', nargs=2, metavar=('A', 'B'), default=None,
                     help='show the difference between two fields of this run, e.g. '
                          '--difference T_2M T_S')
@@ -69,6 +70,9 @@ def _derive(window, args):
     available = ingest.scan_for_fields(ingest.search_roots(window.ds.path))
     if args.difference:
         kind, wanted = derivedialog.DIFFERENCE, list(args.difference)
+    elif args.derive == 'wind':
+        kind = derivedialog.WIND
+        wanted = [derived.WIND_INPUTS[k][0] for k in ('zonal', 'meridional')]
     else:
         kind = (derivedialog.DEW_POINT if args.derive == 'dewpoint'
                 else derivedialog.DEPRESSION)

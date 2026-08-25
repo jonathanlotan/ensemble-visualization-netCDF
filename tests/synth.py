@@ -122,3 +122,34 @@ def pair(tmp_path, n_times=6, n_members=3, ny=4, nx=5, humidity_encoding=None,
     return (temperature(tmp_path / f'ICON_ENS_{run}_T_2M.nc', n_times, n_members, ny, nx),
             humidity(tmp_path / f'ICON_ENS_{run}_RELHUM_2M.nc', n_times, n_members, ny, nx,
                      encoding=humidity_encoding))
+
+
+def wind_component(path, field, base, n_members=3, step=0.5, units='m s-1'):
+    """One component of the wind, `m s-1`, with the members offset from each other."""
+    long_names = {'U_10M': 'zonal wind in 10m', 'V_10M': 'meridional wind in 10m'}
+    return write_nc3(path, field, units, _member_spread(np.asarray(base, float),
+                                                        n_members, step),
+                     history=HISTORY_TEMPLATE.format(field=field),
+                     long_name=long_names.get(field, field), standard_name=field.lower())
+
+
+def wind_pair(tmp_path, n_times=6, n_members=3, ny=4, nx=5, run='2026082300',
+              u=None, v=None, units='m s-1'):
+    """A matching (U_10M, V_10M) pair -- what the wind map and its barbs are built from.
+
+    The default pattern sweeps the speed across the domain from calm to about 39 kt, so a
+    single frame exercises the calm circle, half feathers and full feathers at once, and
+    turns the wind through the compass as time advances.
+    """
+    t = np.arange(n_times)[:, None, None]
+    y = np.arange(ny)[None, :, None]
+    x = np.arange(nx)[None, None, :]
+    if u is None:
+        u = 0.0 * t + 0.0 * y + 5.0 * x                  # 0, 5, 10, 15, 20 m s-1 eastward
+    if v is None:
+        v = -(2.0 + 0.5 * t) + 0.0 * y + 0.0 * x         # northerly, freshening with time
+    u, v = np.broadcast_to(u, (n_times, ny, nx)), np.broadcast_to(v, (n_times, ny, nx))
+    return (wind_component(tmp_path / f'ICON_ENS_{run}_U_10M.nc', 'U_10M', u,
+                           n_members, step=0.5, units=units),
+            wind_component(tmp_path / f'ICON_ENS_{run}_V_10M.nc', 'V_10M', v,
+                           n_members, step=-0.25, units=units))

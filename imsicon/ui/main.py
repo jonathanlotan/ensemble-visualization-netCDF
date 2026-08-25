@@ -24,6 +24,14 @@ DIVERGING_DEFAULT = 'CET-D1A'
 SEQUENTIAL_DEFAULT = 'turbo'
 
 
+# What the wind barbs mean, said once. The glyph is defined in knots whatever the colour
+# scale is set to -- a half feather is 5 kt, not "5 of whatever the toolbar says".
+BARB_TOOLTIP = ('Wind barbs on the map, in knots: half feather 5 kt, full feather 10 kt, '
+                'pennant 50 kt, open circle calm. The staff points into the wind (the '
+                'direction it blows FROM), and the barbs thin out or fill in as you zoom '
+                'so they stay about a finger-width apart.')
+
+
 # Menu names for the fields the download catalogue does not carry. A `TD_2M` written by
 # "Save field..." opens like any other file, and listing it as a bare code would make the
 # one map the user built by hand the only one in the menu without a name.
@@ -349,6 +357,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.rate_combo.currentIndexChanged.connect(self._on_rate_changed)
         row2.addWidget(self.rate_combo)
 
+        # Disabled, not hidden, exactly like Rate: the control is part of the layout
+        # whether or not the field on screen has a direction to draw.
+        self.barbs_check = QtWidgets.QCheckBox('  Wind barbs')
+        self.barbs_check.setChecked(True)
+        self.barbs_check.setEnabled(False)
+        self.barbs_check.setToolTip(BARB_TOOLTIP)
+        self.barbs_check.toggled.connect(lambda _: self.refresh_map())
+        row2.addWidget(self.barbs_check)
+
         self.units_warning = QtWidgets.QLabel('')
         self.units_warning.setStyleSheet('color:#a05000;')
         self.units_warning.hide()
@@ -488,6 +505,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.member_combo.addItems(ds.member_labels)
         self.member_combo.blockSignals(False)
         self.save_action.setEnabled(True)
+        self._sync_barbs_check()
 
         self.slider.blockSignals(True)
         self.slider.setRange(0, ds.n_times - 1)
@@ -547,6 +565,12 @@ class MainWindow(QtWidgets.QMainWindow):
                                  f'{derived.DEPRESSION_NAME} - dew point depression')):
                 entries.append((kind, label,
                                 derivedialog.DerivedRequest(kind, paths, label)))
+
+        wind = [derived.WIND_INPUTS[role][0] for role in ('zonal', 'meridional')]
+        if all(field in on_disk for field in wind):
+            label = f'{derived.WIND_FIELD} - wind speed + barbs'
+            entries.append((derivedialog.WIND, label, derivedialog.DerivedRequest(
+                derivedialog.WIND, [on_disk[field] for field in wind], label)))
 
         current = getattr(self.ds, 'derived_kind', 'base')
         if current != 'base' and not any(key == current for key, _l, _t in entries):
@@ -794,9 +818,41 @@ class MainWindow(QtWidgets.QMainWindow):
             # -2 K did a frame earlier. `spread` is excluded: it is non-negative already.
             lo, hi = _symmetric(lo, hi)
         units = f' [{self.ds.units}]' if self.ds.units else ''
-        self.map.set_frame(frame, (lo, hi),
-                           f'{self.ds.display_name}{units} - {what} - '
-                           f'{self.ds.label_for(self.t)}')
+        title = (f'{self.ds.display_name}{units} - {what} - '
+                 f'{self.ds.label_for(self.t)}')
+        barb_note = self._push_wind(mode)
+        self.map.set_frame(frame, (lo, hi), f'{title}  |  {barb_note}' if barb_note
+                           else title)
+
+    # ---- wind barbs ------------------------------------------------------------
+    def _push_wind(self, mode):
+        """Hand the map the vectors behind what it is showing. -> a label, or ''.
+
+        Duck-typed on purpose: any view that can produce `wind_vectors` gets barbs, and
+        neither this method nor `MapView` ever learns what a `WindView` is -- the same
+        arrangement that lets a derived field be an ordinary dataset everywhere else.
+
+        The label is not decoration. `mean` barbs are the mean *vector* while the colours
+        under them are the mean *speed*, and `spread` has no direction at all, so the map
+        has to say which of those the feathers are counting.
+        """
+        vectors = getattr(self.ds, 'wind_vectors', None)
+        if vectors is None or not self.barbs_check.isChecked():
+            self.map.set_wind(None)
+            return ''
+        # `t` and `member` are read when the map asks, not captured now, so a wheel zoom
+        # between two redraws still draws the step that is on screen.
+        self.map.set_wind(lambda rows, cols: vectors(self.t, mode, self.member,
+                                                     rows, cols))
+        return self.ds.barb_label(mode)
+
+    def _sync_barbs_check(self):
+        has_wind = getattr(self.ds, 'wind_vectors', None) is not None
+        self.barbs_check.setEnabled(has_wind)
+        self.barbs_check.setToolTip(
+            BARB_TOOLTIP if has_wind else
+            f'{self.ds.display_name} has no direction to draw. Open the wind map '
+            '(U_10M and V_10M of this run) under "Map shows" for barbs.')
 
     def set_time(self, t):
         if self.ds is None:
@@ -845,6 +901,16 @@ class MainWindow(QtWidgets.QMainWindow):
         text = f'{lat:.3f}°N  {lon:.3f}°E'
         if np.isfinite(value):
             text += f'   {value:,.1f} {self.ds.units}'
+            # A wind speed with no direction is half a reading, so the view is asked
+            # for one whenever it has it -- including when the barbs are switched off.
+            # One value read off the aggregated VECTOR, never a statistic of degrees,
+            # which is the thing G16 forbids.
+            direction = getattr(self.ds, 'direction_at', None)
+            if direction is not None:
+                iy, ix = self.ds.nearest_index(lat, lon)
+                degrees = direction(self.t, iy, ix, self.agg_combo.currentData(),
+                                    self.member)
+                text += f'   from {degrees:.0f}°'
         self.status_right.setText(text)
 
     def _on_agg_changed(self):

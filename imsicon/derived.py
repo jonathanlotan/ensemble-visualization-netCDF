@@ -1,12 +1,16 @@
-"""Fields computed from more than one file: dew point, and the difference of two fields.
+"""Fields computed from more than one file: dew point, difference, and the wind map.
 
-Both are the same shape of problem -- take two ensemble files of one run and combine them
-member by member -- so they share one pairing check and one view base class.
+All three are the same shape of problem -- take two ensemble files of one run and combine
+them member by member -- so they share one pairing check and one view base class.
 
     T_2M  ─┐
            ├─► DewPointView ──┐
  RELHUM_2M─┘                  ├─► DifferenceView  (T − Td, the dew point depression)
     T_2M  ─────────────────---┘
+
+    U_10M ─┐
+           ├─► WindView       (speed as the map, u and v kept for the barbs)
+    V_10M ─┘
 
 The views mirror `FieldView`'s attribute surface, so `MainWindow`, `MapView`, `PlotView`
 and `ReadoutPanel` need no special case: a derived field is just another dataset.
@@ -20,7 +24,7 @@ for wind speed, now enforced rather than documented.
 """
 import numpy as np
 
-from . import transform
+from . import barbs, transform
 from .dataset import EnsembleFile
 from .fieldview import FieldView
 
@@ -41,6 +45,13 @@ DEW_POINT_FIELD = 'TD_2M'
 # What the dew point depression is called on screen. `T_2M-TD_2M` is the machine name;
 # `T-Td` is what a forecaster reads it as, and the map is for reading.
 DEPRESSION_NAME = 'T-Td'
+
+# The wind map: the two components it is built from, and the units each must be in. Same
+# policy as the dew point -- the units string is a guard, never a conversion, because a
+# component that arrived in km h-1 would draw barbs at 3.6x the real speed and look fine.
+WIND_INPUTS = {'zonal': ('U_10M', 'm s-1'), 'meridional': ('V_10M', 'm s-1')}
+WIND_FIELD = 'WSPD_10M'
+WIND_NAME = 'wind 10m'
 
 
 class PairError(Exception):
@@ -455,7 +466,14 @@ class DewPointView(DerivedView):
         return self._units.apply_range(lo, hi)
 
 
-def _require_field_units(view, field, expected, role):
+def _require_field_units(view, field, expected, role, what='dew point'):
+    """Refuse an operand whose units are not what the formula is written for.
+
+    A guard, never a conversion: the same policy the v2 registry follows (v2.md 1.3). A
+    RELHUM_2M that arrived as a 0-1 fraction would put the dew point tens of degrees out
+    with nothing on screen to show it, and a U_10M in km h-1 would draw barbs at 3.6x the
+    real speed -- both entirely plausible-looking.
+    """
     if view.field != field:
         raise PairError(f'The {role} input must be {field}, not {view.field} '
                         f'({view.path.name}).')
@@ -463,9 +481,9 @@ def _require_field_units(view, field, expected, role):
     if actual != expected:
         raise PairError(
             f'{field} ({view.path.name}) reports units {getattr(view, "raw", view).units!r}, '
-            f'which normalises to {actual!r}; the dew point formula needs {expected!r}. '
-            'No dew point is computed -- converting on a guess would be wrong by tens of '
-            'degrees with nothing on screen to show it.')
+            f'which normalises to {actual!r}; the {what} needs {expected!r}. '
+            f'No {what} is computed -- converting on a guess would be wrong with nothing '
+            'on screen to show it.')
 
 
 def dew_point(temperature, humidity):
@@ -595,3 +613,175 @@ def dew_point_depression(temperature, humidity):
     view.provenance = (f'dew point depression from {td.temperature.path.name} and '
                        f'{td.humidity.path.name}')
     return view
+
+
+# ---- the wind map ----------------------------------------------------------------------
+class WindView(DerivedView):
+    """The wind at 10 m: **speed** as the coloured map, **u and v kept for the barbs**.
+
+    One view carries both because they are one quantity read two ways. The image, the
+    graph and the six readout statistics all need a scalar, and that scalar is the speed
+    `hypot(u, v)`; the direction cannot go through any of them (**G16** -- it is circular
+    data, so a linear mean, min, max or percentile of degrees is simply wrong: the linear
+    mean of 350 and 10 degrees is 180, the answer is 360). Direction therefore reaches the
+    screen only as barbs, which are built from the *vectors* and never from degrees.
+
+    Canonical space is `m s-1`, so a speed field written out with "Save field..." reopens
+    as an ordinary `WSPD_10M` with the registry's kt / km h-1 options -- without its
+    barbs, honestly, because a speed file no longer knows which way the wind was blowing.
+    """
+
+    def __init__(self, zonal, meridional):
+        check_pairable(zonal, meridional)
+        _require_field_units(zonal, *WIND_INPUTS['zonal'], 'zonal wind', what='wind map')
+        _require_field_units(meridional, *WIND_INPUTS['meridional'], 'meridional wind',
+                             what='wind map')
+        super().__init__(
+            (zonal, meridional), WIND_FIELD, 'wind speed and direction in 10m',
+            f'wind from {zonal.field} and {meridional.field} '
+            f'({zonal.path.name}, {meridional.path.name}): speed = hypot(u, v), '
+            'barbs from the component vectors',
+            display_name=WIND_NAME)
+        self.u, self.v = zonal, meridional
+        self.unit_choices, registry_note = transform.choices_for(WIND_FIELD, 'm s-1')
+        self._units = self.unit_choices[0]
+        self.note = registry_note
+
+    # ---- units -------------------------------------------------------------------------
+    def set_units(self, label):
+        for choice in self.unit_choices:
+            if choice.label == label:
+                self._units = choice
+                return True
+        return False
+
+    @property
+    def units_affine(self):
+        return self._units
+
+    @property
+    def units(self):
+        return self._units.label
+
+    # ---- values: the SPEED, in the display units --------------------------------------
+    # The operands' raw accessors, deliberately: the components are m s-1 in the file
+    # whatever the speed happens to be shown in, and the conversion belongs at the end.
+    def _speed(self, u, v):
+        return self._units.apply(np.hypot(u, v))
+
+    def _display_frame(self, t, member):
+        return self._speed(self.u.raw.frame(t, member), self.v.raw.frame(t, member))
+
+    def _display_ens_frame(self, t):
+        return self._speed(self.u.raw.ens_frame(t), self.v.raw.ens_frame(t))
+
+    def _display_series(self, iy, ix):
+        return self._speed(self.u.raw.series(iy, ix), self.v.raw.series(iy, ix))
+
+    # ---- the barbs ---------------------------------------------------------------------
+    # `barb_units` and `wind_vectors` are the whole protocol the UI knows about: a view
+    # that has them gets barbs, and a view that does not gets none. Nothing in MapView or
+    # MainWindow tests for this class by name.
+    barb_units = 'kt'
+
+    def _components(self, t, rows, cols):
+        """The two raw component stacks, over the whole grid or a subsample of it."""
+        if rows is None or cols is None:
+            return (self.u.raw.ens_frame(t), self.v.raw.ens_frame(t))
+        return (self.u.raw.sub_frame(t, rows, cols), self.v.raw.sub_frame(t, rows, cols))
+
+    def wind_vectors(self, t, mode, member=0, rows=None, cols=None):
+        """-> (u, v) in KNOTS on the grid, aggregated to match what the map is showing.
+
+        `rows`/`cols` restrict the read to the grid points that will actually be drawn.
+        Barbs are drawn at a stride that the zoom decides, so all but a few hundred of the
+        42,000 points are thrown away -- reading them anyway costs 10 ms of a 16.7 ms
+        frame, and reading only what is wanted costs 0.16 ms.
+
+        Barbs are drawn in knots whatever the colour scale is set to, because the glyph
+        *is* defined in knots -- a half feather means 5 kt, not "5 of whatever unit the
+        toolbar says". The colour and the barb are still the same wind; only the unit the
+        feathers count in is fixed.
+
+        The aggregation matters more than it looks. Aggregating the two components
+        independently is only right for the mean:
+
+        * `member`  -- that member's own vector.
+        * `mean`    -- the mean VECTOR (**G16**). Note that its length is not the mean
+          speed the colours show: |mean(V)| <= mean(|V|) by Jensen, and the gap is exactly
+          the ensemble's disagreement about direction. That is a feature to read, not an
+          inconsistency: barbs all pointing one way under a strong colour means the
+          members agree.
+        * `max` / `min` / `median` -- the vector of the member the colour under it came
+          from, picked per cell by speed. Taking max(u) with max(v) would invent a wind no
+          member forecast.
+        * `spread` -- a max-minus-min has no member and no direction of its own, so the
+          barbs fall back to the mean vector and `barb_label` says so.
+        """
+        u, v = self._components(t, rows, cols)
+        u = np.asarray(u, dtype=np.float32)
+        v = np.asarray(v, dtype=np.float32)
+        if mode == 'member':
+            index = int(np.clip(member, 0, u.shape[0] - 1))
+            picked = (u[index], v[index])
+        elif mode in ('max', 'min', 'median'):
+            picked = self._pick_member(u, v, mode)
+        else:                                    # mean, spread, and anything unforeseen
+            picked = (np.nanmean(u, axis=0), np.nanmean(v, axis=0))
+        return (np.asarray(picked[0], dtype=np.float32) * barbs.KT_PER_MS,
+                np.asarray(picked[1], dtype=np.float32) * barbs.KT_PER_MS)
+
+    @staticmethod
+    def _pick_member(u, v, mode):
+        """The per-cell member whose speed is the max / min / median of the ensemble."""
+        speed = np.hypot(u, v)
+        if mode == 'max':
+            index = np.where(np.isfinite(speed), speed, -np.inf).argmax(axis=0)
+        elif mode == 'min':
+            index = np.where(np.isfinite(speed), speed, np.inf).argmin(axis=0)
+        else:
+            with np.errstate(invalid='ignore'):
+                middle = np.nanmedian(speed, axis=0)
+            # No member sits exactly on the median of an even ensemble, so take the
+            # nearest one: a real member's direction beats an interpolated non-wind.
+            distance = np.abs(np.where(np.isfinite(speed), speed, np.inf) - middle)
+            index = distance.argmin(axis=0)
+        index = index[None, ...]
+        return (np.take_along_axis(u, index, axis=0)[0],
+                np.take_along_axis(v, index, axis=0)[0])
+
+    def barb_label(self, mode):
+        """What the barbs on screen actually are -- it is not the same for every mode."""
+        if mode == 'member':
+            return f'barbs ({self.barb_units}): one member'
+        if mode == 'spread':
+            return (f'barbs ({self.barb_units}): mean vector - a spread has no direction '
+                    'of its own')
+        if mode in ('max', 'min', 'median'):
+            return f'barbs ({self.barb_units}): the {mode}-speed member at each point'
+        return f'barbs ({self.barb_units}): ensemble mean vector'
+
+    def direction_at(self, t, iy, ix, mode, member=0):
+        """Wind direction in degrees at one point, for the status bar (**G16** applies:
+        one value read off the aggregated vector, never a statistic of degrees)."""
+        u, v = self.wind_vectors(t, mode, member, rows=[iy], cols=[ix])
+        return float(barbs.direction_from(u[0, 0], v[0, 0]))
+
+    # ---- range: cached in m s-1, converted affinely like any other scaled quantity -----
+    canonical_units = 'm s-1'
+
+    def canonical_ens_frame(self, t):
+        return np.hypot(np.asarray(self.u.raw.ens_frame(t), dtype=np.float32),
+                        np.asarray(self.v.raw.ens_frame(t), dtype=np.float32))
+
+    def _transform_range(self, lo, hi):
+        return self._units.apply_range(lo, hi)
+
+
+def wind(zonal, meridional):
+    """Build a `WindView` from a U_10M and a V_10M view, in either order."""
+    by_field = {view.field: view for view in (zonal, meridional)}
+    if WIND_INPUTS['zonal'][0] in by_field and WIND_INPUTS['meridional'][0] in by_field:
+        zonal = by_field[WIND_INPUTS['zonal'][0]]
+        meridional = by_field[WIND_INPUTS['meridional'][0]]
+    return WindView(zonal, meridional)

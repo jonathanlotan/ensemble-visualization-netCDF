@@ -142,6 +142,10 @@ UNITS = {
     'TOT_PREC':  FieldUnits(('kg m-2',), [Affine('mm'), Affine('kg m-2')]),
     'U_10M':     FieldUnits(('m s-1',), _WIND),
     'V_10M':     FieldUnits(('m s-1',), _WIND),
+    # Not an IMS product either: derived.WindView computes the speed from U_10M and V_10M
+    # and ncwrite can save it. Registered so a written WSPD_10M reopens with exactly the
+    # treatment its components get -- m s-1, kt, km h-1.
+    'WSPD_10M':  FieldUnits(('m s-1',), _WIND),
     # VMAX_10M stays in file units: guessing a forecaster wants knots is a preference.
     'VMAX_10M':  FieldUnits(('m s-1',), [Affine('m s-1'), Affine('kt', 3600.0 / 1852.0),
                                          Affine('km h-1', 3.6)]),
