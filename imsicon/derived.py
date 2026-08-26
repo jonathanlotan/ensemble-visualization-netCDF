@@ -22,9 +22,11 @@ members and the result looks entirely plausible. `check_pairable` compares the m
 labels element for element and refuses to pair on any mismatch -- the same reason v2 gave
 for wind speed, now enforced rather than documented.
 """
+from typing import NamedTuple
+
 import numpy as np
 
-from . import barbs, transform
+from . import barbs, isolines, transform
 from .dataset import EnsembleFile
 from .fieldview import FieldView
 
@@ -45,6 +47,58 @@ DEW_POINT_FIELD = 'TD_2M'
 # What the dew point depression is called on screen. `T_2M-TD_2M` is the machine name;
 # `T-Td` is what a forecaster reads it as, and the map is for reading.
 DEPRESSION_NAME = 'T-Td'
+# The two operands, in order, that MAKE a difference the depression -- whichever way it
+# was built: from the dialog, from `--derive depression`, or as an ad-hoc `--difference
+# T_2M TD_2M` against a TD_2M file written earlier by "Save field...".
+DEPRESSION_OPERANDS = (DEW_POINT_INPUTS['temperature'][0], DEW_POINT_FIELD)
+
+
+# ---- the "sort" scale (R5) --------------------------------------------------------------
+class SortScale(NamedTuple):
+    """A colour scale that only colours a band, and leaves everything above it plain.
+
+    "Sort" is the requested word for it, and it describes what it does to the map: the
+    depression is sorted into the range that decides whether there is fog or cloud at the
+    surface, and everything drier than that stops competing for attention. Values above
+    the top stop are not a separate colour -- they ARE the top stop, which is white, so
+    the colours simply run out where the band does.
+
+    `stops` are `(value, '#rrggbb', name)` in DISPLAY units, ascending. The name is not
+    decoration: "0 is red, 1 is yellow-orange, 2 is white" is how the scale was specified
+    and how the tooltip has to describe it, so it is kept beside the hex rather than
+    written out a second time in the UI. Only data here -- the pyqtgraph colormap is
+    built in `ui/main.py`, because `derived.py` stays free of Qt.
+    """
+    stops: tuple
+
+    @property
+    def levels(self):
+        """(low, high) for the colorbar -- the band, not the data range."""
+        return (float(self.stops[0][0]), float(self.stops[-1][0]))
+
+    @property
+    def top(self):
+        return float(self.stops[-1][0])
+
+    def positions(self):
+        """-> ([0..1] positions, [colours]) -- the two arrays a colormap is built from."""
+        low, high = self.levels
+        span = (high - low) or 1.0
+        return ([(float(stop[0]) - low) / span for stop in self.stops],
+                [stop[1] for stop in self.stops])
+
+    def described(self):
+        """-> [(value, name)] -- the scale in words, for a tooltip or a title."""
+        return [(float(stop[0]), stop[2]) for stop in self.stops]
+
+
+# Red at 0, yellow-orange at 1, white at 2 -- stated in degC, the canonical space of a
+# temperature difference, and rescaled by the units affine like any other spacing (G15),
+# so the band is 2 degC whether the toolbar reads degC, K or degF. The colours are
+# ColorBrewer RdYlBu's warm end, which stays legible in print and to the red-green
+# colour blind (the ramp varies in lightness, not only in hue).
+SORT_STOPS = ((0.0, '#d7191c', 'red'), (1.0, '#fdae61', 'yellow-orange'),
+              (2.0, '#ffffff', 'white'))
 
 # The wind map: the two components it is built from, and the units each must be in. Same
 # policy as the dew point -- the units string is a guard, never a conversion, because a
@@ -213,6 +267,8 @@ class DerivedView:
     rate_hours = 0
     rate_note = None
     window_steps = 0
+    isoline_interval = None          # R5: an `isolines.Interval` in CANONICAL units
+    sort_stops = None                # R5: `SortScale` stops in canonical units, or None
 
     def __init__(self, operands, field, long_name, provenance, display_name=None):
         self.operands = tuple(operands)
@@ -277,6 +333,27 @@ class DerivedView:
 
     def set_units(self, label):
         raise NotImplementedError
+
+    # ---- isolines and the sort scale ---------------------------------------------------
+    # Both are spacings and thresholds rather than values, so both take the affine's scale
+    # and never its offset (**G15**) -- which is what makes "every 0.5 degC" and "below
+    # 2 degC" mean the same thing with the Units combo on degC, K or degF.
+    @property
+    def isolines(self):
+        """Contour interval in DISPLAY units, or None when this view is not contoured."""
+        interval = self.isoline_interval
+        if interval is None:
+            return None
+        return interval.scaled(self.units_affine, difference=self.is_difference_view)
+
+    @property
+    def sort_scale(self):
+        """-> `SortScale` in DISPLAY units, or None when this view has no sort band."""
+        if not self.sort_stops:
+            return None
+        scale = abs(float(self.units_affine.apply_delta(1.0)))
+        return SortScale(tuple((value * scale, colour, name)
+                               for value, colour, name in self.sort_stops))
 
     # ---- rate: never, for an instantaneous derived quantity ----------------------------
     @property
@@ -392,6 +469,10 @@ class DewPointView(DerivedView):
             f'({temperature.path.name}, {humidity.path.name}) by the '
             f'Alduchov-Eskridge Magnus formula')
         self.temperature, self.humidity = temperature, humidity
+        # Contoured at the same 1 degC as the temperature it is read against, from the
+        # same registry entry -- a dew point map and a temperature map are compared by
+        # eye, and two different intervals would make that comparison a trap.
+        self.isoline_interval = isolines.interval_for(DEW_POINT_FIELD)
         # TD_2M is in the registry as a Kelvin temperature, so this yields degC / K / degF
         # with degC as the default -- the same treatment T_2M gets.
         self.unit_choices, registry_note = transform.choices_for(DEW_POINT_FIELD, 'K')
@@ -537,6 +618,18 @@ class DifferenceView(DerivedView):
         if a.units != b.units:
             raise PairError(f'{a.field} and {b.field} could not be put in the same units '
                             f'({a.units!r} vs {b.units!r}).')
+        # A difference of two contoured fields is contoured twice as finely (R5.1): the
+        # depression a forecaster reads lives in the 0-5 degC band, where the whole
+        # question is answered between one temperature isoline and the next.
+        if all(isolines.interval_for(view.field) for view in (a, b)):
+            self.isoline_interval = isolines.DIFFERENCE
+        if (a.field, b.field) == DEPRESSION_OPERANDS:
+            # Named and coloured here rather than in `dew_point_depression`, because this
+            # is the same quantity however it was arrived at -- including an ad-hoc
+            # `--difference T_2M TD_2M` against a saved dew point file.
+            self.display_name = DEPRESSION_NAME
+            self.long_name = 'dew point depression (T - Td)'
+            self.sort_stops = SORT_STOPS
 
     # ---- units: one selection, pushed to both operands ---------------------------------
     def set_units(self, label):
@@ -607,9 +700,10 @@ def dew_point_depression(temperature, humidity):
     forecaster the absolute moisture, and the depression tells them whether it matters.
     """
     td = dew_point(temperature, humidity)
+    # The name and the sort band come from `DifferenceView` recognising its operands, so
+    # this and `--difference T_2M TD_2M` cannot drift apart. Only the provenance is
+    # written here: it is the one thing that knows the humidity file this came through.
     view = difference(td.temperature, td)
-    view.display_name = DEPRESSION_NAME
-    view.long_name = 'dew point depression (T - Td)'
     view.provenance = (f'dew point depression from {td.temperature.path.name} and '
                        f'{td.humidity.path.name}')
     return view

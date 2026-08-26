@@ -3,7 +3,7 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .. import barbs
+from .. import barbs, isolines as iso
 
 # row-major must be set before any ImageItem exists: image[row=lat, col=lon]
 pg.setConfigOption('imageAxisOrder', 'row-major')
@@ -14,12 +14,18 @@ pg.setConfigOption('foreground', 'k')
 # items happened to be added in. The field is the bottom layer; every outline sits above
 # it, and the picked-point marker above those.
 Z_FIELD = 0
+# Isolines of the field sit directly on it, under every geographic outline: the coastline
+# is the frame you read the contours against, so it goes on top of them, not under.
+Z_ISOLINE = 5
 Z_COAST = 10
 Z_BORDER = 12
 # Wind barbs sit above the outlines: they are the reading, and an outline crossing a barb
 # is easier to follow than a barb hidden under a border.
 Z_BARB = 15
 Z_MARKER = 20
+
+# Roughly the colorbar column, kept out of the title's wrapping width (G36).
+TITLE_MARGIN_PX = 110
 
 
 class _Outline:
@@ -63,6 +69,16 @@ class MapView(pg.GraphicsLayoutWidget):
         self.img = pg.ImageItem(axisOrder='row-major')
         self.img.setZValue(Z_FIELD)
         self.plot.addItem(self.img)
+        # Isolines (R5), in two weights: every line, and every 5th (or 2nd) drawn heavier
+        # so the eye can count in fives instead of one at a time. Both `ignoreBounds`, for
+        # the reason the barbs are: geometry computed FROM the frame must never feed back
+        # into the range that decides which frame is on screen.
+        self.isoline = self._outline(Z_ISOLINE, '#1c1c1c', 0.9, halo=2.2,
+                                     ignore_bounds=True)
+        self.isoline_heavy = self._outline(Z_ISOLINE, '#1c1c1c', 1.7, halo=3.0,
+                                           ignore_bounds=True)
+        self.isoline_levels = np.empty(0)     # what is drawn, for the status bar and tests
+        self.isoline_step = 0.0               # the interval actually used (see G35)
         # Coastline and borders, each drawn twice: a pale halo underneath and the line on
         # top. Over turbo or a diverging ramp there is no single ink colour that stays
         # legible against both ends of the scale, and an outline that disappears over the
@@ -159,7 +175,12 @@ class MapView(pg.GraphicsLayoutWidget):
         self._cos_lat = float(np.cos(np.deg2rad(ds.lat.mean())))
         self.plot.setAspectLocked(True, ratio=self._cos_lat)
         self._user_zoomed = False
+        # Nothing of the previous field survives into the new one: its frame would read
+        # out under the new field's title on a hover, and its contours would be drawn
+        # against the new field's coordinates. `refresh_map` supplies both immediately.
+        self._frame = None
         self.set_wind(None)             # a new field's wind has not been pushed yet
+        self._draw_isolines(None)
         self.set_overlay(overlay)
         self.reset_view()
 
@@ -196,18 +217,29 @@ class MapView(pg.GraphicsLayoutWidget):
         # layout settles -- so keep re-fitting until the user takes over the view.
         super().resizeEvent(ev)
         # pyqtgraph calls resizeEvent(None) from GraphicsView.__init__, before our attrs exist
+        if getattr(self, 'plot', None) is not None:
+            self._wrap_title()
         if getattr(self, 'ds', None) is not None and not self._user_zoomed:
             QtCore.QTimer.singleShot(0, self.reset_view)
 
-    def set_colormap(self, name):
-        try:
-            self.cmap = pg.colormap.get(name)
-        except Exception:
-            self.cmap = pg.colormap.get('viridis')
+    def set_colormap(self, cmap):
+        """A pyqtgraph colormap NAME, or a ready-made `ColorMap` (R5's sort scale)."""
+        if isinstance(cmap, str):
+            try:
+                cmap = pg.colormap.get(cmap)
+            except Exception:
+                cmap = pg.colormap.get('viridis')
+        self.cmap = cmap
         self.cbar.setColorMap(self.cmap)
 
     # ---- drawing ---------------------------------------------------------------
-    def set_frame(self, frame, levels=None, label=None):
+    def set_frame(self, frame, levels=None, label=None, interval=None):
+        """Paint one frame. `interval` is an `isolines.Interval` in the frame's own units.
+
+        The contours are drawn here rather than through a call of their own so that they
+        cannot be one frame behind what the colours show: there is exactly one place the
+        image changes, and the lines are rebuilt from the same array in the same call.
+        """
         self._frame = frame
         self.img.setImage(frame, autoLevels=False)
         if levels is not None:
@@ -215,8 +247,40 @@ class MapView(pg.GraphicsLayoutWidget):
             if hi <= lo:
                 hi = lo + 1.0
             self.cbar.setLevels(low=lo, high=hi)
+        self._draw_isolines(interval)
         if label is not None:
             self.plot.setTitle(label)
+
+    def set_title(self, text):
+        """Set the map title, wrapped so it cannot widen the layout (**G36**).
+
+        Separate from `set_frame` because the title names the interval the isolines were
+        actually drawn at, which is only known afterwards.
+        """
+        self.plot.setTitle(text)
+        self._wrap_title()
+
+    def _wrap_title(self):
+        """G36: a `LabelItem`'s minimum width is the width of its text, and a
+        GraphicsLayout widens the whole column to honour it -- swallowing the colorbar
+        and, because the ViewBox is aspect-locked, CROPPING the map's latitude to match
+        (the **G10** failure again, reached from the other end). Wrapping makes a long
+        title take a second line instead of taking the domain.
+        """
+        label = self.plot.titleLabel
+        label.item.setTextWidth(max(240, int(self.width()) - TITLE_MARGIN_PX))
+        label.updateMin()
+
+    def _draw_isolines(self, interval):
+        if interval is None or self.ds is None or self._frame is None:
+            self.isoline.clear()
+            self.isoline_heavy.clear()
+            self.isoline_levels, self.isoline_step = np.empty(0), 0.0
+            return
+        drawn = iso.contour_set(self.ds.lon, self.ds.lat, self._frame, interval)
+        self.isoline.setData(*drawn['ordinary'])
+        self.isoline_heavy.setData(*drawn['emphasised'])
+        self.isoline_levels, self.isoline_step = drawn['levels'], drawn['step']
 
     def set_marker(self, lat, lon):
         for item in (self.marker, self.marker_halo):

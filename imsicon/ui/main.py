@@ -1,5 +1,6 @@
 """MainWindow - map (left) | readout + graph (right), wired together."""
 import numpy as np
+import pyqtgraph as pg
 from pathlib import Path
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -30,6 +31,37 @@ BARB_TOOLTIP = ('Wind barbs on the map, in knots: half feather 5 kt, full feathe
                 'pennant 50 kt, open circle calm. The staff points into the wind (the '
                 'direction it blows FROM), and the barbs thin out or fill in as you zoom '
                 'so they stay about a finger-width apart.')
+
+
+# R5. Both tooltips say the interval in the units on screen rather than in the abstract,
+# because the whole point of the G15 scaling is that "every 1 degree Celsius" survives a
+# switch to degF as "every 1.8 degF" -- and a reader has to be able to see that it did.
+def _isoline_tooltip(ds):
+    interval = getattr(ds, 'isolines', None) if ds is not None else None
+    if interval is None:
+        name = ds.display_name if ds is not None else 'This field'
+        return (f'{name} is not contoured. Isolines are drawn on the temperature maps '
+                '(every 1 °C) and on a difference between two of them, such as T-Td '
+                '(every 0.5 °C).')
+    units = f' {ds.units}' if ds.units else ''
+    return (f'Isolines every {interval.step:g}{units}, with every {interval.emphasis} '
+            f'({interval.step * interval.emphasis:g}{units}) drawn heavier. The interval '
+            'is fixed in degrees Celsius, so changing the display units moves the label, '
+            'never the lines.')
+
+
+def _sort_tooltip(ds):
+    scale = getattr(ds, 'sort_scale', None) if ds is not None else None
+    if scale is None:
+        name = ds.display_name if ds is not None else 'This field'
+        return (f'Sort applies to the dew point depression (T-Td), not to {name}. '
+                'Choose T-Td under "Map shows".')
+    units = f' {ds.units}' if ds.units else ''
+    stops = ', '.join(f'{value:g}{units} {name}' for value, name in scale.described())
+    return (f'Show colour only where the depression is under {scale.top:g}{units} -- '
+            f'{stops} -- so the map says where the air is near saturation and stops '
+            'colouring everywhere that is not. Drier than that is left white; the '
+            'isolines still run through it.')
 
 
 # Menu names for the fields the download catalogue does not carry. A `TD_2M` written by
@@ -178,6 +210,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # from would otherwise be forgotten -- and the rest of the run with it.
         self._roots = []
         self._progress = None
+        # What colour scale the map is currently carrying, so a scrub does not rebuild an
+        # identical lookup table on every frame. See `_apply_colormap`.
+        self._cmap_state = None
         # Every file-backed view this window has opened, so building a derived field on
         # the field already on screen does not map another 407 MB of the same bytes.
         self.opened = {}
@@ -366,6 +401,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.barbs_check.toggled.connect(lambda _: self.refresh_map())
         row2.addWidget(self.barbs_check)
 
+        # R5. Isolines are on by default where a field has them -- they are what makes a
+        # smooth colour ramp readable as numbers -- while Sort is off, because it hides
+        # part of the map and that has to be asked for.
+        self.isolines_check = QtWidgets.QCheckBox('  Isolines')
+        self.isolines_check.setChecked(True)
+        self.isolines_check.setEnabled(False)
+        self.isolines_check.toggled.connect(lambda _: self.refresh_map())
+        row2.addWidget(self.isolines_check)
+
+        self.sort_check = QtWidgets.QCheckBox('  Sort')
+        self.sort_check.setChecked(False)
+        self.sort_check.setEnabled(False)
+        self.sort_check.toggled.connect(self._on_sort_toggled)
+        row2.addWidget(self.sort_check)
+
         self.units_warning = QtWidgets.QLabel('')
         self.units_warning.setStyleSheet('color:#a05000;')
         self.units_warning.hide()
@@ -506,6 +556,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.member_combo.blockSignals(False)
         self.save_action.setEnabled(True)
         self._sync_barbs_check()
+        self._sync_isolines_check()
+        self._sync_sort_check()
 
         self.slider.blockSignals(True)
         self.slider.setRange(0, ds.n_times - 1)
@@ -754,12 +806,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self._error(f'Could not write the field:\n{message}')
 
     def _sync_colormap(self, ds):
-        """A difference wants a diverging ramp; anything else wants a sequential one."""
+        """A difference wants a diverging ramp; anything else wants a sequential one.
+
+        Only the *combo* is set here. What reaches the map goes through `_apply_colormap`,
+        which is also what the sort scale overrides -- so there is one place that decides
+        the colours, and choosing a field cannot quietly undo the sort band.
+        """
         wanted = DIVERGING_DEFAULT if getattr(ds, 'diverging', False) else SEQUENTIAL_DEFAULT
         if self.cmap_combo.currentText() != wanted:
             self.cmap_combo.setCurrentText(wanted)      # fires _on_cmap_changed
         else:
-            self.map.set_colormap(wanted)
+            self._apply_colormap(self.sort_scale())
 
     def _ensure_range(self):
         """Range for the CURRENT transform view: cached, or one background scan (G19).
@@ -806,23 +863,86 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             frame = self.ds.agg_frame(self.t, mode)
             what = self.agg_combo.currentText()
-        if self.scale_combo.currentIndex() == 0 and self.ds.value_range is not None:
+        sort = self.sort_scale(mode)
+        self._sync_scale_controls(sort)
+        if sort is not None:
+            # The band IS the scale: fixed, so that a cell's colour means the same
+            # depression in every frame and at every time step, which is the whole
+            # premise of reading it as "under 2 degrees" rather than as "reddest here".
+            lo, hi = sort.levels
+        elif self.scale_combo.currentIndex() == 0 and self.ds.value_range is not None:
             lo, hi = self.ds.value_range
             if mode == 'spread':
                 lo, hi = 0.0, _finite_max(frame, 1.0)
         else:
             lo, hi = _finite_min(frame, 0.0), _finite_max(frame, 1.0)
-        if getattr(self.ds, 'diverging', False) and mode != 'spread':
+        if sort is None and getattr(self.ds, 'diverging', False) and mode != 'spread':
             # A difference map has to be symmetric about zero, or the colour that means
             # "no difference" moves with the data and +2 K reads as the same colour as
             # -2 K did a frame earlier. `spread` is excluded: it is non-negative already.
             lo, hi = _symmetric(lo, hi)
+        self._apply_colormap(sort)
         units = f' [{self.ds.units}]' if self.ds.units else ''
-        title = (f'{self.ds.display_name}{units} - {what} - '
-                 f'{self.ds.label_for(self.t)}')
-        barb_note = self._push_wind(mode)
-        self.map.set_frame(frame, (lo, hi), f'{title}  |  {barb_note}' if barb_note
-                           else title)
+        interval = (getattr(self.ds, 'isolines', None)
+                    if self.isolines_check.isChecked() else None)
+        self.map.set_frame(frame, (lo, hi), interval=interval)
+        # After the frame, never before: the title names the interval the lines were
+        # actually drawn at, which `levels_for` may have coarsened (G35).
+        notes = [note for note in (self._push_wind(mode), self._isoline_note(interval),
+                                   self._sort_note(sort)) if note]
+        self.map.set_title('  |  '.join(
+            [f'{self.ds.display_name}{units} - {what} - {self.ds.label_for(self.t)}']
+            + notes))
+
+    def _isoline_note(self, interval):
+        """`isolines 1 °C`, from what the map drew rather than from what was asked for."""
+        if interval is None or not len(self.map.isoline_levels):
+            return ''
+        units = f' {self.ds.units}' if self.ds.units else ''
+        drawn = f'isolines {self.map.isoline_step:g}{units}'
+        if self.map.isoline_step > interval.step * 1.000001:
+            drawn += f' (too many lines at {interval.step:g}{units})'
+        return drawn
+
+    def _sort_note(self, sort):
+        """`sorted: colour only below 2 °C`. What the colours mean is on the colorbar
+        beside it and in the tooltip; a title is a label, not a legend."""
+        if sort is None:
+            return ''
+        units = f' {self.ds.units}' if self.ds.units else ''
+        return f'sorted: colour only below {sort.top:g}{units}'
+
+    def sort_scale(self, mode=None):
+        """The R5 sort band if it applies to what is on screen, else None.
+
+        `spread` is excluded for the reason it is excluded from the symmetric scale: a
+        max-minus-min across the members is a width, not a depression, so colouring it
+        against the fog thresholds would read as a forecast of fog that nobody made.
+        """
+        if self.ds is None or not self.sort_check.isChecked():
+            return None
+        if (mode or self.agg_combo.currentData()) == 'spread':
+            return None
+        return getattr(self.ds, 'sort_scale', None)
+
+    def _apply_colormap(self, sort):
+        """Push the colour scale the view and the options ask for, when it has changed.
+
+        Guarded by the key rather than by call order: `refresh_map` runs on every frame
+        of a scrub, and rebuilding a lookup table 121 times to arrive at the same colours
+        is the sort of thing that only shows up as "the slider feels heavy".
+        """
+        if sort is None:
+            key = ('map', self.cmap_combo.currentText())
+        else:
+            key = ('sort', round(sort.top, 6))
+        if key == self._cmap_state:
+            return
+        self._cmap_state = key
+        if sort is None:
+            self.map.set_colormap(key[1])
+        else:
+            self.map.set_colormap(pg.ColorMap(*sort.positions()))
 
     # ---- wind barbs ------------------------------------------------------------
     def _push_wind(self, mode):
@@ -845,6 +965,43 @@ class MainWindow(QtWidgets.QMainWindow):
         self.map.set_wind(lambda rows, cols: vectors(self.t, mode, self.member,
                                                      rows, cols))
         return self.ds.barb_label(mode)
+
+    def _sync_isolines_check(self):
+        """Disabled, not hidden -- the same rule Rate and Wind barbs follow."""
+        interval = getattr(self.ds, 'isolines', None)
+        self.isolines_check.setEnabled(interval is not None)
+        self.isolines_check.setToolTip(_isoline_tooltip(self.ds))
+
+    def _sync_sort_check(self):
+        """Sort follows the field: available on T-Td, and cleared on anything else.
+
+        Cleared rather than left ticked-but-disabled, because a disabled tick reads as
+        "this is on and you cannot change it", which is the opposite of what it means.
+        """
+        available = getattr(self.ds, 'sort_scale', None) is not None
+        self.sort_check.blockSignals(True)
+        self.sort_check.setEnabled(available)
+        if not available:
+            self.sort_check.setChecked(False)
+        self.sort_check.blockSignals(False)
+        self.sort_check.setToolTip(_sort_tooltip(self.ds))
+
+    def _sync_scale_controls(self, sort):
+        """While the sort band is on it IS the colour scale, so the two controls that
+        would otherwise claim to set one are disabled instead of silently ignored."""
+        for widget, what, idle in ((self.cmap_combo, 'colours', 'Colour ramp for the map'),
+                                   (self.scale_combo, 'range',
+                                    'Colour the whole dataset range, or just this frame')):
+            widget.setEnabled(sort is None)
+            # Restored as well as set, for the reason the truncation warning is cleared in
+            # `_install`: a tooltip left over from a state the app is no longer in is
+            # worse than none at all.
+            widget.setToolTip(idle if sort is None else
+                              f'Sort sets the {what}: red at 0 to white at '
+                              f'{sort.top:g}. Untick Sort to choose again.')
+
+    def _on_sort_toggled(self, _on):
+        self.refresh_map()
 
     def _sync_barbs_check(self):
         has_wind = getattr(self.ds, 'wind_vectors', None) is not None
@@ -951,6 +1108,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot.getAxis('left').enableAutoSIPrefix(False)   # G12: never 'kJ kg-1'
         self.plot.setLabel('left', ds.display_name, units=ds.units or None)
         self.readout.configure(ds)          # select_point below restores the point label
+        # The interval and the sort band are stated in the units on screen, so both
+        # tooltips are stale the moment those change.
+        self._sync_isolines_check()
+        self._sync_sort_check()
         self.time_label.setText(ds.label_for(self.t))
         if ds.value_range is not None:
             self._apply_range(ds.value_range)
@@ -990,9 +1151,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.ds.rate_note:
             self.status_right.setText('\u26a0 ' + self.ds.rate_note)
 
-    def _on_cmap_changed(self, name):
-        self.map.set_colormap(name)
-        self.refresh_map()
+    def _on_cmap_changed(self, _name):
+        self.refresh_map()          # which pushes the colours through _apply_colormap
 
     def _toggle_play(self, on):
         self.play_button.setText('Pause' if on else 'Play')

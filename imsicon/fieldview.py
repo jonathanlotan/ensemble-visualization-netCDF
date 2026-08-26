@@ -15,7 +15,7 @@ verbatim, so MapView / PlotView / ReadoutPanel need no change at all.
 """
 import numpy as np
 
-from . import transform
+from . import isolines, transform
 from .transform import Affine
 
 
@@ -183,6 +183,26 @@ class FieldView:
         """What the map title and the y axis call this. A derived view overrides it --
         `T-Td` reads better than `T_2M-TD_2M` -- so every caller can just ask for it."""
         return self.field
+
+    # ---- isolines --------------------------------------------------------------------
+    @property
+    def isolines(self):
+        """Contour interval in DISPLAY units, or None when this field is not contoured.
+
+        The registry states it in canonical units, as a spacing and an anchor, and the
+        two convert differently (**G15**): the spacing takes the affine's scale, the
+        anchor takes the whole affine. That is what keeps "every 1 degree Celsius" true
+        when the Units combo says degF -- the SAME lines, at 32.0 and 33.8 degF, rather
+        than a new set anchored on whole Fahrenheit.
+
+        A rate view returns None: `TOT_PREC` is not contoured either way, but were a
+        contoured field ever accumulated, its 1 h window would be a different quantity
+        from the value the interval was chosen for.
+        """
+        interval = isolines.interval_for(self.field)
+        if interval is None or self.rate_hours:
+            return None
+        return interval.scaled(self._units, difference=self.is_difference_view)
 
     @property
     def transform_signature(self):

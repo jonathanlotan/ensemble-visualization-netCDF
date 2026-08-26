@@ -20,7 +20,7 @@ import json
 import numpy as np
 from pathlib import Path
 
-from . import nc3
+from . import isolines, nc3
 
 TOPO_NAMES = ('topo_icon_web.nc', 'icon_topo_web.nc')
 MAPDATA = Path(__file__).resolve().parent / 'mapdata' / 'levant_10m.json'
@@ -56,40 +56,14 @@ def load_topo(path):
 def contour_segments(x, y, z, level=0.5):
     """Marching squares -> (xs, ys) polyline arrays separated by NaN.
 
-    Dependency-free (no matplotlib/scipy) so the frozen exe stays small. Saddle cells are
-    resolved by pairing crossings in order, which is fine for drawing a coastline.
+    The land mask is contoured once at startup and cached, so this was a plain Python
+    loop over the cells until R5 needed the same algorithm on every redraw of a field.
+    It now delegates to `isolines.contour_lines`, which is the vectorised version of
+    exactly this: one marching squares in the codebase rather than two that can disagree
+    about a saddle. Both are dependency-free (no matplotlib, no scipy), which is what
+    keeps the frozen exe small.
     """
-    z = np.asarray(z, dtype=float)
-    ny, nx = z.shape
-    xs, ys = [], []
-
-    def cross(v0, v1, c0, c1):
-        """Interpolated crossing of `level` on the edge between two corners."""
-        if (v0 - level) * (v1 - level) >= 0 or v1 == v0:
-            return None
-        f = (level - v0) / (v1 - v0)
-        return (c0[0] + f * (c1[0] - c0[0]), c0[1] + f * (c1[1] - c0[1]))
-
-    for i in range(ny - 1):
-        for j in range(nx - 1):
-            a, b = z[i, j], z[i, j + 1]
-            d, c = z[i + 1, j], z[i + 1, j + 1]
-            if not np.isfinite(a + b + c + d):
-                continue
-            lo = min(a, b, c, d)
-            hi = max(a, b, c, d)
-            if lo >= level or hi < level:          # no crossing in this cell
-                continue
-            p00, p10 = (x[j], y[i]), (x[j + 1], y[i])
-            p01, p11 = (x[j], y[i + 1]), (x[j + 1], y[i + 1])
-            pts = [p for p in (cross(a, b, p00, p10), cross(b, c, p10, p11),
-                               cross(d, c, p01, p11), cross(a, d, p00, p01))
-                   if p is not None]
-            for k in range(0, len(pts) - 1, 2):
-                (x0, y0), (x1, y1) = pts[k], pts[k + 1]
-                xs.extend((x0, x1, np.nan))
-                ys.extend((y0, y1, np.nan))
-    return np.array(xs), np.array(ys)
+    return isolines.contour_lines(x, y, z, [level])
 
 
 def coastline_for(data_path, cache={}):
