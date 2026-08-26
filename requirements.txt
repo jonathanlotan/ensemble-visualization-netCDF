@@ -1,7 +1,8 @@
 numpy>=1.26
 PySide6>=6.6
 pyqtgraph>=0.13
-
+requests>=2.31
+requests-ntlm>=1.2
 # Optional -- the built-in downloader only (Download... in the toolbar). The viewer opens
 # and derives fields without them, and they are imported lazily so a frozen build that
 # leaves them out simply reports what to install.
