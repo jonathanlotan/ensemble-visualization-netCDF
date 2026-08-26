@@ -34,6 +34,14 @@ def main(argv=None):
                          '--difference T_2M T_S')
     ap.add_argument('--write', metavar='PATH', default=None,
                     help='write the field on screen to a NetCDF-3 file, then exit')
+    ap.add_argument('--isolines', choices=('on', 'off'), default=None,
+                    help='contour lines over the map: every 1 degC on a temperature, '
+                         'every 0.5 degC on a difference such as T-Td (default: on '
+                         'wherever the field has them)')
+    ap.add_argument('--sort', action='store_true',
+                    help='T-Td only: colour the map only where the depression is under '
+                         '2 degC (2 white, 1 yellow-orange, 0 red), leaving drier air '
+                         'uncoloured')
     args = ap.parse_args(argv)
     if args.derive and args.difference:
         ap.error('--derive and --difference choose the same thing; give only one')
@@ -44,9 +52,10 @@ def main(argv=None):
     window.show()
 
     wants_post = any((args.units, args.rate is not None, args.derive, args.difference,
-                      args.write))
+                      args.write, args.isolines is not None, args.sort))
     if wants_post and not args.path:
-        ap.error('--units/--rate/--derive/--difference/--write need a file path')
+        ap.error('--units/--rate/--derive/--difference/--write/--isolines/--sort need '
+                 'a file path')
     if args.screenshot:
         if not args.path:
             ap.error('--screenshot needs a file path')
@@ -131,6 +140,16 @@ def _apply_display(window, args, ap, tries=0):
                   'so it has no window rate', file=sys.stderr)
         else:
             window.rate_combo.setCurrentText(transform.rate_label(hours))
+    if args.isolines is not None:
+        if not window.isolines_check.isEnabled() and args.isolines == 'on':
+            print(f'--isolines on: {window.ds.display_name} is not a contoured field',
+                  file=sys.stderr)
+        window.isolines_check.setChecked(args.isolines == 'on')
+    if args.sort:
+        if not window.sort_check.isEnabled():
+            print(f'--sort: {window.ds.display_name} has no sort band; it applies to the '
+                  'dew point depression (--derive depression)', file=sys.stderr)
+        window.sort_check.setChecked(True)
     if args.write:
         _write(window, args.write)
         if not args.screenshot:
@@ -147,7 +166,7 @@ def _shoot(app, window, args):
             window.scan.wait(5000)
             window._on_scan_done(window.ds.value_range)
         if any((args.units, args.rate is not None, args.derive, args.difference,
-                args.write)):
+                args.write, args.isolines is not None, args.sort)):
             _apply_display(window, args, None)
         if args.point:
             window.select_point(*window.ds.nearest_index(*args.point))

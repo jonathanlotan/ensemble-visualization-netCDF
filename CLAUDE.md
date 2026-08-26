@@ -1197,3 +1197,218 @@ venv/bin/python -m imsicon --derive wind --write out/WSPD.nc  <U_10M file>
 Wheel-zoom the map and the barbs fill in; zoom out and they thin. **Wind barbs** on
 toolbar row 2 turns them off without losing the speed map, and hovering the map reads
 `31.250°N  35.000°E   17.8 m s-1   from 289°`.
+
+---
+
+# Release 5 — isolines, and the T-Td sort scale
+
+Requested 2026-08-26: *isolines for temperature (every 1 degree Celsius) and T-Td (every
+0.5 degrees Celsius); for T-Td an option to "sort", meaning it will only show the colours
+when the difference is under 2 — 2 white, 1 yellow-orange, 0 red.* Sections 0 (byte math),
+R1 (the two-panel viewer), R2 (the one transform layer), R3 (derived fields) and R4 (the
+wind map) are unchanged and still the contract.
+
+## R5.1 The shape of it
+
+Both halves are the same question asked twice — *what does this number mean, in degrees?*
+— so both are answered by the view rather than by the map:
+
+```
+                     ┌─ isolines ──► Interval(step, emphasis, anchor)  ──┐
+   FieldView /        │              1 degC on a temperature             │
+   DewPointView   ────┤              0.5 degC on a difference            ├──► MapView
+   DifferenceView     │                                                  │    (draws it)
+                     └─ sort_scale ► SortScale(0 red, 1 orange, 2 white) ┘
+                                     T-Td only
+```
+
+`MapView` and `MainWindow` ask a view for an interval and a band the same duck-typed way
+they ask it for `wind_vectors` (R4.1): a view that has one gets the drawing, a view that
+does not gets none, and neither panel learns what a dew point depression is.
+
+| file | responsibility |
+|---|---|
+| `imsicon/isolines.py` | vectorised marching squares, level selection, the emphasis rule, and the per-field interval registry. No Qt |
+| `imsicon/derived.py` | `SortScale`, `SORT_STOPS`, and the `isolines` / `sort_scale` properties on the derived views |
+| `imsicon/fieldview.py` | `FieldView.isolines` — the registry entry, converted to display units |
+| `imsicon/ui/mapview.py` | two isoline layers under the coastline, and `set_title` wrapping (**G36**) |
+| `imsicon/ui/main.py` | the **Isolines** and **Sort** checkboxes, the band's colour scale, the title notes |
+| `imsicon/geo.py` | `contour_segments` now delegates to `isolines.contour_lines` |
+
+## R5.2 The interval: a spacing *and* an anchor, converted differently
+
+The trap here is that half of **G15** is easy to remember and the other half is not. The
+*spacing* is a difference and takes the affine's scale alone — 1 degC is 1 K and 1.8 degF.
+The **anchor** is a value and takes the whole affine, and it is what decides *where* the
+lines fall:
+
+| units | spacing | anchor | first lines |
+|---|---|---|---|
+| °C | 1.0 | 0.0 | 15, 16, 17 |
+| K | 1.0 | 273.15 | 288.15, 289.15, 290.15 |
+| °F | 1.8 | 32.0 | 59.0, 60.8, 62.6 |
+
+Those are the **same three isotherms** in three notations. Scaling the spacing alone —
+the obvious reading of G15 — would have anchored the lines on whole Kelvin or whole
+Fahrenheit instead, drawing a *different* set of lines every time the Units combo moved,
+20.85 °C and 21.85 °C rather than 15 and 16. A view whose values are already a difference
+(`T-Td`) takes the scale for both, because no difference is no difference in every unit.
+
+Levels are always `anchor + k·step` for whole k, never "the frame minimum plus a
+multiple": the 20 °C isotherm has to be at 20 °C in every frame, or scrubbing time would
+slide every line across the map as the data range breathed.
+
+**Which fields.** `T_2M`, `T_S` and `TD_2M` at 1 °C with every 5th line heavier; a
+difference of any two of them — the depression above all — at 0.5 °C with every 2nd
+(a round 1 °C) heavier. The finer interval is about range, not symmetry: a temperature map
+spans 20 °C across the domain while the depression a forecaster reads lives in the 0–5 °C
+band, where half a degree is the difference between fog and no fog. Everything else is
+uncontoured and the checkbox is **disabled, not hidden** — the rule Rate and Wind barbs
+already follow.
+
+## R5.3 The sort scale
+
+`Sort` is the requested word and it describes what it does: the depression is sorted into
+the band that decides whether there is fog or cloud at the surface, and everything drier
+stops competing for attention. Red at 0, yellow-orange at 1, white at 2, and **above 2 is
+not a separate colour — it *is* the top stop**, so on this app's white background the
+colours simply run out where the band does. The thresholds are stated in °C and rescale
+like any other spacing, so the band is 0–3.6 in °F.
+
+* **It replaces the scale, so the controls that set one are disabled**, not silently
+  ignored: while Sort is on, *Colours* and *Scale* are greyed with a tooltip saying why.
+* **Fixed levels, deliberately.** A cell's colour means the same depression in every frame
+  and at every step, which is the entire premise of reading it as "under 2 degrees"
+  instead of "reddest here".
+* **`spread` is excluded**, for the reason it is excluded from the symmetric difference
+  scale (R3.4): a max-minus-min across the members is a width, not a depression, and
+  colouring it against the fog thresholds would read as a forecast nobody made.
+* **Offered on the depression and nothing else.** `T_2M − T_S` is a temperature difference
+  and *is* contoured, but it is signed, and red-at-zero-white-above-2 would hide which
+  side of zero a cell is on.
+* The isolines keep running through the uncoloured air, which is most of the point: they
+  are what says how far past the threshold a dry area is.
+
+It also fixes something R3 left awkward. A depression is non-negative, so the diverging
+symmetric scale a difference map gets (R3.4) spends half its colorbar on values that
+cannot occur — the map is one flat shade of red. Sorting is the reading that scale could
+not give.
+
+**Recognising the depression.** `DifferenceView` now decides from its operands: `T_2M`
+minus `TD_2M` **is** the depression, so it gets the name `T-Td`, the 0.5 °C interval and
+the sort band whether it was built by *Derived field…*, by the **Map shows** combo, by
+`--derive depression`, or as an ad-hoc `--difference T_2M TD_2M` against a `TD_2M` file
+written earlier by *Save field…*. Verified end to end: the written file's depression is
+the same map, to 1e-5 °C, as the live computation.
+
+## R5.4 Measured, not assumed
+
+Contours are rebuilt on **every** redraw of the map, so the arithmetic had to fit inside
+v2's 16.7 ms frame. On the real grid (261×161), on the machine R4.4 measured as roughly
+3× slower than the one v2 and v3 were timed on:
+
+| operation | ms |
+|---|---|
+| contour a temperature frame, 16 levels at 1 °C (6,478 segments) | **3.45** |
+| contour a depression frame, 33 levels at 0.5 °C (13,085 segments) | **4.81** |
+| `refresh_map`, T_2M, isolines off → on | 5.40 → **8.76** |
+| `refresh_map`, T-Td, isolines off → on | 15.03 → **18.47** |
+| `refresh_map`, T-Td sorted, isolines off → on | 15.03 → 18.08 |
+
+So the lines cost about **3.4 ms a frame**, roughly 1.2 ms on the reference machine. (The
+T-Td row is dominated by the derived difference itself, which R3.5 recorded at 14.05 ms
+and which this release does not touch.)
+
+Two things got it there, and the obvious spelling of either would have blown the budget:
+
+* **The grid is walked once for the whole level set, not once per level.** A binary search
+  places each cell's corner range in the level ladder, which gives the *count* of levels
+  it crosses, and `repeat` expands that straight into the (cell, level) pairs. Everything
+  downstream then works on the 13,000 crossings that exist rather than the 1.4 million
+  (cell, level) combinations that do not. Measured: the per-level scan cost 6.56 ms for the
+  0.5 °C case against 4.81 ms.
+* **A float32 field is contoured in float32.** Every frame this app draws is float32, the
+  comparisons and the search are the bulk of the cost, and halving their memory traffic is
+  most of the rest of the difference. Crossing *positions* still land in float64 because
+  the coordinates are; float32 would place a line to about 0.3 m on a 2.5 km grid anyway.
+
+`geo.contour_segments` — the `fr_land` coastline, contoured once at startup — now
+delegates to the same function. One marching squares in the codebase rather than two that
+can disagree about a saddle.
+
+## R5.5 Gotchas found while building v5
+
+* **G35 — a title naming an interval the lines are not drawn at is worse than no title.**
+  Above ~60 lines a map is a hatch pattern, not a reading, so `levels_for` coarsens the
+  step by a **whole** factor (every line at the coarser step was a line at the finer one)
+  and reports the step it actually used. `MainWindow` therefore builds the title *after*
+  `set_frame`, from what the map drew — `isolines 6 °C (too many lines at 1 °C)` — rather
+  than from what it asked for.
+* **G36 — a long map title silently CROPS the map.** A pyqtgraph `LabelItem`'s minimum
+  width is the width of its text, and a `GraphicsLayout` widens the whole column to honour
+  it. Adding the isoline and sort notes to the title took the plot column from 582 px to
+  992 px, swallowed the colorbar entirely, and — the ViewBox being aspect-locked — shrank
+  the latitude on screen from 6.5° to 2.4°, showing about a third of the domain with no
+  error anywhere. That is **G10** reached from the other end, and it was latent in R4's
+  barb titles too. `MapView.set_title` now wraps the label to the widget width (and
+  re-wraps on resize), so a long title takes a second line instead of taking the domain.
+  `test_a_long_title_does_not_crop_the_map` fails on the old code.
+* **A `cap=MAX_LINES` default argument cannot be monkeypatched.** Python binds default
+  arguments at import, so a test that lowers `isolines.MAX_LINES` to force the coarsening
+  path changes nothing. `levels_for` and `contour_set` take `cap=None` and read the module
+  attribute at call time. The same trap as any "constant" a test needs to move.
+* **The saddle decision is not cosmetic.** Cases 5 and 10 have all four edges crossing and
+  two valid pairings; picking the wrong one joins two lobes that are not connected. It is
+  resolved from the mean of the four corners — whichever side of the level the middle of
+  the cell is on is the side that stays connected through it — and
+  `test_a_saddle_is_resolved_by_the_middle_of_the_cell` pins both branches, because the
+  wrong one draws a perfectly plausible-looking map.
+
+## R5.6 Verified
+
+`419 passed, 30 skipped` (364 from R1–R4, unchanged and green, + 55 new). The skips are the
+tests needing the 407 MB reference file or `netCDF4`, neither present here.
+
+| what | where | verified by |
+|---|---|---|
+| the geometry | `isolines.py` | `test_isolines.py` (36) — **the vectorised path matches a deliberately naive cell-by-cell loop written independently in the test**, on random fields with ties and NaNs; a ramp's contour lies exactly on its level; a peak gives a closed ring; a saddle gives two segments that do not cross, resolved by the cell centre; a NaN corner leaves a hole rather than a line around one; mismatched coordinates are refused |
+| the interval | `isolines.py`, `fieldview.py`, `derived.py` | same file — levels anchored, not floated with the frame; the same isotherms in °C, K and °F; a difference anchored at 0; the cap coarsens by a whole factor to a subset of the fine lines; only the temperatures are contoured |
+| the sort band | `derived.py` | same file — red/orange/white at 0/1/2, 0–3.6 in °F, offered on the depression and refused on `TD_2M`, `T_2M`, the wind and `T_2M − T_S`; a depression built from a *saved* `TD_2M` is the same map as the live one |
+| the map | `ui/mapview.py`, `ui/main.py` | `test_ui_isolines.py` (19) — on the real widgets: lines drawn every whole °C with every 5th heavier, following the time step and the aggregation; unticking leaves the colours; °F keeps the same isotherms; the band fixes the colorbar at 0–2 and disables *Colours* and *Scale*; `spread` is never sorted; Sort clears itself on a field that has none; and G36's long title no longer crops the map |
+
+End-to-end under `QT_QPA_PLATFORM=offscreen`, on a 6-step run at the real 261×161×20
+resolution: `T_2M` renders with 1 °C isolines over the bundled coastline; `--derive
+depression` renders with 0.5 °C isolines; `--sort` colours only the band and greys the
+two controls it replaces; `--units F` moves the band to 0–3.6 °F and the label to 1.8 °F
+while the lines stay put; `--isolines off` takes them down; `--sort` on a plain
+temperature prints one sentence and carries on; and `--difference T_2M TD_2M --sort`
+against a `TD_2M` written by `--write` opens as `T-Td` with the band.
+
+## R5.7 Deliberately not done
+
+* **Labels along the contours.** The standard way to read a contour map is to have the
+  value written into a gap in the line. It needs label placement (which gap, which angle,
+  how many per line) and re-placement on every zoom, which is a piece of work in its own
+  right; for now the heavier every-5th line, the colorbar and the hover readout carry the
+  values.
+* **Smoothing before contouring.** The lines show the data, ragged or not. Real ICON
+  output is spatially coherent; a filter that tidied the lines would also move them.
+* **Isolines on the other fields** (CAPE at 250 J kg⁻¹, precipitation at 1 mm). The
+  registry takes one line each — the reason they are absent is that nobody asked, not that
+  anything stops them.
+* **A sort band on other quantities.** The thresholds 0/1/2 are the dew point depression's
+  physics. The mechanism is general; the numbers are not.
+
+## R5.8 Running it
+
+```bash
+venv/bin/python -m imsicon data/ICON_ENS_..._T_2M.nc            # isolines every 1 °C
+venv/bin/python -m imsicon --derive depression --sort data/ICON_ENS_..._T_2M.nc
+venv/bin/python -m imsicon --derive depression --sort --units F --screenshot sorted.png <T_2M file>
+venv/bin/python -m imsicon --isolines off data/ICON_ENS_..._T_2M.nc
+```
+
+Toolbar row 2 carries **Isolines** (on wherever the field has them) and **Sort** (enabled
+on `T-Td`, which **Map shows** offers whenever the run's `T_2M` and `RELHUM_2M` are on
+disk). The map title names both: `T-Td [°C] - Ensemble mean - 2026-08-23 02:00Z (+2 h) |
+isolines 0.5 °C | sorted: colour only below 2 °C`.
