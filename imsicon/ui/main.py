@@ -1,6 +1,5 @@
 """MainWindow - map (left) | readout + graph (right), wired together."""
 import numpy as np
-import pyqtgraph as pg
 from pathlib import Path
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -8,7 +7,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from .. import derived, download, geo, ingest, nc3, ncwrite, transform
 from ..dataset import EnsembleFile, member_stats
 from ..fieldview import FieldView
-from . import derivedialog, downloaddialog
+from . import colors, derivedialog, downloaddialog
 from .mapview import MapView
 from .plotview import PlotView
 from .readout import ReadoutPanel
@@ -17,10 +16,11 @@ FILE_FILTER = 'ICON ensemble (*.nc *.nc.bz2);;NetCDF (*.nc);;Compressed (*.nc.bz
 AGG_CHOICES = [('Ensemble mean', 'mean'), ('Ensemble max', 'max'), ('Ensemble min', 'min'),
                ('Ensemble median', 'median'), ('Spread (max-min)', 'spread'),
                ('Single member', 'member')]
-COLORMAPS = ['turbo', 'viridis', 'inferno', 'plasma', 'magma', 'CET-L17',
-             # Diverging, for a difference map: a single hue ramp cannot show which side
-             # of zero a value is on, which is the only thing a difference map is for.
-             'CET-D1A', 'CET-D9', 'CET-D3']
+SEQUENTIAL_MAPS = ['turbo', 'viridis', 'inferno', 'plasma', 'magma', 'CET-L17']
+# Diverging, for a difference map: a single hue ramp cannot show which side of zero a
+# value is on, which is the only thing a difference map is for.
+DIVERGING_MAPS = ['CET-D1A', 'CET-D9', 'CET-D3']
+COLORMAPS = SEQUENTIAL_MAPS + DIVERGING_MAPS
 DIVERGING_DEFAULT = 'CET-D1A'
 SEQUENTIAL_DEFAULT = 'turbo'
 
@@ -112,6 +112,24 @@ def _symmetric(lo, hi):
     """The smallest range about 0 containing (lo, hi) -- a difference map's scale."""
     reach = max(abs(float(lo)), abs(float(hi)))
     return (-reach, reach) if reach > 0 else (-1.0, 1.0)
+
+
+def _zero_is_the_floor(lo, hi):
+    """Is the bottom of this colour scale the value zero?
+
+    The one question that decides whether the map fades out where the field is zero
+    (`ui/colors.py`). Zero at the *floor* means the field cannot go lower, so a zero cell
+    is an absence -- no CAPE, no rain, no snow, no spread between the members -- and
+    drawing it as nothing is honest. Zero anywhere else on the scale is an ordinary
+    reading with colder or drier values below it, and fading it would hide them.
+
+    The tolerance is relative to the span because the floor is a float that has been
+    through a units affine: 0 mm of rain converted to inches is not exactly 0.0.
+    """
+    lo, hi = float(lo), float(hi)
+    span = abs(hi - lo)
+    return bool(np.isfinite(lo) and np.isfinite(hi)
+                and abs(lo) <= 1e-6 * (span or 1.0))
 
 
 class ScanWorker(QtCore.QThread):
@@ -816,7 +834,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.cmap_combo.currentText() != wanted:
             self.cmap_combo.setCurrentText(wanted)      # fires _on_cmap_changed
         else:
-            self._apply_colormap(self.sort_scale())
+            # The new field decides the transparency, and only `refresh_map` knows where
+            # its scale lands -- so drop the cached state and let the next frame rebuild.
+            self._cmap_state = None
 
     def _ensure_range(self):
         """Range for the CURRENT transform view: cached, or one background scan (G19).
@@ -881,7 +901,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # "no difference" moves with the data and +2 K reads as the same colour as
             # -2 K did a frame earlier. `spread` is excluded: it is non-negative already.
             lo, hi = _symmetric(lo, hi)
-        self._apply_colormap(sort)
+        self._apply_colormap(sort, transparent_zero=_zero_is_the_floor(lo, hi))
         units = f' [{self.ds.units}]' if self.ds.units else ''
         interval = (getattr(self.ds, 'isolines', None)
                     if self.isolines_check.isChecked() else None)
@@ -925,24 +945,34 @@ class MainWindow(QtWidgets.QMainWindow):
             return None
         return getattr(self.ds, 'sort_scale', None)
 
-    def _apply_colormap(self, sort):
+    def _apply_colormap(self, sort, transparent_zero=False):
         """Push the colour scale the view and the options ask for, when it has changed.
+
+        `transparent_zero` fades the bottom of the ramp out (`ui/colors.py`) and is passed
+        in rather than worked out here, because only `refresh_map` knows where the
+        colorbar's low end ended up -- the dataset range, this frame's range, a symmetric
+        difference or the sort band all put it somewhere different.
 
         Guarded by the key rather than by call order: `refresh_map` runs on every frame
         of a scrub, and rebuilding a lookup table 121 times to arrive at the same colours
         is the sort of thing that only shows up as "the slider feels heavy".
         """
         if sort is None:
-            key = ('map', self.cmap_combo.currentText())
+            name = self.cmap_combo.currentText()
+            # A diverging ramp is left alone: its centre is a reading ("no difference"),
+            # not an absence, and its neutral colour is already pale.
+            sequential = name not in DIVERGING_MAPS
+            key = ('map', name, sequential, sequential and transparent_zero)
         else:
             key = ('sort', round(sort.top, 6))
         if key == self._cmap_state:
             return
         self._cmap_state = key
         if sort is None:
-            self.map.set_colormap(key[1])
+            self.map.set_colormap(colors.map_colormap(key[1], transparent_zero=key[3],
+                                                      punchy=key[2]))
         else:
-            self.map.set_colormap(pg.ColorMap(*sort.positions()))
+            self.map.set_colormap(colors.with_transparent_top(*sort.positions()))
 
     # ---- wind barbs ------------------------------------------------------------
     def _push_wind(self, mode):

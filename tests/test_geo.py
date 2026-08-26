@@ -1,4 +1,4 @@
-"""The bundled coastline + border overlay, and that it really sits over the field.
+"""The bundled coastline + border overlay, the land fill under it, and the stacking.
 
 The overlay is committed data, so these tests check the shipped file rather than a
 fixture: if `imsicon/mapdata/levant_10m.json` is ever regenerated wrongly, the map goes
@@ -60,6 +60,61 @@ def test_disputed_lines_are_kept_separate_from_settled_ones():
     assert len(data['borders'][0]) and len(data['borders_uncertain'][0])
 
 
+# ---- the land polygons (R6) --------------------------------------------------------
+def test_the_bundle_carries_land_polygons():
+    """Lines cannot be filled: a coastline clipped to a box is a set of open polylines
+    with no inside, so the grey land needs the source's real rings."""
+    rings = geo.load_mapdata()['land']
+    assert len(rings) > 5
+    for xs, ys in rings:
+        assert len(xs) == len(ys) >= 3
+        assert np.isfinite(xs).all() and np.isfinite(ys).all()   # no NaN breaks in a ring
+
+
+def test_the_land_covers_the_whole_pan_range_not_just_the_domain():
+    """An outline that stops mid-pan looks like a bug; a fill that stops mid-pan looks
+    like a coastline that is not there."""
+    xs = np.concatenate([ring[0] for ring in geo.load_mapdata()['land']])
+    ys = np.concatenate([ring[1] for ring in geo.load_mapdata()['land']])
+    assert xs.min() <= 33.0 and xs.max() >= 37.0
+    assert ys.min() <= 28.0 and ys.max() >= 34.5
+
+
+def test_the_land_agrees_with_the_coastline_about_where_the_sea_is():
+    """Ray casting against the rings, at places nobody can be wrong about."""
+    rings = geo.load_mapdata()['land']
+
+    def is_land(lon, lat):
+        inside = False
+        for xs, ys in rings:
+            x2, y2 = np.roll(xs, -1), np.roll(ys, -1)
+            crossing = (ys > lat) != (y2 > lat)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                at = xs + (lat - ys) * (x2 - xs) / (y2 - ys)
+            if np.count_nonzero(crossing & (lon < at)) % 2:
+                inside = not inside
+        return inside
+
+    for lon, lat, expected in [(35.22, 31.78, True),     # Jerusalem
+                               (34.50, 32.90, False),    # Mediterranean off Haifa
+                               (33.60, 29.60, True),     # Sinai
+                               (33.00, 28.50, False),    # Gulf of Suez
+                               (33.20, 35.00, True),     # Cyprus
+                               (36.30, 33.50, True)]:    # Damascus
+        assert is_land(lon, lat) is expected, (lon, lat)
+
+
+def test_an_older_bundle_without_land_still_loads():
+    """schema 1 costs the map its grey land and nothing else."""
+    assert geo._rings_to_arrays(()) == []
+    assert geo._rings_to_arrays([[[1, 2], [3, 4]]]) == []      # a 2-point ring is not one
+
+
+def test_the_fallback_overlay_has_no_land_to_fill():
+    layers = dict(geo.overlay_for('nowhere.nc'))
+    assert 'land' in layers
+
+
 def test_the_source_is_recorded():
     assert 'Natural Earth' in geo.load_mapdata()['source']
 
@@ -95,6 +150,9 @@ def test_the_outlines_stack_above_the_field(qapp):
     from imsicon.ui import mapview
     view = mapview.MapView()
     try:
+        # The land is UNDER the field: it is there to be seen through it (`ui/colors.py`),
+        # not to cover it.
+        assert view.land.zValue() < view.img.zValue()
         assert view.img.zValue() < view.coast.under.zValue()
         assert view.coast.under.zValue() < view.coast.over.zValue()
         assert view.coast.over.zValue() <= view.borders.under.zValue()
@@ -114,6 +172,7 @@ def test_setting_an_overlay_fills_every_layer(qapp):
             assert layer.over.xData is not None and len(layer.over.xData)
             # Halo and ink carry the same geometry, or the halo would show through.
             assert np.array_equal(layer.under.xData, layer.over.xData, equal_nan=True)
+        assert view.land_rings > 5 and view.land.path().elementCount() > 100
         assert 'Natural Earth' in view.overlay_source
     finally:
         view.close()
@@ -127,6 +186,7 @@ def test_an_empty_overlay_clears_the_layers_instead_of_raising(qapp):
         view.set_overlay(None)
         for layer in (view.coast, view.borders, view.borders_uncertain):
             assert layer.over.xData is None or not len(layer.over.xData)
+        assert view.land_rings == 0 and view.land.path().isEmpty()
     finally:
         view.close()
 
@@ -154,5 +214,20 @@ def test_each_outline_has_a_contrasting_halo(qapp, layer):
         ink = outline.over.opts['pen']
         assert halo.widthF() > ink.widthF()
         assert halo.color().lightness() > ink.color().lightness()
+    finally:
+        view.close()
+
+
+def test_the_land_is_filled_pale_and_the_sea_is_left_to_the_background(qapp):
+    """Light enough to sit under the lowest values a ramp carries, dark enough to read
+    as land against the white sea. The sea is not drawn at all."""
+    from PySide6 import QtCore
+    from imsicon.ui import mapview
+    view = mapview.MapView()
+    try:
+        brush = view.land.brush()
+        assert brush.style() != QtCore.Qt.BrushStyle.NoBrush
+        assert 200 < brush.color().lightness() < 245
+        assert view.land.pen().style() == QtCore.Qt.PenStyle.NoPen
     finally:
         view.close()

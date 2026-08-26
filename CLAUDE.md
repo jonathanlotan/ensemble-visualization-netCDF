@@ -891,7 +891,8 @@ so outside the inner box the map had **no coastline at all** (**G6**). Now:
 * `tools/build_mapdata.py` clips Natural Earth 1:10 m coastline and admin-0 boundary lines
   to 30.5–39.5 E / 24.5–38 N — the full pan range, not just the domain, or the outline
   stops mid-pan and looks like a bug — rounds to 4 decimals (~11 m, against a 2.5 km grid)
-  and writes `imsicon/mapdata/levant_10m.json`. **85 kB**, committed, no runtime download.
+  and writes `imsicon/mapdata/levant_10m.json`. **85 kB** (133 kB once R6 added the land
+  polygons), committed, no runtime download.
 * `geo.overlay_for` returns every layer at once and falls back to the `fr_land` contour
   when the bundle is missing, so a lost data file costs the map its outlines rather than
   stopping a forecast opening.
@@ -1412,3 +1413,213 @@ Toolbar row 2 carries **Isolines** (on wherever the field has them) and **Sort**
 on `T-Td`, which **Map shows** offers whenever the run's `T_2M` and `RELHUM_2M` are on
 disk). The map title names both: `T-Td [°C] - Ensemble mean - 2026-08-23 02:00Z (+2 h) |
 isolines 0.5 °C | sorted: colour only below 2 °C`.
+
+
+---
+
+# Release 6 — a transparent zero, a vivid ramp, and the land underneath
+
+Requested 2026-08-26: *for each map, for the turbo colours, make 0 be transparent and make
+everything else pop up more; and when the map is empty, make the land light grey (keep the
+sea white).* Sections 0 (byte math), R1 (the two-panel viewer), R2 (the one transform
+layer), R3 (derived fields), R4 (the wind map) and R5 (isolines and the sort scale) are
+unchanged and still the contract.
+
+## R6.1 The shape of it
+
+The two halves are one idea. Painting nothing where the field is zero is only an
+improvement if there is something worth seeing underneath, so the transparency and the
+grey land ship together and neither makes sense alone:
+
+```
+   geo.load_mapdata()['land'] ──► MapView.land   (grey fill, z = -10)   the sea is the
+                                       ▲                                widget's own white
+   FieldView / derived view ─────► MapView.img   (z = 0)  ◄── ColorMap from ui/colors.py
+                                       ▲                        vivid + alpha fade at zero
+   MainWindow.refresh_map ── lo, hi ───┘  _zero_is_the_floor(lo, hi) decides the fade
+```
+
+| file | responsibility |
+|---|---|
+| `imsicon/ui/colors.py` | the two colour transforms (`vivid`, `fade_in_from_zero`), the cache, and the sort band's transparent top stop |
+| `imsicon/ui/main.py` | `_zero_is_the_floor` — the one predicate; `_apply_colormap` gained the flag |
+| `imsicon/ui/mapview.py` | the land layer at `Z_LAND = -10`, filled odd-even |
+| `imsicon/geo.py` | `land` in the overlay dict, as one array pair per closed ring |
+| `tools/build_mapdata.py` | schema 2: `ne_10m_land` fetched and Sutherland-Hodgman clipped |
+
+## R6.2 Zero is an absence, and only at the floor
+
+A CAPE map at 03 UTC is zero nearly everywhere, and turbo paints zero as a near-black
+navy: the whole domain reads as a dark rectangle with the coastline lost underneath it.
+Zero is not a small value of CAPE, it is the *absence* of CAPE, and the honest way to draw
+an absence is to draw nothing.
+
+**The fade is at the value zero, not at position 0.0 of the ramp**, and that distinction is
+the whole safety of it. `_zero_is_the_floor(lo, hi)` asks whether the bottom of the colour
+scale *is* zero — which means the field cannot go lower, so a zero cell is an absence. On a
+2 m temperature map the bottom of the scale is the coldest air in the domain, which is a
+reading with nothing missing about it, and fading it would hide the coldest place on the
+map. So:
+
+| map | floor | faded |
+|---|---|---|
+| CAPE, precipitation, snow depth, wind speed | 0 | yes |
+| any field under `spread` (max − min) | 0 | yes — no spread means the members agree |
+| `T_2M` / `T_S` / `TD_2M` | the coldest air | no |
+| a difference map (`T-Td`, `A − B`) | −max\|v\| | no — its centre is a reading, not an absence |
+
+The tolerance is relative to the span, because a floor is a float that has been through a
+units affine: 0 m of snow read as mm is not exactly 0.0.
+
+**It fades rather than switches.** A model field is not "0 or 1400"; it is a floor of exact
+zeros with a smooth skirt of small values around every active cell. Cutting at exactly 0.0
+would leave that skirt painted solid and the map barely changed, so alpha climbs from
+nothing to opaque across the bottom 5 % of the scale (~160 J kg⁻¹ on the reference CAPE
+file — below anything a forecaster acts on). **Nothing above the fade is touched at all**:
+the transform can lighten a map, never move a value's colour.
+
+## R6.3 Vivid — and why the near-black end had to go
+
+With the floor gone the rest has to carry the map on its own. `vivid` does two things to
+every stop: a saturation gain about the value (V = max(r,g,b) is held, the other channels
+are pulled down — an HSV saturation multiply without the round trip), and a lift of V
+itself to `floor + (1 − floor)·V`, which is ≥ V everywhere and exactly V at V = 1, so it
+only ever brightens and leaves a fully bright colour where it was.
+
+The lift is not decoration. turbo starts at a navy of V = 0.23 and viridis at a purple of
+V = 0.27, and against a pale map both read as *black* — which is the reading the
+transparency now gives to zero, and must give to nothing else. A low-but-nonzero cell that
+looks like an empty cell is the bug this release exists to fix, reappearing 5 % further up
+the scale.
+
+Applied to the six sequential ramps. **The three diverging ones are left exactly as they
+are**: a difference map's centre is a reading ("no difference"), its neutral colour is
+already pale, and symmetry about zero is the only thing that map is for.
+
+## R6.4 The land, and why lines could not do it
+
+`geo` already bundled Natural Earth coastline and border *lines*, and a line has no inside:
+a coastline clipped to a box is a set of open polylines, so there is nothing to fill. Schema
+2 of `levant_10m.json` therefore carries `ne_10m_land` **rings**, clipped with
+Sutherland-Hodgman — which keeps a ring a ring, unlike `clip_line`, which may split a
+polyline into several runs. The degenerate edges S-H can leave running along the box
+enclose no area, so an odd-even fill is unaffected by them, and interior rings are kept
+rather than dropped so a hole punches its own hole with no further bookkeeping.
+
+* **The land is under the field, not over it** (`Z_LAND = -10`), by explicit z-value like
+  every other layer since R3.10. It is there to be seen *through* the map.
+* **The sea is not drawn at all** — the widget background is already white, so "keep the
+  sea white" is the absence of a layer rather than a second one.
+* Grey `#e7e7e2`: pale enough to sit under the lowest values a ramp carries, dark enough to
+  read as land at a glance.
+* An older bundle, a missing one or a corrupt one costs the map its grey land and nothing
+  else — the same failure mode `load_mapdata` already had for the outlines.
+
+**The sort band's top stop changed with it.** R5 ended the band at white on the reasoning
+that above 2 °C "the colours simply run out", which was true while the background was plain
+white. With grey land underneath, an opaque white top stop would paint over the coastline
+in exactly the dry air the band is trying to say nothing about. The stop keeps its RGB —
+the colorbar still reads white at the top — and loses its alpha, so the colours run out for
+real. It also fixes something R3 left awkward from the other side: a depression is
+non-negative, so its diverging symmetric scale spent half a colorbar on values that cannot
+occur.
+
+## R6.5 Measured, not assumed
+
+Timings on the real CAPE file (261×161, 20 members), each `refresh_map` followed by a full
+widget grab so the paint — where a lookup table is actually applied — is inside the number.
+This is the machine R4.4 measured as roughly 3× slower than the one v2 and v3 were timed on.
+
+| operation | ms |
+|---|---|
+| `refresh_map` + paint, opaque vivid turbo | 15.2 |
+| `refresh_map` + paint, transparent-zero turbo | **15.4** |
+| the land fill, added to the same paint | **+0.6** |
+| one cold colormap build (256 stops) | 1.33 |
+| a cached `map_colormap` lookup | 0.03 |
+
+So an RGBA lookup table costs about 0.2 ms — inside the noise, and nowhere near v2's
+16.7 ms frame. Measuring it wrongly is easy and was tried first: **timing `refresh_map`
+alone reported the transparent path as 3.7 ms slower**, because `ImageItem.setImage` only
+marks the item dirty and the LUT is applied at paint. The extra 3.7 ms was a first-call
+warm-up being charged to whichever variant ran first.
+
+Other numbers:
+
+| claim | measurement |
+|---|---|
+| the land bundle stays committable | 19 rings, 2,763 points, **133 kB** total (from 85 kB) — clipped down from the 82,076 points those rings carry globally |
+| the clip is correct, not just small | ray-cast against the clipped rings at 12 places nobody can be wrong about: Jerusalem, Damascus, Cairo, Sinai and Cyprus land; the Med off Haifa, west of Cyprus, the NW corner, the Gulf of Suez and the Eilat gulf sea |
+| the existing layers did not drift | the regenerated coastline and border blobs are **byte-identical** to the committed ones; only the `land` key is new |
+
+## R6.6 Gotchas found while building v6
+
+* **G37 — a `pg.ColorMap` built from floats in 0..1 is black from end to end.**
+  `ColorMap.__init__` runs every colour through `mkColor`, which reads a 4-tuple as 0–255
+  integers, so `[0.19, 0.07, 0.23, 1.0]` becomes `(0, 0, 0, 1)`. `getLookupTable(mode=FLOAT)`
+  hands *back* 0..1, so the natural spelling of "read the ramp, edit it, put it back" is
+  silently wrong — no exception, just a black map and a black colorbar. `colors._build`
+  converts to bytes, and `test_the_stops_survive_the_trip_through_mkColor` fails on the
+  float version.
+* **G38 — `QMessageBox.critical` reached from a worker's failure signal wedges the whole
+  offscreen test run.** **G30** covered the modal file dialog; this is the same trap
+  arriving from `_on_derive_failed` *inside* `app.processEvents()`, so pytest-timeout's
+  default signal method cannot unwind it either — the run dies at the shell timeout with no
+  failing test to point at, and `--timeout-method=thread` is what prints the stack that
+  names it. UI tests now collect `QMessageBox.critical` into a list and assert it is empty,
+  which turns a wedged run into a one-line failure quoting the app's own message. What it
+  caught first time was a *fixture* bug of the G17 family: a humidity array built from `x`
+  and `step` but not `y` broadcast to `(NT, 1, NX)`, so the file was written on a
+  1-row grid and `check_pairable` correctly refused to pair it with the temperature.
+* **An empty `QPainterPath` does not have zero elements.** `path().elementCount()` is 1 for
+  a fresh path (a `moveTo` at the origin), so a "the layer was cleared" assertion written
+  against `== 0` fails on a layer that really is clear. `QPainterPath.isEmpty()` is the
+  predicate that means what it says.
+
+## R6.7 Verified
+
+`504 passed` (469 from R1–R5, unchanged and green apart from the one sort-band assertion
+this release deliberately changes, + 35 new). Nothing skips in this environment because
+both `netCDF4` and the 407 MB reference file are present here.
+
+| what | where | verified by |
+|---|---|---|
+| the colour transforms | `ui/colors.py` | `test_colors.py` (20) — the bottom stop is not painted; everything above the fade is fully opaque and the fade is a fade, not a step; **the RGB of every stop is identical with and without the flag**, and alpha only ever decreases; the ramp gains saturation and loses its near-black end without any stop getting darker; a fully bright colour is left where it was; an unknown name falls back instead of raising; the cache returns the same object; G37 |
+| the predicate | `ui/main.py` | same file — CAPE, an all-zero field and `spread` are floors; a temperature map, a scale with zero inside it and a symmetric difference are not; a floor that has been through an affine still counts; a NaN range is not a floor (**G20**'s family) |
+| the wiring | `ui/main.py`, `ui/mapview.py` | `test_ui_colors.py` (9) — on real widgets: a zero-floor field is not painted at zero and a temperature map is opaque all the way down; the decision follows the aggregation (`spread` on a temperature map fades, `mean` does not) and the Scale control; a units change keeps it; a difference map's diverging ramp is **bit-identical to the stock pyqtgraph one**; the land is filled, sits under the field, and survives switching fields; a 121-step scrub rebuilds no lookup table |
+| the land data | `geo.py`, `mapdata/levant_10m.json` | `test_geo.py` (+6) — the shipped bundle carries rings with no NaN breaks, spanning the whole pan range; ray casting agrees with the coastline at 6 places; an older schema-1 bundle still loads; the fill is pale, pen-less, under the field, and cleared by an empty overlay |
+| the sort band | `derived.py`, `ui/colors.py` | `test_ui_isolines.py` — red at 0 and yellow-orange at 1 stay painted, white at 2 keeps its RGB and loses its alpha |
+
+End-to-end under `QT_QPA_PLATFORM=offscreen`, on the real 407 MB CAPE file: at +110 h the
+convective plume is vivid over grey land and white sea with the coastline legible through
+it; at +20 h, when the domain is almost entirely zero, the map is the grey land, the white
+sea and the outlines, with a faint haze exactly where a little CAPE exists. `H_SNOW` in
+summer — all zeros — renders as a bare map. A 2 m temperature map and a wind-speed map stay
+fully opaque, and the sorted depression shows the land through the dry air the band leaves
+uncoloured.
+
+## R6.8 Deliberately not done
+
+* **A transparent centre on the diverging ramps.** "No difference" is a reading, and the
+  neutral colour is already pale. If a difference map ever wants to disappear where it is
+  zero, that is a different request with a different justification.
+* **A land shade that varies with terrain.** `topo_icon_web.nc` has `topography_c`, and
+  CLAUDE.md Phase 4.3 still lists an optional hillshade — but it only covers the inner box
+  (**G6**), so it would fade out mid-domain. The flat fill covers the whole pan range.
+* **Lakes and rivers.** `ne_10m_lakes` would put the Sea of Galilee and the Dead Sea back
+  in white. It is another layer in the same bundle and the same clip; nobody asked yet.
+* **A configurable fade width or land colour.** Both are single constants in
+  `ui/colors.py` and `ui/mapview.py`, deliberately not on the toolbar: the toolbar already
+  carries seven controls, and these are calibration, not a reading.
+
+## R6.9 Running it
+
+```bash
+venv/bin/python -m imsicon data/ICON_ENS_..._CAPE_ML.nc     # zero is not painted
+venv/bin/python -m imsicon --derive depression --sort data/ICON_ENS_..._T_2M.nc
+python tools/build_mapdata.py --fetch                       # rebuild the bundle (dev only)
+```
+
+Nothing new on the toolbar. **Colours** still chooses the ramp, and the transparency
+follows the scale rather than a switch — which is the point: it appears on the maps where
+zero means nothing happened, and nowhere else.

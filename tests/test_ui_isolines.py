@@ -236,10 +236,13 @@ def test_sorting_colours_only_the_band_below_two_degrees(window, qapp):
     window.sort_check.setChecked(True)
     settle(qapp)
     assert window.map.cbar.levels() == (0.0, 2.0)
-    lut = window.map.cmap.getLookupTable(0.0, 1.0, 3)
-    assert tuple(lut[0]) == (215, 25, 28)        # 0 degC: red
-    assert tuple(lut[-1]) == (255, 255, 255)     # 2 degC and drier: white, i.e. no colour
+    lut = window.map.cmap.getLookupTable(0.0, 1.0, 3, alpha=True)
+    assert tuple(lut[0]) == (215, 25, 28, 255)   # 0 degC: red
+    # 2 degC and drier: white, and not painted at all -- the colours run out for real, so
+    # the grey land under the map shows through instead of being covered over.
+    assert tuple(lut[-1]) == (255, 255, 255, 0)
     assert tuple(lut[1])[0] > 240 and tuple(lut[1])[2] < 130   # 1 degC: yellow-orange
+    assert lut[1][3] > 100                       # inside the band, still painted
     assert 'sorted: colour only below 2 °C' in window.map.plot.titleLabel.text
 
 

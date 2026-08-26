@@ -11,8 +11,15 @@ pg.setConfigOption('background', 'w')
 pg.setConfigOption('foreground', 'k')
 
 # Explicit stacking, because "drawn over the model map" must not depend on the order the
-# items happened to be added in. The field is the bottom layer; every outline sits above
-# it, and the picked-point marker above those.
+# items happened to be added in. The land fill is under everything, the field over it,
+# every outline above that, and the picked-point marker above those.
+#
+# The land is under the FIELD rather than over it because the field is what it is there
+# for: a turbo map is transparent where the value is zero (`ui/colors.py`), so the grey
+# shows through exactly where there is nothing to say, and a forecaster reading an empty
+# CAPE map still sees which side of the coast they are looking at. The sea is not drawn
+# at all -- the widget background is already white.
+Z_LAND = -10
 Z_FIELD = 0
 # Isolines of the field sit directly on it, under every geographic outline: the coastline
 # is the frame you read the contours against, so it goes on top of them, not under.
@@ -26,6 +33,10 @@ Z_MARKER = 20
 
 # Roughly the colorbar column, kept out of the title's wrapping width (G36).
 TITLE_MARGIN_PX = 110
+
+# Pale enough to sit under a colour ramp without competing with the lowest values it
+# carries, dark enough to read as land against the white sea at a glance.
+LAND_COLOUR = '#e7e7e2'
 
 
 class _Outline:
@@ -65,6 +76,16 @@ class MapView(pg.GraphicsLayoutWidget):
         self.plot.setLabel('left', 'latitude', units='°N')
         self.plot.showGrid(x=True, y=True, alpha=0.15)
         self.plot.setMenuEnabled(False)
+
+        # Land under the field, so an empty map is still a map. `ignoreBounds` for the
+        # reason the barbs use it: the fill reaches past the model domain to the edge of
+        # the bundled overlay, and it must not be able to drag the view range out with it.
+        self.land = QtWidgets.QGraphicsPathItem()
+        self.land.setPen(QtGui.QPen(QtCore.Qt.PenStyle.NoPen))
+        self.land.setBrush(pg.mkBrush(LAND_COLOUR))
+        self.land.setZValue(Z_LAND)
+        self.plot.addItem(self.land, ignoreBounds=True)
+        self.land_rings = 0                # how many are filled (status, tests)
 
         self.img = pg.ImageItem(axisOrder='row-major')
         self.img.setZValue(Z_FIELD)
@@ -185,8 +206,9 @@ class MapView(pg.GraphicsLayoutWidget):
         self.reset_view()
 
     def set_overlay(self, overlay):
-        """Draw the coastline and border layers (`geo.overlay_for`) over the field."""
+        """Draw the land fill under the field and the outline layers over it."""
         overlay = overlay or {}
+        self._set_land(overlay.get('land') or ())
         for name, item in (('coastline', self.coast), ('borders', self.borders),
                            ('borders_uncertain', self.borders_uncertain)):
             xs, ys = overlay.get(name) or (None, None)
@@ -195,6 +217,25 @@ class MapView(pg.GraphicsLayoutWidget):
             else:
                 item.clear()
         self.overlay_source = overlay.get('source', '')
+
+    def _set_land(self, rings):
+        """Fill the land rings pale grey; the sea is the widget's own white background.
+
+        Odd-even, so a ring inside a ring is a hole and not a second island -- which is
+        what `tools/build_mapdata.py` relies on by keeping the source's interior rings
+        instead of dropping them.
+        """
+        path = QtGui.QPainterPath()
+        path.setFillRule(QtCore.Qt.FillRule.OddEvenFill)
+        for xs, ys in rings:
+            if len(xs) < 3:
+                continue
+            polygon = QtGui.QPolygonF([QtCore.QPointF(float(x), float(y))
+                                       for x, y in zip(xs, ys)])
+            path.addPolygon(polygon)
+            path.closeSubpath()
+        self.land.setPath(path)
+        self.land_rings = len(rings)
 
     def reset_view(self):
         """Fit the whole domain. Aspect lock means one axis gets slack, not a crop."""

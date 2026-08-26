@@ -2,9 +2,11 @@
 
 Two sources, and the bundled one is why this file changed shape:
 
-* `imsicon/mapdata/levant_10m.json` -- Natural Earth 1:10 m coastline and admin-0 boundary
-  lines, clipped to the domain by `tools/build_mapdata.py` and committed (85 kB). This is
-  what CLAUDE.md Phase 4.3 asked for, and it covers the WHOLE domain.
+* `imsicon/mapdata/levant_10m.json` -- Natural Earth 1:10 m coastline, land polygons and
+  admin-0 boundary lines, clipped to the domain by `tools/build_mapdata.py` and committed
+  (133 kB). This is what CLAUDE.md Phase 4.3 asked for, and it covers the WHOLE domain.
+  The land polygons are what the map fills pale grey under the field, so that a field
+  drawn transparent where it is zero still shows you which side of the coast you are on.
 * `topo_icon_web.nc` (MANUALS/IMS_ICON), whose `fr_land` gives a coastline derived from the
   model's own land mask. It is a *different, smaller* grid -- lat 29.0-34.0, lon 34.0-36.0,
   same 0.025 deg spacing, aligned on exact integer offsets (CLAUDE.md **G6**) -- so it
@@ -98,11 +100,27 @@ def _polylines_to_arrays(polylines):
     return np.array(xs), np.array(ys)
 
 
+def _rings_to_arrays(rings):
+    """[[[lon, lat], ...], ...] -> [(xs, ys)] -- one array pair per closed ring.
+
+    Kept apart, unlike the polylines: a fill needs to know where each ring ends, so the
+    NaN-separated trick that makes the line layers one scene item each would lose exactly
+    the information the fill runs on.
+    """
+    out = []
+    for ring in rings:
+        if len(ring) < 3:
+            continue
+        points = np.asarray(ring, dtype=float)
+        out.append((points[:, 0], points[:, 1]))
+    return out
+
+
 def load_mapdata(path=None, cache={}):
     """The bundled overlay as ready-to-draw arrays, or None if it is not there.
 
     -> {'coastline': (xs, ys), 'borders': (xs, ys), 'borders_uncertain': (xs, ys),
-        'source': str, 'classes': {name: n}}
+        'land': [(xs, ys)], 'source': str, 'classes': {name: n}}
 
     Never raises: a missing or corrupt overlay costs the map its outlines, and that must
     not stop a forecast being opened.
@@ -123,6 +141,9 @@ def load_mapdata(path=None, cache={}):
             'coastline': _polylines_to_arrays(blob.get('coastline') or ()),
             'borders': _polylines_to_arrays(borders),
             'borders_uncertain': _polylines_to_arrays(uncertain),
+            # schema 1 has no land polygons; an older bundle costs the map its grey land
+            # and nothing else, which is the same failure mode as a missing bundle.
+            'land': _rings_to_arrays(blob.get('land') or ()),
             'source': str(blob.get('source', '')),
             'classes': classes,
         }
@@ -140,7 +161,7 @@ def overlay_for(data_path):
     when the bundle is unavailable.
     """
     layers = {'coastline': (None, None), 'borders': (None, None),
-              'borders_uncertain': (None, None), 'source': '', 'classes': {}}
+              'borders_uncertain': (None, None), 'land': [], 'source': '', 'classes': {}}
     bundled = load_mapdata()
     if bundled is not None:
         layers.update(bundled)
