@@ -124,6 +124,83 @@ def pair(tmp_path, n_times=6, n_members=3, ny=4, nx=5, humidity_encoding=None,
                      encoding=humidity_encoding))
 
 
+# ---- the deterministic ICON-LAM shapes (v7) -------------------------------------------
+# `IE_<run>_<field>.nc`, the variable named after the field rather than `<FIELD>_eps`, and
+# either a real `plev` coordinate or no vertical dimension at all. Both are written by the
+# same production writer the app saves with, so a fixture cannot drift from what the app
+# produces -- and neither is a guess about the IMS file: the app decides the axis from
+# what a file actually carries (`levels.axis_for`), and these are the shapes that decision
+# has to get right.
+ICON_LEVELS = (1000, 925, 850, 700, 500)
+
+
+def _run_units(run):
+    """`minutes since <run>` -- so a fixture's header agrees with the run in its name."""
+    return (f'minutes since {run[:4]}-{int(run[4:6])}-{int(run[6:8])} '
+            f'{int(run[8:10])}:00:00')
+
+
+def pressure_field(path, field='temp', units='K', n_times=4, ny=4, nx=5, levels=None,
+                   values=None, level_units='hPa', variable=None, run='2026083100'):
+    """A 3-D field on pressure levels: (time, plev, lat, lon).
+
+    The default pattern falls with height the way an atmosphere does, so a test can tell
+    one level from another by its values alone.
+    """
+    levels = ICON_LEVELS if levels is None else tuple(levels)
+    t = np.arange(n_times)[:, None, None, None]
+    p = np.asarray(levels, dtype=float)[None, :, None, None]
+    y = np.arange(ny)[None, None, :, None]
+    x = np.arange(nx)[None, None, None, :]
+    if values is None:
+        # ~6.5 K per km, roughly hydrostatic, plus a diurnal wiggle and a spatial tilt.
+        values = 220.0 + 0.06 * p + 2.0 * np.sin(t * np.pi / 6) + 0.1 * y + 0.05 * x
+        values = np.broadcast_to(values, (n_times, len(levels), ny, nx))
+    written = np.asarray(levels, dtype=float)
+    if level_units == 'Pa':
+        written = written * 100.0
+    return write_nc3(path, field, units, values, levels=written,
+                     variable=variable or field, time_units=_run_units(run),
+                     long_name=f'{field} on pressure levels', standard_name=field,
+                     global_attrs={'history': 'icon-lam deterministic run'},
+                     level_units=level_units)
+
+
+def surface_field(path, field='t_2m', units='K', n_times=4, ny=4, nx=5, values=None,
+                  variable=None, run='2026083100'):
+    """A deterministic surface field: (time, lat, lon), with no vertical dimension."""
+    t = np.arange(n_times)[:, None, None]
+    y = np.arange(ny)[None, :, None]
+    x = np.arange(nx)[None, None, :]
+    if values is None:
+        values = 293.15 + 4 * np.sin(t * np.pi / 6) + 0.2 * y + 0.1 * x
+        values = np.broadcast_to(values, (n_times, ny, nx))
+    return write_nc3(path, field, units, np.asarray(values, float)[:, None],
+                     levels=False, variable=variable or field, time_units=_run_units(run),
+                     long_name=f'{field} at the surface', standard_name=field,
+                     global_attrs={'history': 'icon-lam deterministic run'})
+
+
+def icon_run(tmp_path, run='2026083100', fields=('temp', 't_2m'), **kwargs):
+    """One deterministic run on disk: 3-D fields get levels, surface fields do not."""
+    out = {}
+    for field in fields:
+        path = tmp_path / f'IE_{run}_{field}.nc'
+        if field in ('temp', 'rh', 'u', 'v', 'omega', 'geopot'):
+            out[field] = pressure_field(path, field, _ICON_UNITS.get(field, 'K'),
+                                        run=run, **kwargs)
+        else:
+            out[field] = surface_field(path, field, _ICON_UNITS.get(field, 'K'),
+                                       run=run, **kwargs)
+    return out
+
+
+_ICON_UNITS = {'temp': 'K', 'rh': '%', 'u': 'm s-1', 'v': 'm s-1', 'omega': 'Pa s-1',
+               'geopot': 'm2 s-2', 't_2m': 'K', 'td_2m': 'K', 'rh_2m': '%',
+               'u_10m': 'm s-1', 'v_10m': 'm s-1', 'tot_prec': 'kg m-2',
+               'pres_msl': 'Pa', 'clct': '%'}
+
+
 def wind_component(path, field, base, n_members=3, step=0.5, units='m s-1'):
     """One component of the wind, `m s-1`, with the members offset from each other."""
     long_names = {'U_10M': 'zonal wind in 10m', 'V_10M': 'meridional wind in 10m'}

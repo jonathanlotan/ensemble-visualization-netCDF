@@ -13,7 +13,7 @@ from pathlib import Path
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .. import download, ingest
+from .. import download, ingest, products
 
 
 def human(size):
@@ -25,19 +25,27 @@ def human(size):
 
 
 class ListWorker(QtCore.QThread):
-    """Authenticate and fetch the directory index, off the UI thread."""
+    """Authenticate and fetch one family's directory index, off the UI thread.
+
+    `session` may be an already-authenticated one: switching the product combo re-lists a
+    different folder and must not make the user type the password again.
+    """
 
     listed = QtCore.Signal(object)
     failed = QtCore.Signal(str)
 
-    def __init__(self, user, password, parent=None):
+    def __init__(self, user, password, family=None, session=None, parent=None):
         super().__init__(parent)
         self._user, self._password = user, password
+        self._family = family or products.ENSEMBLE
+        self._session = session
 
     def run(self):
         try:
-            session = download.make_session(self._user, self._password)
-            self.listed.emit((session, download.fetch_listing(session)))
+            session = self._session or download.make_session(self._user, self._password)
+            self.listed.emit((session,
+                              download.fetch_listing(session, family=self._family),
+                              self._family))
         except download.DownloadError as exc:
             self.failed.emit(str(exc))
         except Exception as exc:
@@ -101,6 +109,7 @@ class DownloadDialog(QtWidgets.QDialog):
         self.worker = None
         self.fetcher = None
         self.downloaded = []
+        self.family = products.ENSEMBLE
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.addWidget(self._build_credentials())
@@ -143,6 +152,20 @@ class DownloadDialog(QtWidgets.QDialog):
         box = QtWidgets.QGroupBox('Maps')
         outer = QtWidgets.QVBoxLayout(box)
         row = QtWidgets.QHBoxLayout()
+        # Which product. The ensemble gives 20 members of one 00Z run a day; the
+        # deterministic ICON-LAM run gives 00Z and 12Z, 48 fields, and six of them on 20
+        # pressure levels -- which is what the viewer's Level control steps through.
+        row.addWidget(QtWidgets.QLabel('Product:'))
+        self.family_combo = QtWidgets.QComboBox()
+        for family in products.FAMILIES:
+            self.family_combo.addItem(family.title, family.key)
+        self.family_combo.setToolTip(
+            'IMS publishes the model twice: an ensemble of 20 members (one 00Z run a '
+            'day), and the deterministic ICON-LAM run (00Z and 12Z), whose temperature, '
+            'humidity, wind, omega and geopotential come on 20 pressure levels.')
+        self.family_combo.currentIndexChanged.connect(self._on_family_changed)
+        row.addWidget(self.family_combo)
+        row.addSpacing(12)
         row.addWidget(QtWidgets.QLabel('Run:'))
         self.run_combo = QtWidgets.QComboBox()
         self.run_combo.setMinimumWidth(190)
@@ -165,7 +188,7 @@ class DownloadDialog(QtWidgets.QDialog):
         outer.addLayout(row)
 
         self.field_list = QtWidgets.QTreeWidget()
-        self.field_list.setHeaderLabels(['Map', 'Field', 'Size', 'On disk'])
+        self.field_list.setHeaderLabels(['Map', 'Field', 'Levels', 'Size', 'On disk'])
         self.field_list.setRootIsDecorated(False)
         self.field_list.setAlternatingRowColors(True)
         self.field_list.itemChanged.connect(lambda *_: self._refresh_footer())
@@ -209,15 +232,34 @@ class DownloadDialog(QtWidgets.QDialog):
             self.status.setText('A user name and password are needed.')
             return
         self.connect_button.setEnabled(False)
-        self.status.setText('Connecting to the IMS server...')
-        self.worker = ListWorker(user, password, self)
+        self.status.setText(f'Connecting to the IMS server ({self.family.short})...')
+        self.worker = ListWorker(user, password, self.family, self.session, self)
         self.worker.listed.connect(self._on_listed)
         self.worker.failed.connect(self._on_list_failed)
         self.worker.start()
 
+    def _on_family_changed(self, _index):
+        """Switching product re-lists the other folder, reusing the open session."""
+        self.family = products.BY_KEY.get(self.family_combo.currentData(),
+                                          products.ENSEMBLE)
+        self.files, self.by_run = [], {}
+        self.run_combo.clear()
+        self._populate_fields()
+        for button, fields in ((self.dewpoint_button, download.dew_point_fields(self.family)),
+                               (self.wind_button, download.wind_fields(self.family))):
+            button.setEnabled(bool(fields))
+        if self.session is not None:
+            self.connect_to_server()
+        else:
+            self.status.setText(f'{self.family.title}: press Connect to list its runs.')
+
     def _on_listed(self, result):
         self.connect_button.setEnabled(True)
-        self.session, self.files = result
+        # (session, files) or (session, files, family): a listing that does not name a
+        # family belongs to the one currently selected.
+        self.session, self.files = result[0], result[1]
+        if len(result) > 2 and result[2] is not None:
+            self.family = result[2]
         if self.remember.isChecked():
             if not download.remember_credentials(self.user_edit.text().strip(),
                                                  self.password_edit.text()):
@@ -230,7 +272,7 @@ class DownloadDialog(QtWidgets.QDialog):
             self.run_combo.addItem(f'{run[:4]}-{run[4:6]}-{run[6:8]}  {run[8:]}Z', run)
         self.run_combo.blockSignals(False)
         self._populate_fields()
-        self.status.setText(f'{len(self.files)} files across '
+        self.status.setText(f'{self.family.title}: {len(self.files)} files across '
                             f'{len(self.by_run)} runs. Tick the maps you want.')
 
     def _on_list_failed(self, message):
@@ -241,34 +283,40 @@ class DownloadDialog(QtWidgets.QDialog):
     def _populate_fields(self):
         run = self.run_combo.currentData()
         offered = self.by_run.get(run, {})
-        on_disk = ingest.scan_for_fields(ingest.search_roots())
+        on_disk = ingest.fields_of_run(
+            ingest.scan_for_fields(ingest.search_roots()), self.family, run)
         self.field_list.blockSignals(True)
         self.field_list.clear()
         # Catalogue order first, so CAPE and precipitation lead; anything the server
         # offers that this build has never heard of still appears, at the end.
-        known = [p.field for p in download.PRODUCTS]
+        known = [p.field for p in self.family.products]
         fields = known + sorted(set(offered) - set(known))
         for field in fields:
             entry = offered.get(field)
             if entry is None:
                 continue
-            product = download.BY_FIELD.get(field)
-            cached = on_disk.get((run, field))
+            product = self.family.by_field.get(field)
+            cached = on_disk.get(field)
             target = ingest.download_dir() / entry.local_name()
             resumable = download.resume_state(target)
             state = (cached.name if cached else
                      f'partial, {human(resumable)} done' if resumable else '')
+            # Which maps give the viewer a Level control to step through, said in the list
+            # rather than discovered after a 262 MB download.
+            depth = (f'{len(products.PRESSURE_LEVELS)} pressure levels'
+                     if entry.levels else 'surface')
             item = QtWidgets.QTreeWidgetItem(
-                [product.label if product else field, field, human(entry.size), state])
+                [product.label if product else field, field, depth,
+                 human(entry.size), state])
             item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(0, QtCore.Qt.CheckState.Unchecked)
             item.setData(0, QtCore.Qt.ItemDataRole.UserRole, entry)
             if product and product.note:
                 item.setToolTip(0, product.note)
             if cached:
-                item.setForeground(3, QtGui.QBrush(QtGui.QColor('#2a7a2a')))
+                item.setForeground(4, QtGui.QBrush(QtGui.QColor('#2a7a2a')))
             self.field_list.addTopLevelItem(item)
-        for column in (1, 2, 3):
+        for column in (1, 2, 3, 4):
             self.field_list.resizeColumnToContents(column)
         self.field_list.blockSignals(False)
         self._refresh_footer()
@@ -278,10 +326,10 @@ class DownloadDialog(QtWidgets.QDialog):
                 for i in range(self.field_list.topLevelItemCount())]
 
     def _select_dew_point(self):
-        self._select_fields(download.DEW_POINT_FIELDS)
+        self._select_fields(download.dew_point_fields(self.family))
 
     def _select_wind(self):
-        self._select_fields(download.WIND_FIELDS)
+        self._select_fields(download.wind_fields(self.family))
 
     def _select_fields(self, fields):
         for item in self._items():

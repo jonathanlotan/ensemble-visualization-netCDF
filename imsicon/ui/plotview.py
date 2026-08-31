@@ -1,4 +1,12 @@
-"""PlotView - the right panel: every ensemble member through time, hover-reactive (F4)."""
+"""PlotView - the right panel: every member (or level) through time, hover-reactive (F4).
+
+On an ensemble file the 20 curves are the 20 members of one forecast, and the thick mean
+and the min-max envelope over them are the point of the panel. On a pressure-level file
+the same 20 curves are the 20 levels of the column -- a time-height section of one point,
+which is worth reading -- but the mean and the envelope are NOT drawn, because a mean of
+1000 hPa and 150 hPa is not a temperature anyone forecasts (see `levels.py`). The selected
+level's curve is drawn heavier instead, so the up/down keys show as movement in the graph.
+"""
 import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore
@@ -15,7 +23,9 @@ class PlotView(pg.PlotWidget):
         self.ds = None
         self.series = None
         self._curves = []
+        self._pens = []
         self._n_times = 0
+        self._highlight = None          # index of the curve drawn heavier, or None
 
         self.showGrid(x=True, y=True, alpha=0.2)
         self.setLabel('bottom', 'forecast hour')
@@ -52,17 +62,47 @@ class PlotView(pg.PlotWidget):
         self._n_times = ds.n_times
         for curve in self._curves:
             self.removeItem(curve)
-        self._curves = []
+        self._curves, self._pens = [], []
+        self._highlight = None
         for m in range(ds.n_members):
-            pen = pg.mkPen(pg.intColor(m, hues=ds.n_members, alpha=190), width=1.1)
+            pen = pg.mkPen(pg.intColor(m, hues=max(2, ds.n_members), alpha=190), width=1.1)
             curve = pg.PlotDataItem(pen=pen, name=ds.member_labels[m],
                                     connect='finite')
             self.addItem(curve)
             self._curves.append(curve)
+            self._pens.append(pen)
+        # The mean and the envelope are statistics ACROSS the second axis, so they are
+        # drawn only where that axis is an ensemble. Hidden rather than emptied: the items
+        # keep their z-order and their brushes for the next file that does have members.
+        across = ds.axis.aggregatable
+        self.mean_curve.setVisible(across)
+        self.envelope.setVisible(across)
         self.getAxis('left').enableAutoSIPrefix(False)   # J kg-1, never 'kJ kg-1'
         self.setLabel('left', ds.display_name, units=ds.units or None)
         self.setLabel('bottom', f'forecast hour from {ds.run_init:%Y-%m-%d %H:%M}Z run')
         self.setXRange(float(ds.forecast_hours[0]), float(ds.forecast_hours[-1]), padding=0.01)
+
+    def set_level(self, index):
+        """Draw one curve heavier -- the level (or member) the map is showing.
+
+        Only for an axis with no mean of its own: on an ensemble the thick black line is
+        already the mean, and a second thick line would compete with it.
+        """
+        if self.ds is None or self.ds.axis.aggregatable:
+            return
+        index = int(index) if self.ds.n_members > 1 else 0
+        if index == self._highlight:
+            return
+        self._highlight = index
+        for m, (curve, pen) in enumerate(zip(self._curves, self._pens)):
+            if m == index:
+                colour = pg.mkColor(pen.color())
+                colour.setAlpha(255)
+                curve.setPen(pg.mkPen(colour, width=2.8))
+                curve.setZValue(9)
+            else:
+                curve.setPen(pen)
+                curve.setZValue(0)
 
     def set_series(self, series):
         """series: (n_times, n_members) for the selected grid point."""

@@ -27,6 +27,8 @@ from typing import NamedTuple
 
 import numpy as np
 
+from . import products
+
 
 # ---- the interval policy ---------------------------------------------------------------
 class Interval(NamedTuple):
@@ -67,6 +69,14 @@ STEPS = {
     'T_2M': _TEMPERATURE,
     'T_S': _TEMPERATURE,
     'TD_2M': _TEMPERATURE,
+    # The deterministic run's temperatures, keyed the same canonical way (`field_key`):
+    # `temp` on pressure levels, the 2 m temperature and dew point, the grid-mean surface
+    # temperature, and the daily extremes. An 850 hPa chart is read at 1 degC exactly as a
+    # 2 m one is, so they share the interval rather than getting a second table.
+    'TEMP': _TEMPERATURE,
+    'T_G': _TEMPERATURE,
+    'TMAX_2M': _TEMPERATURE,
+    'TMIN_2M': _TEMPERATURE,
 }
 
 # A DIFFERENCE of two contoured fields -- the dew point depression above all, but equally
@@ -85,8 +95,12 @@ MAX_LINES = 60
 
 
 def interval_for(field):
-    """-> `Interval` in canonical units for a field name, or None if it is not contoured."""
-    return STEPS.get(field)
+    """-> `Interval` in canonical units for a field name, or None if it is not contoured.
+
+    Keyed on `products.field_key`, so the two families' spellings of one quantity
+    (`T_2M` and `t_2m`) are contoured identically rather than one of them not at all.
+    """
+    return STEPS.get(products.field_key(field))
 
 
 def levels_for(lo, hi, step, anchor=0.0, cap=None):

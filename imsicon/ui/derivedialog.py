@@ -8,11 +8,13 @@ from pathlib import Path
 
 from PySide6 import QtCore, QtWidgets
 
-from .. import derived, download, ingest
+from .. import derived, download, ingest, products
 
 # Presentation order for the A/B combos: the download catalogue's order, so CAPE and
 # precipitation lead rather than whatever sorts first alphabetically, with the derived
-# dew point slotted in beside the temperatures it belongs with.
+# dew point slotted in beside the temperatures it belongs with. Both families are in the
+# list -- their field names do not overlap, and one dialog is only ever showing one of
+# them -- so a deterministic run's fields sort by its catalogue rather than alphabetically.
 FIELD_ORDER = []
 for _product in download.PRODUCTS:
     FIELD_ORDER.append(_product.field)
@@ -20,18 +22,20 @@ for _product in download.PRODUCTS:
         FIELD_ORDER.append(derived.DEW_POINT_FIELD)
     if _product.field == 'V_10M':
         FIELD_ORDER.append(derived.WIND_FIELD)
+FIELD_ORDER += [_product.field for _product in products.ICON.products]
 
 
 def field_sort_key(field):
     return (FIELD_ORDER.index(field) if field in FIELD_ORDER else len(FIELD_ORDER), field)
 
 
-WIND_FIELDS = {role: field for role, (field, _units) in derived.WIND_INPUTS.items()}
-
 DEW_POINT = 'dewpoint'
 DEPRESSION = 'depression'
 DIFFERENCE = 'difference'
 WIND = 'wind'
+# The same view from the 3-D components: one kind per ENTRY, because "Map shows" keys its
+# list on the kind and a run can offer both a 10 m wind map and one on pressure levels.
+WIND_UPPER = 'wind-upper'
 
 
 class DerivedRequest:
@@ -49,14 +53,23 @@ class DerivedRequest:
 class DerivedDialog(QtWidgets.QDialog):
     """Pick a dew point / depression / wind map / A-B difference from the files on disk."""
 
-    def __init__(self, parent=None, near=None, run=None, roots=None):
+    def __init__(self, parent=None, near=None, run=None, roots=None, family=None):
         super().__init__(parent)
         self.setWindowTitle('Derived field')
         self.setMinimumWidth(560)
+        # One family at a time. The ensemble and the deterministic run publish the same
+        # run id with different contents, and `derived.check_pairable` refuses to combine
+        # them, so offering both here would only be offering a refusal.
+        self.family = family or products.ENSEMBLE
         # `roots` lets the window hand over everywhere it has looked, so this dialog and
         # the "Map shows" combo never disagree about which files exist.
-        self.available = ingest.scan_for_fields(roots if roots is not None
-                                                else ingest.search_roots(near))
+        scanned = ingest.scan_for_fields(roots if roots is not None
+                                         else ingest.search_roots(near))
+        self.available = {(found_run, field): path
+                          for (found_family, found_run, field), path in scanned.items()
+                          if found_family == self.family.key}
+        self.roles = {role: self.family.roles.get(role)
+                      for role in ('temperature', 'humidity', 'zonal', 'meridional')}
         self.run = run or self._default_run()
 
         layout = QtWidgets.QVBoxLayout(self)
@@ -111,10 +124,12 @@ class DerivedDialog(QtWidgets.QDialog):
     def _build_dewpoint_box(self):
         box = QtWidgets.QGroupBox('From temperature and humidity')
         form = QtWidgets.QVBoxLayout(box)
+        temperature = self.roles['temperature'] or 'T_2M'
         self.dewpoint_radio = QtWidgets.QRadioButton(
             'Dew point (TD_2M) - the temperature the air must cool to for saturation')
         self.depression_radio = QtWidgets.QRadioButton(
-            'Dew point depression (T_2M - TD_2M) - how far the air is from saturation')
+            f'Dew point depression ({temperature} - TD_2M) - how far the air is from '
+            'saturation')
         self.kind_group.addButton(self.dewpoint_radio, 0)
         self.kind_group.addButton(self.depression_radio, 1)
         self.dewpoint_radio.setChecked(True)
@@ -129,8 +144,11 @@ class DerivedDialog(QtWidgets.QDialog):
     def _build_wind_box(self):
         box = QtWidgets.QGroupBox('From the wind components')
         form = QtWidgets.QVBoxLayout(box)
+        zonal = self.roles['zonal'] or 'U_10M'
+        meridional = self.roles['meridional'] or 'V_10M'
         self.wind_radio = QtWidgets.QRadioButton(
-            'Wind map (U_10M + V_10M) - wind speed, with wind barbs for the direction')
+            f'Wind map ({zonal} + {meridional}) - wind speed, with wind barbs for the '
+            'direction')
         self.kind_group.addButton(self.wind_radio, 3)
         form.addWidget(self.wind_radio)
         note = QtWidgets.QLabel(
@@ -203,19 +221,29 @@ class DerivedDialog(QtWidgets.QDialog):
                     return
         self.b_combo.setCurrentIndex(1)
 
-    def _dew_point_inputs(self):
-        """The two paths the dew point needs, or None with a reason."""
-        missing = [field for field in ('T_2M', 'RELHUM_2M')
-                   if (self.run, field) not in self.available]
+    def _role_inputs(self, roles):
+        """The paths for a list of roles in this family, or None with a reason."""
+        fields = [self.roles.get(role) for role in roles]
+        if not all(fields):
+            return None, (f'The {self.family.short} product has no '
+                          f'{" and ".join(role for role in roles)} field to build this '
+                          'from.')
+        missing = [field for field in fields if (self.run, field) not in self.available]
         if missing:
             return None, (f'{" and ".join(missing)} for run {self.run} is not on disk. '
                           'Download it first (Download from IMS...), then come back.')
-        return ([self.available[(self.run, 'T_2M')],
-                 self.available[(self.run, 'RELHUM_2M')]], None)
+        return [self.available[(self.run, field)] for field in fields], None
+
+    def _dew_point_inputs(self):
+        """The two paths the dew point needs, or None with a reason."""
+        return self._role_inputs(['temperature', 'humidity'])
 
     def _wind_inputs(self):
         """The two paths the wind map needs, or None with a reason."""
-        fields = [WIND_FIELDS[role] for role in ('zonal', 'meridional')]
+        fields = [self.roles.get(role) for role in ('zonal', 'meridional')]
+        if not all(fields):
+            return None, (f'The {self.family.short} product has no wind components to '
+                          'build a wind map from.')
         missing = [field for field in fields if (self.run, field) not in self.available]
         if missing:
             return None, (f'{" and ".join(missing)} for run {self.run} is not on disk. '
@@ -229,17 +257,18 @@ class DerivedDialog(QtWidgets.QDialog):
         if kind in (DEW_POINT, DEPRESSION):
             paths, problem = self._dew_point_inputs()
             self.inputs_label.setText(
-                'Needs T_2M and RELHUM_2M from this run' if problem else
+                f'Needs {self.roles["temperature"]} and {self.roles["humidity"]} from '
+                'this run' if problem else
                 'Using ' + ' + '.join(p.name for p in paths))
         elif kind == WIND:
             paths, problem = self._wind_inputs()
             self.wind_inputs_label.setText(
-                'Needs U_10M and V_10M from this run' if problem else
-                'Using ' + ' + '.join(p.name for p in paths))
+                f'Needs {self.roles["zonal"]} and {self.roles["meridional"]} from this run'
+                if problem else 'Using ' + ' + '.join(p.name for p in paths))
         else:
             a, b = self.a_combo.currentData(), self.b_combo.currentData()
             if not a or not b:
-                problem = f'No ICON ensemble files found for run {self.run}.'
+                problem = (f'No {self.family.title} files found for run {self.run}.')
             elif a == b:
                 problem = 'A and B are the same field, so the difference is zero everywhere.'
             elif not derived.units_look_compatible(a, b):
@@ -261,12 +290,13 @@ class DerivedDialog(QtWidgets.QDialog):
             if problem:
                 return None
             title = ('Dew point TD_2M' if kind == DEW_POINT
-                     else 'Dew point depression T_2M - TD_2M')
+                     else f'Dew point depression {self.roles["temperature"]} - TD_2M')
             return DerivedRequest(kind, paths, title)
         if kind == WIND:
             paths, problem = self._wind_inputs()
             return None if problem else DerivedRequest(
-                kind, paths, 'Wind U_10M + V_10M')
+                kind, paths,
+                f'Wind {self.roles["zonal"]} + {self.roles["meridional"]}')
         a, b = self.a_combo.currentData(), self.b_combo.currentData()
         if not a or not b or a == b or not derived.units_look_compatible(a, b):
             return None
@@ -292,7 +322,7 @@ def build(request, opened=None):
         view = derived.dew_point(*views)
     elif request.kind == DEPRESSION:
         view = derived.dew_point_depression(*views)
-    elif request.kind == WIND:
+    elif request.kind in (WIND, WIND_UPPER):
         view = derived.wind(*views)
     else:
         view = derived.difference(*views)

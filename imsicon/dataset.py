@@ -1,26 +1,38 @@
-"""EnsembleFile - the domain model over one IMS ICON ensemble file.
+"""EnsembleFile - the domain model over one IMS ICON file.
 
-Wraps the strided memmap from nc3 with coordinates, valid times, member labels and the
-ensemble aggregations the UI needs. Every accessor is a numpy slice: see CLAUDE.md 0.4.
+Wraps the strided memmap from nc3 with coordinates, valid times, the second axis' labels
+and the aggregations the UI needs. Every accessor is a numpy slice: see CLAUDE.md 0.4.
+
+The class keeps its name because the ensemble is what it was written for and what its
+tests pin, but the second axis is no longer assumed to be ensemble members: `self.axis`
+(a `levels.LevelAxis`) says whether it is 20 members, 20 pressure levels, or the single
+notional level of a deterministic surface field. `n_members` and `member_labels` are that
+axis' length and labels whichever it is, so every reader of them keeps working.
 """
 import datetime as dt
 import json
 import numpy as np
 from pathlib import Path
 
-from . import nc3, transform
+from . import levels, nc3, products, transform
 from .transform import AGGREGATIONS      # noqa: F401  (re-exported: v1 import site)
 
 
 class EnsembleFile:
-    """One `ICON_ENS_<run>_<FIELD>.nc` file, read lazily."""
+    """One `ICON_ENS_<run>_<FIELD>.nc` or `IE_<run>_<field>.nc` file, read lazily."""
 
     def __init__(self, path):
         self.path = Path(path)
         self.hdr = nc3.parse(self.path)
         self.field_var = nc3.field_name(self.hdr)
-        self._data = nc3.view(self.path, self.hdr, self.field_var)
-        self.n_times, self.n_members, self.ny, self.nx = self._data.shape
+        data = nc3.view(self.path, self.hdr, self.field_var)
+        if data.ndim == 3:
+            # A deterministic surface field is (time, lat, lon): no second axis at all.
+            # One is inserted rather than special-cased downstream, so `frame`, `series`
+            # and every aggregation keep the shapes the rest of the app is written for.
+            data = data[:, None]
+        self._data = data
+        self.n_times, n_axis, self.ny, self.nx = self._data.shape
 
         self.lat = np.asarray(nc3.view(self.path, self.hdr, 'lat'), dtype=float)
         self.lon = np.asarray(nc3.view(self.path, self.hdr, 'lon'), dtype=float)
@@ -30,7 +42,15 @@ class EnsembleFile:
         attrs = self.hdr['vars'][self.field_var]['attrs']
         self.units = str(attrs.get('units', '')).strip()
         self.long_name = str(attrs.get('long_name', self.field_var)).strip()
-        self.field = self.field_var[:-4] if self.field_var.endswith('_eps') else self.field_var
+        # The file name is the better source of the field: it is what the server, the
+        # catalogue and the "Map shows" list all agree on, and a deterministic file's
+        # variable can be spelled differently from its product name. The variable name is
+        # the fallback for anything not named like an IMS product.
+        parsed = products.parse_name(self.path.name)
+        self.family = parsed[0] if parsed else None
+        self.field = (parsed[2] if parsed else
+                      (self.field_var[:-4] if self.field_var.endswith('_eps')
+                       else self.field_var))
 
         raw_time = np.asarray(nc3.view(self.path, self.hdr, 'time'), dtype=float)
         epoch, scale = nc3.parse_time_units(self.hdr['vars']['time']['attrs'].get('units'))
@@ -39,14 +59,22 @@ class EnsembleFile:
         self.forecast_hours = np.array(
             [(t - epoch).total_seconds() / 3600.0 for t in self.times])
 
-        self.member_labels = nc3.member_labels(self.hdr['attrs'].get('history'),
-                                               self.n_members)
+        # What the second axis IS -- members, pressure levels, or nothing to choose --
+        # decided from the file, with the manual's ladder only as a last resort.
+        dim, coord, coord_attrs = nc3.level_coordinate(self.path, self.hdr, self.field_var)
+        self.axis = levels.axis_for(
+            n_axis, dim=dim, coord=coord, units=coord_attrs.get('units'),
+            attrs=coord_attrs, field=self.field, family=self.family,
+            history=self.hdr['attrs'].get('history'))
+        self.n_members = self.axis.n
+        self.member_labels = list(self.axis.labels)
         # G26: the file may hold fewer records than its header declares (interrupted
         # download). It opens and reads correctly, but the user has to be told they are
         # looking at part of a forecast.
         self.truncated = bool(self.hdr.get('truncated'))
         self.declared_times = int(self.hdr.get('declared_numrecs', self.n_times))
         self._ranges = {}
+        self._level_ranges = {}
 
     # ---- reads -----------------------------------------------------------------
     def frame(self, t, member):
@@ -89,6 +117,10 @@ class EnsembleFile:
         return (self.lon[0] - self.dlon / 2, self.lon[-1] + self.dlon / 2,
                 self.lat[0] - self.dlat / 2, self.lat[-1] + self.dlat / 2)
 
+    def level_label(self, index):
+        """`850 hPa` / `member 03` -- what one position on the second axis is called."""
+        return self.axis.label(index)
+
     def label_for(self, t):
         """'2026-08-27 14:00Z  (+110 h)' - the F4 time readout."""
         return (f'{self.times[t]:%Y-%m-%d %H:%M}Z  '
@@ -129,12 +161,32 @@ class EnsembleFile:
         if not isinstance(entry, dict) or 'min' not in entry or 'max' not in entry:
             return None
         self._ranges[signature] = (entry['min'], entry['max'])
+        per_level = entry.get('levels')
+        if isinstance(per_level, list):
+            self._level_ranges[signature] = [tuple(pair) for pair in per_level]
         return self._ranges[signature]
 
-    def _store_range(self, signature, lo, hi):
+    def level_range(self, index, signature='raw'):
+        """Cached (min, max) for ONE position on the second axis, or None.
+
+        A column of pressure levels spans the whole troposphere -- 60 degC between 1000
+        and 150 hPa on the test file -- so colouring one level against the whole file's
+        range paints every map a single flat shade. Each level therefore carries its own
+        range, measured in the same pass, and the map uses it: fixed while time is
+        scrubbed, which is R1's rule, but fixed to something that has contrast in it.
+        """
+        per_level = self._level_ranges.get(signature)
+        if not per_level or not (0 <= int(index) < len(per_level)):
+            return None
+        return per_level[int(index)]
+
+    def _store_range(self, signature, lo, hi, per_level=None):
         """Merge one signature into the sidecar, leaving the others intact."""
         ranges = self._load_ranges()
-        ranges[signature] = {'min': lo, 'max': hi}
+        entry = {'min': lo, 'max': hi}
+        if per_level:
+            entry['levels'] = [list(pair) for pair in per_level]
+        ranges[signature] = entry
         try:
             self.stats_path.write_text(json.dumps(
                 {'schema': 2, 'key': self._cache_key(), 'ranges': ranges}))
@@ -149,21 +201,37 @@ class EnsembleFile:
         """
         source = frame_source if frame_source is not None else self.ens_frame
         lo, hi = np.inf, -np.inf
+        # Per position on the second axis, from the same pass: one level of a column has
+        # its own range, and a second scan to find it would be a second 0.6 s.
+        low = np.full(self.n_members, np.inf)
+        high = np.full(self.n_members, -np.inf)
         for t in range(self.n_times):
             if cancel is not None and cancel():
                 return None
-            block = source(t)
+            block = np.asarray(source(t))
             if np.isfinite(block).any():
                 lo = min(lo, float(np.nanmin(block)))
                 hi = max(hi, float(np.nanmax(block)))
+                if block.ndim == 3 and block.shape[0] == self.n_members:
+                    with np.errstate(invalid='ignore'):
+                        finite = np.isfinite(block).any(axis=(1, 2))
+                        low = np.where(finite, np.fmin(low, np.nanmin(block, axis=(1, 2))),
+                                       low)
+                        high = np.where(finite, np.fmax(high, np.nanmax(block, axis=(1, 2))),
+                                        high)
             if progress is not None:
                 progress(t + 1, self.n_times)
         if not np.isfinite(lo):
             lo, hi = 0.0, 1.0
         if hi <= lo:
             hi = lo + 1.0
+        per_level = [(float(a), float(b) if b > a else float(a) + 1.0)
+                     for a, b in zip(low, high) if np.isfinite(a) and np.isfinite(b)]
+        per_level = per_level if len(per_level) == self.n_members else None
         self._ranges[signature] = (lo, hi)
-        self._store_range(signature, lo, hi)
+        if per_level:
+            self._level_ranges[signature] = per_level
+        self._store_range(signature, lo, hi, per_level)
         return self._ranges[signature]
 
     def range_for(self, signature='raw'):
@@ -173,6 +241,11 @@ class EnsembleFile:
     @property
     def value_range(self):
         return self._ranges.get('raw')
+
+    @property
+    def axis_note(self):
+        """A warning about how the second axis was identified, or None (`levels`)."""
+        return self.axis.note
 
     @property
     def truncation_note(self):
@@ -187,12 +260,17 @@ class EnsembleFile:
         short = (f' | INCOMPLETE: {self.n_times}/{self.declared_times} steps'
                  if self.truncated else '')
         return (f'{self.path.name} | {self.field} ({self.long_name}) [{self.units}] | '
-                f'run {self.run_init:%Y-%m-%d %H:%M}Z | {self.n_members} members | '
+                f'run {self.run_init:%Y-%m-%d %H:%M}Z | {self.axis.describe()} | '
                 f'{self.n_times} steps{short} | {self.ny}x{self.nx} grid')
 
 
 def member_stats(values):
-    """The six F4 numbers for one time step's member values."""
+    """The six F4 numbers for one time step's member values.
+
+    Only meaningful across an ENSEMBLE: see `levels.LevelAxis.aggregatable`. A column of
+    pressure levels gets `level_stats` instead, which reports where a value came from
+    rather than pretending the column is a sample of one quantity.
+    """
     values = np.asarray(values, dtype=np.float64)
     good = values[np.isfinite(values)]
     if good.size == 0:
@@ -200,3 +278,28 @@ def member_stats(values):
     p10, p90 = np.percentile(good, [10, 90])
     return dict(mean=float(good.mean()), max=float(good.max()), min=float(good.min()),
                 p90=float(p90), p10=float(p10), n=int(good.size))
+
+
+def level_stats(values, labels=None, index=0):
+    """The readout for a PRESSURE axis: the chosen level's value, and the column's ends.
+
+    Deliberately not `member_stats`: a mean or a P90 across 1000..150 hPa is not a
+    quantity anyone forecasts, and printing one would read as an ensemble statistic on a
+    file that has no ensemble (the `levels` module docstring, and G16's family of
+    "plausible but meaningless"). What is meaningful about a column is where in it a
+    value sits, so the extremes are reported WITH the level they occur at.
+    """
+    values = np.asarray(values, dtype=np.float64)
+    labels = list(labels) if labels is not None else [str(i) for i in range(values.size)]
+    index = int(np.clip(index, 0, max(0, values.size - 1)))
+    good = np.isfinite(values)
+    out = dict(value=float(values[index]) if values.size and good[index] else np.nan,
+               level=labels[index] if labels else '',
+               n=int(np.count_nonzero(good)))
+    if not good.any():
+        return dict(out, max=np.nan, min=np.nan, max_level='', min_level='')
+    order = np.where(good, values, -np.inf)
+    top = int(order.argmax())
+    bottom = int(np.where(good, values, np.inf).argmin())
+    return dict(out, max=float(values[top]), min=float(values[bottom]),
+                max_level=labels[top], min_level=labels[bottom])

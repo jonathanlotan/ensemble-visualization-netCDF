@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 import synth
-from imsicon import transform
+from imsicon import transform, products
 from imsicon.dataset import EnsembleFile
 from imsicon.fieldview import FieldView
 
@@ -156,9 +156,12 @@ def test_instantaneous_fields_are_refused_a_rate(tmp_path):
     assert not view.can_rate and view.set_rate(3) is False
 
 
-def test_only_the_three_documented_fields_accumulate():
-    assert transform.ACCUMULATION == {'TOT_PREC': 'sum', 'ASWDIFD_S': 'mean',
-                                      'ASWDIR_S': 'mean'}
+def test_only_the_three_documented_ensemble_fields_accumulate():
+    """Scoped to the ensemble catalogue: v7 added the deterministic run's own accumulated
+    fields (tests/test_pressure_levels.py), and this test is about the 15 measured ones."""
+    ensemble = {field: kind for field, kind in transform.ACCUMULATION.items()
+                if field in products.ENSEMBLE.by_field}
+    assert ensemble == {'TOT_PREC': 'sum', 'ASWDIFD_S': 'mean', 'ASWDIR_S': 'mean'}
     assert 'VMAX_10M' not in transform.ACCUMULATION
 
 
