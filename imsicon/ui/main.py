@@ -261,6 +261,13 @@ class MainWindow(QtWidgets.QMainWindow):
         # Every file-backed view this window has opened, so building a derived field on
         # the field already on screen does not map another 407 MB of the same bytes.
         self.opened = {}
+        # R8: the run's wind, held beside whatever is on screen, so barbs can be drawn
+        # over ANY map. `_overlay_key` is the shape it was built to sit on -- run, axis,
+        # grid and number of steps -- so switching between two fields of one run keeps it
+        # while it fits, and drops it when it does not (`_overlay_shape`).
+        self.wind_overlay = None
+        self._overlay_key = None
+        self._overlay_builder = None
 
         self._build_ui()
         self._pending = path
@@ -463,7 +470,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.barbs_check.setChecked(True)
         self.barbs_check.setEnabled(False)
         self.barbs_check.setToolTip(BARB_TOOLTIP)
-        self.barbs_check.toggled.connect(lambda _: self.refresh_map())
+        self.barbs_check.toggled.connect(self._on_barbs_toggled)
         row2.addWidget(self.barbs_check)
 
         # R5. Isolines are on by default where a field has them -- they are what makes a
@@ -625,6 +632,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._show_standing_note()
 
         self.save_action.setEnabled(True)
+        # An overlay built for another shape -- another run, another axis, another grid --
+        # cannot be drawn over this one, so it is dropped rather than silently reused.
+        if self._overlay_key is not None and self._overlay_key != self._overlay_shape():
+            self.wind_overlay = None
+            self._overlay_key = None
         self._sync_barbs_check()
         self._sync_isolines_check()
         self._sync_sort_check()
@@ -952,6 +964,18 @@ class MainWindow(QtWidgets.QMainWindow):
             self._apply_range(self.ds.value_range)
 
     def _apply_range(self, value_range):
+        """G46: the range can be None by the time it arrives, and unpacking None crashes.
+
+        `_on_scan_done` re-reads the range from the VIEW rather than trusting the value
+        the worker carried, because a scan is per transform signature (G19) -- and if the
+        signature moved on while the scan was running (the Rate combo, mostly), the view
+        has no range for the new one yet and answers None. Seen for real when `--rate 3h`
+        and `--barbs on` were given together: opening the wind held the event loop long
+        enough for the two to cross. Doing nothing is right -- `_ensure_range` has already
+        started the scan for the signature that is now on screen.
+        """
+        if value_range is None:
+            return
         lo, hi = value_range
         self.readout.span = hi - lo
         self.plot.set_yrange(min(0.0, lo) if lo >= 0 else lo, hi)   # A1: pinned to dataset max
@@ -1085,15 +1109,16 @@ class MainWindow(QtWidgets.QMainWindow):
         under them are the mean *speed*, and `spread` has no direction at all, so the map
         has to say which of those the feathers are counting.
         """
-        vectors = getattr(self.ds, 'wind_vectors', None)
-        if vectors is None or not self.barbs_check.isChecked():
+        source, overlay = self.wind_source()
+        if source is None or not self.barbs_check.isChecked():
             self.map.set_wind(None)
             return ''
-        # `t` and `member` are read when the map asks, not captured now, so a wheel zoom
-        # between two redraws still draws the step that is on screen.
+        vectors = source.wind_vectors
+        # `t` and the axis position are read when the map asks, not captured now, so a
+        # wheel zoom between two redraws still draws the step that is on screen.
         self.map.set_wind(lambda rows, cols: vectors(self.t, mode, self.level,
                                                      rows, cols))
-        return self.ds.barb_label(mode)
+        return source.barb_label(mode, over=self.ds.display_name if overlay else None)
 
     def _sync_isolines_check(self):
         """Disabled, not hidden -- the same rule Rate and Wind barbs follow."""
@@ -1132,13 +1157,154 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_sort_toggled(self, _on):
         self.refresh_map()
 
+    # ---- R8: the wind, over any map ------------------------------------------------
+    def _overlay_shape(self):
+        """What an overlay has to fit: the run, the axis, the grid AND the time axis.
+
+        Compared rather than rebuilt on every field change, so flipping between two maps
+        of one run keeps the barbs that are already open. `check_pairable` still has the
+        last word when the view is built.
+
+        `n_times` is in the key for a reason found on real data (**G45**): the run's `temp`
+        and its `u`/`v` can hold DIFFERENT numbers of steps -- an interrupted download
+        stops each file at its own point (G26) -- and barbs from a 5-step wind over a
+        7-step map index past the end of the wind the moment the slider passes step 5.
+        """
+        if self.ds is None:
+            return None
+        return (f'{self.ds.run_init:%Y%m%d%H}', self.ds.axis.kind, self.ds.n_members,
+                self.ds.n_times, self.ds.ny, self.ds.nx)
+
+    def _overlay_request(self):
+        """A `DerivedRequest` for the wind that fits what is on screen, or None.
+
+        The pair is chosen by SHAPE (`derived.wind_pair_for`): over an 850 hPa temperature
+        the barbs must be the wind at 850 hPa, which is the run's 3-D `u`/`v`, while over
+        a surface or ensemble map they must be the 10 m pair. Anything else would draw a
+        wind from the wrong place and look entirely normal.
+        """
+        if self.base_ds is None or self.ds is None:
+            return None
+        family = self.base_ds.family or products.ENSEMBLE
+        run = f'{self.base_ds.run_init:%Y%m%d%H}'
+        on_disk = ingest.fields_of_run(ingest.scan_for_fields(self._search_roots()),
+                                       family, run)
+        pair = derived.wind_pair_for(family, on_disk,
+                                     levels=self.ds.axis.is_pressure)
+        if pair is None:
+            return None
+        label = f'Wind barbs from {pair[0]} + {pair[1]}'
+        return derivedialog.DerivedRequest(derivedialog.WIND,
+                                           [on_disk[field] for field in pair], label)
+
+    def wind_source(self):
+        """The view whose vectors the barbs should use: the map's own, or the overlay.
+
+        The overlay is only offered while it still fits the map on screen -- same run,
+        axis, grid and number of steps -- so nothing downstream has to defend against
+        being handed a wind from a different forecast.
+        """
+        if getattr(self.ds, 'wind_vectors', None) is not None:
+            return self.ds, False
+        if self.wind_overlay is not None and self._overlay_key == self._overlay_shape():
+            return self.wind_overlay, True
+        return None, False
+
     def _sync_barbs_check(self):
-        has_wind = getattr(self.ds, 'wind_vectors', None) is not None
-        self.barbs_check.setEnabled(has_wind)
+        """Enabled whenever barbs are POSSIBLE -- on the wind map, and over any other map
+        of a run whose wind components are on disk."""
+        own = getattr(self.ds, 'wind_vectors', None) is not None
+        request = None if own else self._overlay_request()
+        self.barbs_check.setEnabled(own or request is not None)
+        if own:
+            tooltip = BARB_TOOLTIP
+        elif request is not None:
+            fields = ' and '.join(path.name for path in request.paths)
+            tooltip = (f'Draw the run\'s wind over the {self.ds.display_name} map.\n\n'
+                       f'{BARB_TOOLTIP}\n\nThe barbs come from {fields}, so the colours '
+                       'and the feathers are two different quantities -- the map title '
+                       'says which wind they are.')
+        else:
+            tooltip = (f'{self.ds.display_name} has no direction to draw, and the wind '
+                       'components of this run are not on disk. Download them '
+                       '(Download... -> Select what the wind map needs) and they can be '
+                       'drawn over any map.')
+        self.barbs_check.setToolTip(tooltip)
+        # The tick reflects what is actually DRAWN, so there is never a ticked box with no
+        # barbs under it. A wind map is barbs by definition and comes up ticked (R4); an
+        # overlay over someone else's map is opt-in, because building it opens two more
+        # files -- so a plain field comes up unticked even where the wind is available,
+        # and stays ticked once an overlay exists and still fits.
+        source, _overlay = self.wind_source()
+        self.barbs_check.blockSignals(True)
+        self.barbs_check.setChecked(own or source is not None)
+        self.barbs_check.blockSignals(False)
+
+    def _on_barbs_toggled(self, on):
+        """Ticking Wind barbs over a non-wind map opens the run's wind first."""
+        source, _overlay = self.wind_source()
+        if on and source is None and self._overlay_request() is not None:
+            self._start_overlay()
+            return
+        self.refresh_map()
+
+    def _start_overlay(self):
+        """Open the wind pair off the UI thread: it can mean decompressing 2 x 262 MB."""
+        request = self._overlay_request()
+        if request is None or (self._overlay_builder is not None
+                               and self._overlay_builder.isRunning()):
+            return
+        self.status_right.setText('opening the wind for the barbs...')
+        self._overlay_builder = derivedialog.BuildWorker(request, dict(self.opened), self)
+        self._overlay_builder.finished_view.connect(self._on_overlay_built)
+        self._overlay_builder.failed.connect(self._on_overlay_failed)
+        self._overlay_builder.start()
+
+    def _on_overlay_built(self, view):
+        """Accept the wind only if it actually fits the map it is going over.
+
+        The two components pair with each OTHER inside `derived.wind`; that says nothing
+        about whether they pair with the field on screen. Grid, run, time axis and level
+        ladder all have to agree, or the barbs would be drawn from another forecast --
+        and, when the wind is the shorter file, would run off the end of it (**G45**).
+        """
+        self._show_standing_note()
+        if view is None:
+            return
+        try:
+            derived.check_pairable(self.ds, view)
+        except derived.PairError as exc:
+            self._refuse_overlay(str(exc))
+            return
+        self.wind_overlay = view
+        self._overlay_key = self._overlay_shape()
+        self.refresh_map()
+
+    def _refuse_overlay(self, message):
+        """Say why the barbs cannot go over this map, and put the tick back.
+
+        A status note rather than a modal: the barbs are a secondary thing the user asked
+        for on top of a map that is fine, so this must not interrupt reading it.
+        """
+        self.wind_overlay = None
+        self._overlay_key = None
+        self.barbs_check.blockSignals(True)
+        self.barbs_check.setChecked(False)
+        self.barbs_check.blockSignals(False)
         self.barbs_check.setToolTip(
-            BARB_TOOLTIP if has_wind else
-            f'{self.ds.display_name} has no direction to draw. Open the wind map '
-            '(U_10M and V_10M of this run) under "Map shows" for barbs.')
+            f'The wind of this run cannot be drawn over {self.ds.display_name}:\n\n'
+            f'{message}')
+        self.status_right.setText('\u26a0 no barbs over this map')
+        self.status_right.setToolTip(message)
+        self.refresh_map()
+
+    def _on_overlay_failed(self, message):
+        """A failed overlay unticks the box rather than leaving it on with no barbs."""
+        self._show_standing_note()
+        self.barbs_check.blockSignals(True)
+        self.barbs_check.setChecked(False)
+        self.barbs_check.blockSignals(False)
+        self._error(f'The wind barbs could not be drawn over this map:\n{message}')
 
     def set_time(self, t):
         if self.ds is None:
@@ -1405,7 +1571,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, ev):
         self._stop_scan()
-        for worker in (self.decompressor, self.builder, self.writer):
+        for worker in (self.decompressor, self.builder, self.writer,
+                       self._overlay_builder):
             if worker is not None and worker.isRunning():
                 worker.cancel()
                 worker.wait(3000)

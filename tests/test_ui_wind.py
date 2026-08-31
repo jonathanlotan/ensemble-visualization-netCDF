@@ -147,12 +147,17 @@ def test_the_map_says_which_wind_the_barbs_are(window, qapp):
     assert 'mean vector' in window.map.plot.titleLabel.text
 
 
-def test_the_barbs_control_is_disabled_for_a_field_with_no_direction(window, qapp):
-    """Disabled, not hidden -- the same rule the Rate control follows."""
-    assert not window.barbs_check.isEnabled()
-    assert 'no direction to draw' in window.barbs_check.toolTip()
-    choose(window, qapp, derivedialog.WIND)
+def test_the_barbs_control_offers_the_runs_wind_over_a_field_that_has_none(window, qapp):
+    """v8: over a plain field the control is live -- it draws the RUN's wind on top.
+
+    Enabled but unticked: the barbs are an addition the user asks for, because building
+    them opens two more files. On the wind map itself it is ticked, as it always was.
+    """
     assert window.barbs_check.isEnabled()
+    assert not window.barbs_check.isChecked()
+    assert 'U_10M' in window.barbs_check.toolTip()
+    choose(window, qapp, derivedialog.WIND)
+    assert window.barbs_check.isEnabled() and window.barbs_check.isChecked()
     assert 'half feather 5 kt' in window.barbs_check.toolTip()
 
 
@@ -264,12 +269,15 @@ def test_the_time_step_moves_the_barbs_with_the_map(window, qapp):
 
 
 def test_switching_back_to_a_plain_field_takes_the_barbs_down_with_it(window, qapp):
+    """The speed map's own barbs come down with it. The control stays live, because the
+    run's wind can be drawn over the U_10M map too (v8) -- but only when asked."""
     choose(window, qapp, derivedialog.WIND)
     assert window.map.barb_count > 0
     choose(window, qapp, 'base')
     assert window.ds.field == 'U_10M'
     assert window.map.barb_count == 0
-    assert not window.barbs_check.isEnabled()
+    assert not window.barbs_check.isChecked()
+    assert window.barbs_check.isEnabled()
 
 
 def test_a_wind_view_carries_its_kind_so_the_combo_names_what_is_on_screen(window, qapp):

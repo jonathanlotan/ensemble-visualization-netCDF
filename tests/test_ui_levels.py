@@ -336,7 +336,7 @@ def test_a_file_whose_levels_were_assumed_says_so_in_the_status_bar(qapp, tmp_pa
 def test_the_default_level_is_the_low_level_chart(qapp, tmp_path):
     synth.pressure_field(tmp_path / 'IE_2026083100_temp.nc',
                          levels=products.PRESSURE_LEVELS,
-                         values=np.zeros((4, 20, 4, 5)))
+                         values=np.zeros((4, len(products.PRESSURE_LEVELS), 4, 5)))
     window = open_window(qapp, tmp_path / 'IE_2026083100_temp.nc')
     try:
         assert window.level_combo.currentText() == '850 hPa'
@@ -367,7 +367,7 @@ def test_the_download_dialog_offers_the_deterministic_product(qapp, monkeypatch)
                 dialog.field_list.topLevelItem(i).text(2)
                 for i in range(dialog.field_list.topLevelItemCount())}
         # Which maps give the viewer a level to step through, said before the download.
-        assert rows['temp'] == '20 pressure levels'
+        assert rows['temp'] == '22 pressure levels'
         assert rows['t_2m'] == 'surface'
         assert dialog.field_list.topLevelItem(0).text(0).startswith('Temperature')
         dialog._select_wind()

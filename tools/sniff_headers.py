@@ -13,6 +13,12 @@ plain Basic returns 401).
 
     python tools/sniff_headers.py --local data/*.nc.bz2
     python tools/sniff_headers.py --all --deep          # needs credentials + network
+    python tools/sniff_headers.py --product icon --all  # the deterministic ICON-LAM run
+
+`--product icon` sniffs the second family (`IE_<run>_<field>.nc.bz2`), whose 3-D
+fields also report their pressure levels -- the one thing about that product a
+header can settle and a manual cannot. Measured 2026-08-31: the files carry 22
+levels in Pa, ascending, against the manual's 20 the other way up.
 """
 import argparse
 import bz2
@@ -24,9 +30,9 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from imsicon import nc3                                            # noqa: E402
+from imsicon import download, levels, nc3, products                # noqa: E402
 
-BASE = 'https://data.israel-meteo-service.org/ims/IMS_ICON_ENSEMBLE/'
+BASE = products.ENSEMBLE.base_url
 PREFIX_SHALLOW = 4 << 20
 PREFIX_DEEP = 16 << 20
 
@@ -85,7 +91,18 @@ def sniff_bytes(raw, label='<prefix>'):
             tmp.write_bytes(raw[:record_start + steps * hdr['recsize']])
         var = nc3.field_name(hdr)
         attrs = hdr['vars'][var]['attrs']
+        # What the second axis is, from the file: the one question about the
+        # deterministic product that a header settles and the manual gets wrong.
+        dim, coord, coord_attrs = nc3.level_coordinate(tmp, hdr, var)
+        shape = hdr['vars'][var]['shape']
+        axis = levels.axis_for(shape[1] if len(shape) > 3 else 1, dim=dim, coord=coord,
+                               units=coord_attrs.get('units'), attrs=coord_attrs,
+                               history=hdr['attrs'].get('history'))
         report = {
+            'axis': axis.describe(),
+            'levels': list(axis.labels) if axis.is_pressure else [],
+            'level_units': str(coord_attrs.get('units', '')).strip(),
+            'dims': ','.join(hdr['vars'][var]['dims']),
             'label': label,
             'variable': var,
             'field': var[:-4] if var.endswith('_eps') else var,
@@ -184,15 +201,14 @@ def fetch_prefix(sess, url, prefix_bytes):
     return resp.content
 
 
-def latest_run(sess):
-    """Newest ICON_ENS run id on the server. The listing is UNTRUSTED input: strict regex."""
-    import re
-    resp = sess.get(BASE, timeout=60)
+def latest_run(sess, family=products.ENSEMBLE):
+    """Newest run id of a family. The listing is UNTRUSTED input: the family's own regex."""
+    resp = sess.get(download.base_url(family), timeout=60)
     resp.raise_for_status()
-    runs = sorted(set(re.findall(r'ICON_ENS_(\d{10})_[A-Z0-9_]+\.nc\.bz2', resp.text)))
+    runs = download.runs_in(download.parse_listing(resp.text, family))
     if not runs:
-        raise SniffError('no ICON_ENS_<run>_<FIELD>.nc.bz2 entries in the server listing')
-    return runs[-1]
+        raise SniffError(f'no {family.prefix}<run>_<field>.nc.bz2 entries in the listing')
+    return runs[0]
 
 
 # ---- reporting -------------------------------------------------------------------------
@@ -203,6 +219,13 @@ def print_report(rows):
     for r in rows:
         print(f'{r["field"]:11s} {r["units"]:9s} {r["steps"]:5d} '
               f'{r["min"]:12.4g} {r["max"]:12.4g}  {r["long_name"][:38]}')
+    print()
+    for r in rows:
+        if r.get('levels'):
+            print(f'  {r["field"]:11s} {r["axis"]} ({r["dims"]}), stored in '
+                  f'{r["level_units"] or "?"}: {", ".join(r["levels"])}')
+        elif r.get('axis'):
+            print(f'  {r["field"]:11s} {r["axis"]} ({r["dims"]})')
     print()
     for r in rows:
         if r.get('monotone'):
@@ -221,7 +244,11 @@ def main(argv=None):
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--local', nargs='*', metavar='FILE',
                     help='sniff local .nc.bz2/.nc files instead of the server')
-    ap.add_argument('--all', action='store_true', help='sniff all 15 fields from the server')
+    ap.add_argument('--product', choices=('ens', 'icon'), default='ens',
+                    help='which family: the ensemble (default) or the deterministic '
+                         'ICON-LAM run')
+    ap.add_argument('--all', action='store_true',
+                    help="sniff every field in the product's catalogue")
     ap.add_argument('--field', action='append', help='sniff one field (repeatable)')
     ap.add_argument('--run', help='run id YYYYMMDDHH (default: newest on the server)')
     ap.add_argument('--deep', action='store_true',
@@ -242,21 +269,23 @@ def main(argv=None):
         print_report(rows)
         return 0
 
-    fields = args.field or (list(FIELDS) if args.all else None)
+    family = products.BY_KEY[args.product]
+    fields = args.field or ([p.field for p in family.products] if args.all else None)
     if not fields:
         ap.error('give --local FILE..., or --all, or --field NAME')
+    base = download.base_url(family)
     try:
         sess = session()
-        run = args.run or latest_run(sess)
+        run = args.run or latest_run(sess, family)
     except SniffError as exc:
         print(f'{exc}', file=sys.stderr)
         return 2
-    print(f'run {run}: fetching {prefix >> 20} MiB of each of {len(fields)} fields '
-          f'({len(fields) * (prefix >> 20)} MiB total, vs {len(fields) * 262} MiB whole)')
+    print(f'{family.title}, run {run}: fetching {prefix >> 20} MiB of each of '
+          f'{len(fields)} fields ({len(fields) * (prefix >> 20)} MiB total)')
     for field in fields:
-        name = f'ICON_ENS_{run}_{field}.nc.bz2'
+        name = family.local_name(run, field)
         try:
-            raw = decompress_prefix(fetch_prefix(sess, BASE + name, prefix))
+            raw = decompress_prefix(fetch_prefix(sess, base + name, prefix))
             rows.append(sniff_bytes(raw, name))
             print(f'  {field:11s} ok')
         except Exception as exc:

@@ -84,16 +84,27 @@ def wind_pairs_in(family, present):
     return pairs
 
 
-def wind_pair_for(family, present, prefer=None):
-    """The wind pair to build from, preferring the one the open field belongs to.
+def wind_pair_for(family, present, prefer=None, levels=None):
+    """The wind pair to build from, out of what this run has on disk.
 
-    Opening `u` (on pressure levels) and asking for a wind map means the wind on those
-    levels, not the 10 m wind that happens to be in the same run.
+    `prefer` is a field the pair should contain -- opening `u` (on pressure levels) and
+    asking for a wind map means the wind on those levels, not the 10 m wind that happens
+    to be in the same run.
+
+    `levels` picks by SHAPE instead, which is what barbs drawn over another field need:
+    over an 850 hPa temperature the barbs must be the wind at 850 hPa (the 3-D pair), and
+    over a surface or ensemble map they must be the 10 m pair. The catalogue answers that
+    without opening anything; `check_pairable` is still the real guard.
     """
     pairs = wind_pairs_in(family, present)
     for fields in pairs:
-        if prefer in fields:
+        if prefer is not None and prefer in fields:
             return fields
+    if levels is not None:
+        for fields in pairs:
+            if all(family.has_levels(field) for field in fields) == bool(levels):
+                return fields
+        return None
     return pairs[0] if pairs else None
 DEW_POINT_FIELD = 'TD_2M'
 # What the dew point depression is called on screen. `T_2M-TD_2M` is the machine name;
@@ -275,7 +286,12 @@ def check_pairable(a, b):
         raise PairError(f'{_describe(a)} has {axis_a.describe()} and {_describe(b)} has '
                         f'{axis_b.describe()}. They are not the same {axis_a.noun} axis.')
     labels_a, labels_b = list(a.member_labels), list(b.member_labels)
-    if labels_a != labels_b:
+    # One plane has no position to mix up, so its label is a NAME (`2 m`, `10 m`,
+    # `surface`), not an identity -- and requiring the two to match would refuse a 10 m
+    # wind over a surface precipitation map, or `t_2m - t_g`, for no reason. G17's danger
+    # is pairing position i of one file with a different position i of another, which
+    # needs there to be more than one.
+    if axis_a.n > 1 and labels_a != labels_b:
         first = next(i for i, (x, y) in enumerate(zip(labels_a, labels_b)) if x != y)
         mixes = ('two different ensemble members' if axis_a.aggregatable
                  else 'two different pressure levels')
@@ -950,20 +966,35 @@ class WindView(DerivedView):
         return (np.take_along_axis(u, index, axis=0)[0],
                 np.take_along_axis(v, index, axis=0)[0])
 
-    def barb_label(self, mode):
-        """What the barbs on screen actually are -- it is not the same for every mode."""
+    @property
+    def source_label(self):
+        """`U_10M/V_10M` -- which two files the feathers are counting."""
+        return f'{self.u.field}/{self.v.field}'
+
+    def barb_label(self, mode, over=None):
+        """What the barbs on screen actually are -- it is not the same for every mode.
+
+        `over` is set when the barbs are drawn over a DIFFERENT field's map, in which case
+        the label names the wind they came from: the colours and the feathers are then two
+        different quantities, and a map that shows both has to say so.
+        """
+        head = f'barbs ({self.barb_units})'
+        if over is not None:
+            head += f' from {self.source_label}'
         if mode == 'member':
             if not self.axis.aggregatable:
-                # There is no member to name: the map is one level of a column, and the
-                # title beside this already says which one.
-                return f'barbs ({self.barb_units}): the wind at this level'
-            return f'barbs ({self.barb_units}): one member'
+                # There is no member to name. On a column the title beside this already
+                # says which level; a one-plane field names its own height, so a 10 m
+                # wind drawn over a 2 m temperature says which of the two it is.
+                where = (self.axis.labels[0] if self.axis.kind == 'single'
+                         else 'this level')
+                return f'{head}: the wind at {where}'
+            return f'{head}: one member'
         if mode == 'spread':
-            return (f'barbs ({self.barb_units}): mean vector - a spread has no direction '
-                    'of its own')
+            return f'{head}: mean vector - a spread has no direction of its own'
         if mode in ('max', 'min', 'median'):
-            return f'barbs ({self.barb_units}): the {mode}-speed member at each point'
-        return f'barbs ({self.barb_units}): ensemble mean vector'
+            return f'{head}: the {mode}-speed member at each point'
+        return f'{head}: ensemble mean vector'
 
     def direction_at(self, t, iy, ix, mode, member=0):
         """Wind direction in degrees at one point, for the status bar (**G16** applies:

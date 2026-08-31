@@ -221,6 +221,8 @@ UNITS.update({
     'ASODIFU_S': FieldUnits(('W m-2',), []),
     'ASODIRD_S': FieldUnits(('W m-2',), []),
     'SODIFD_S':  FieldUnits(('W m-2',), []),
+    'SOB_S':     FieldUnits(('W m-2',), []),
+    'SOU_S':     FieldUnits(('W m-2',), []),
     'SOB_T':     FieldUnits(('W m-2',), []),
     'ASOB_T':    FieldUnits(('W m-2',), []),
     'ATHB_T':    FieldUnits(('W m-2',), []),
@@ -344,12 +346,16 @@ def aggregate(stack, mode):
 #   mean-kind formula  -> [100, 400, 800, 300, 50]            the true hourly signal
 ACCUMULATION = {'TOT_PREC': 'sum', 'ASWDIFD_S': 'mean', 'ASWDIR_S': 'mean'}
 
-# The deterministic run's fields, from the manual. The five radiation fields whose names
-# begin with `a` are described there as "mean since model start" in as many words -- that
-# is the manual's own wording, not an inference -- while `sodifd_s` and `sob_t`, which are
-# not, are deliberately absent. The precipitation amounts are accumulations by the ICON
-# convention and by the measured behaviour of the ensemble's TOT_PREC; if one of them ever
-# turns out not to be, the G24 guard says so on screen rather than showing fake drizzle.
+# The deterministic run's fields. The five radiation fields whose names begin with `a` are
+# described in the manual as "mean since model start" in as many words, while `sodifd_s`,
+# `sob_t`, `sob_s` and `sou_s`, which are not, are deliberately absent.
+#
+# MEASURED 2026-08-31 against run 2026083012, 91 steps each, with
+# `tools/sniff_headers.py --product icon --deep`: `tot_prec`, `rain_gsp`, `snow_gsp` and
+# `graupel_gsp` are non-decreasing in time (accumulated -> `sum`), while `asodird_s` and
+# `asob_t` are not (a running mean -> `mean`), and `sob_s` is not either, which is why it
+# is not in this table. The kinds below are therefore read off the data, not inferred from
+# the names -- and the G24 guard still says so on screen if a field ever stops behaving.
 ACCUMULATION.update({
     'RAIN_GSP': 'sum', 'RAIN_CON': 'sum', 'SNOW_GSP': 'sum', 'SNOW_CON': 'sum',
     'GRAUPEL_GSP': 'sum',
