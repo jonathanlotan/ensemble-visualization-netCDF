@@ -24,7 +24,7 @@ class FieldView:
 
     def __init__(self, raw, units_label=None):
         self.raw = raw
-        sample = self._encoding_sample() if raw.field in transform._CLOUD_FIELDS else None
+        sample = self._encoding_sample() if transform.is_cloud_field(raw.field) else None
         self.unit_choices, self.units_note = transform.choices_for(
             raw.field, raw.units, sample)
         self._units = self.unit_choices[0]
@@ -33,7 +33,7 @@ class FieldView:
 
         # G14: only these three fields accumulate. VMAX_10M is already a per-interval
         # quantity and is deliberately not in the table.
-        self.accum_kind = transform.ACCUMULATION.get(raw.field)
+        self.accum_kind = transform.accumulation_kind(raw.field)
         self.rate_hours = 0
         self.rate_note = None
 
@@ -217,6 +217,13 @@ class FieldView:
         """True when what is on screen is a change in the quantity, not the quantity."""
         return bool(self.rate_hours) and self.accum_kind == 'sum'
 
+    def _display_range(self, cached):
+        if cached is None:
+            return None
+        lo, hi = float(cached[0]), float(cached[1])
+        return (self._units.apply_delta_range(lo, hi) if self.is_difference_view
+                else self._units.apply_range(lo, hi))
+
     @property
     def value_range(self):
         """G19: a pure unit change is affine, so transform the cached range, never rescan.
@@ -224,12 +231,12 @@ class FieldView:
         The cached value is in step-[1] space (differenced but not yet converted), so this
         holds for a rate view too -- switching mm to kg m-2 never costs a scan.
         """
-        cached = self.raw.range_for(self.transform_signature)
-        if cached is None:
-            return None
-        lo, hi = float(cached[0]), float(cached[1])
-        return (self._units.apply_delta_range(lo, hi) if self.is_difference_view
-                else self._units.apply_range(lo, hi))
+        return self._display_range(self.raw.range_for(self.transform_signature))
+
+    def level_range(self, index):
+        """The cached range of ONE position on the second axis, in display units."""
+        return self._display_range(
+            self.raw.level_range(index, self.transform_signature))
 
     # ---- saving: for a file-backed field, what you see is what you save ---------------
     @property
@@ -262,7 +269,7 @@ class FieldView:
         short = (f' | INCOMPLETE: {self.n_times}/{self.raw.declared_times} steps'
                  if self.raw.truncated else '')
         return (f'{self.path.name} | {self.field} ({self.long_name}) [{self.units}] | '
-                f'run {self.run_init:%Y-%m-%d %H:%M}Z | {self.n_members} members | '
+                f'run {self.run_init:%Y-%m-%d %H:%M}Z | {self.axis.describe()} | '
                 f'{self.n_times} steps{short} | {self.ny}x{self.nx} grid')
 
     # ---- range caching, per transform view (G19) --------------------------------------

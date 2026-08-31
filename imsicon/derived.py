@@ -26,7 +26,7 @@ from typing import NamedTuple
 
 import numpy as np
 
-from . import barbs, isolines, transform
+from . import barbs, isolines, products, transform
 from .dataset import EnsembleFile
 from .fieldview import FieldView
 
@@ -43,6 +43,58 @@ ZERO_C = 273.15
 # point ~45 degC too low with no other symptom, so an unexpected units string refuses
 # rather than guesses (the same policy as the v2 registry, v2.md 1.3).
 DEW_POINT_INPUTS = {'temperature': ('T_2M', 'K'), 'humidity': ('RELHUM_2M', '%')}
+# Both families spell the roles differently -- the ensemble publishes `T_2M`/`RELHUM_2M`,
+# the deterministic run `t_2m`/`rh_2m` -- so a role is checked against every family's name
+# for it rather than against one hard-coded field. The units expected for the role are the
+# same either way: the formula is written for K and %, whatever the file is called.
+ROLE_UNITS = {'temperature': 'K', 'humidity': '%', 'zonal': 'm s-1', 'meridional': 'm s-1'}
+
+
+# A wind map can be built from the 10 m components or from the 3-D ones on pressure
+# levels; both play the same role in the formula, so both are accepted for it.
+_ROLE_ALIASES = {'zonal': ('zonal', 'zonal_upper'),
+                 'meridional': ('meridional', 'meridional_upper')}
+
+
+def role_fields(role):
+    """Every family's name(s) for a role, e.g. ('T_2M', 't_2m') for 'temperature'."""
+    names = _ROLE_ALIASES.get(role, (role,))
+    return tuple(dict.fromkeys(
+        family.roles[name] for family in products.FAMILIES for name in names
+        if name in family.roles))
+
+
+def role_field(family, role):
+    """This family's name for a role, or None when it has no field for it."""
+    return family.roles.get(role) if family is not None else None
+
+
+# The wind pairs a family can offer, most-surface first: the 10 m components, and (for the
+# deterministic run) the 3-D ones, which give the wind AT a pressure level.
+WIND_PAIRS = (('zonal', 'meridional'), ('zonal_upper', 'meridional_upper'))
+
+
+def wind_pairs_in(family, present):
+    """-> [(zonal, meridional)] the family defines and `present` actually holds."""
+    pairs = []
+    for roles in WIND_PAIRS:
+        fields = tuple(family.roles.get(role) for role in roles)
+        if all(fields) and all(field in present for field in fields):
+            pairs.append(fields)
+    return pairs
+
+
+def wind_pair_for(family, present, prefer=None):
+    """The wind pair to build from, preferring the one the open field belongs to.
+
+    Opening `u` (on pressure levels) and asking for a wind map means the wind on those
+    levels, not the 10 m wind that happens to be in the same run.
+    """
+    pairs = wind_pairs_in(family, present)
+    for fields in pairs:
+        if prefer in fields:
+            return fields
+    return pairs[0] if pairs else None
 DEW_POINT_FIELD = 'TD_2M'
 # What the dew point depression is called on screen. `T_2M-TD_2M` is the machine name;
 # `T-Td` is what a forecaster reads it as, and the map is for reading.
@@ -50,7 +102,11 @@ DEPRESSION_NAME = 'T-Td'
 # The two operands, in order, that MAKE a difference the depression -- whichever way it
 # was built: from the dialog, from `--derive depression`, or as an ad-hoc `--difference
 # T_2M TD_2M` against a TD_2M file written earlier by "Save field...".
-DEPRESSION_OPERANDS = (DEW_POINT_INPUTS['temperature'][0], DEW_POINT_FIELD)
+# Compared through `products.field_key`, so the deterministic run's NATIVE pair
+# (`t_2m` and its published `td_2m`) is recognised as the same quantity as the ensemble's
+# computed one -- same name on the map, same 0.5 degC isolines, same sort band.
+DEPRESSION_OPERANDS = (products.field_key(DEW_POINT_INPUTS['temperature'][0]),
+                       products.field_key(DEW_POINT_FIELD))
 
 
 # ---- the "sort" scale (R5) --------------------------------------------------------------
@@ -106,6 +162,12 @@ SORT_STOPS = ((0.0, '#d7191c', 'red'), (1.0, '#fdae61', 'yellow-orange'),
 WIND_INPUTS = {'zonal': ('U_10M', 'm s-1'), 'meridional': ('V_10M', 'm s-1')}
 WIND_FIELD = 'WSPD_10M'
 WIND_NAME = 'wind 10m'
+# The same view built from the deterministic run's 3-D components is the wind AT A LEVEL,
+# not at 10 m, and saying "10m" over an 850 hPa map would be a plain misstatement. It gets
+# its own name and its own registry entry (`WSPD`), which is also what a saved file of it
+# reopens as.
+UPPER_WIND_FIELD = 'WSPD'
+UPPER_WIND_NAME = 'wind'
 
 
 class PairError(Exception):
@@ -202,17 +264,27 @@ def check_pairable(a, b):
     Checked in the order that produces the most useful message: member order first,
     because it is the failure that otherwise goes unnoticed.
     """
+    axis_a, axis_b = a.axis, b.axis
+    if axis_a.kind != axis_b.kind:
+        raise PairError(
+            f'{_describe(a)} is on {axis_a.describe()} and {_describe(b)} is on '
+            f'{axis_b.describe()}. Those are different axes -- an ensemble member is not '
+            'a pressure level -- so combining them element by element would pair values '
+            'that have nothing to do with each other.')
     if a.n_members != b.n_members:
-        raise PairError(f'{_describe(a)} has {a.n_members} members and {_describe(b)} has '
-                        f'{b.n_members}. They are not the same ensemble.')
+        raise PairError(f'{_describe(a)} has {axis_a.describe()} and {_describe(b)} has '
+                        f'{axis_b.describe()}. They are not the same {axis_a.noun} axis.')
     labels_a, labels_b = list(a.member_labels), list(b.member_labels)
     if labels_a != labels_b:
         first = next(i for i, (x, y) in enumerate(zip(labels_a, labels_b)) if x != y)
+        mixes = ('two different ensemble members' if axis_a.aggregatable
+                 else 'two different pressure levels')
         raise PairError(
-            f'Member order differs: position {first} is {labels_a[first]!r} in '
-            f'{_describe(a)} but {labels_b[first]!r} in {_describe(b)}. Combining them '
-            'would mix two different ensemble members at every grid point, and the result '
-            'would look completely plausible (G17), so these files are refused.')
+            f'{axis_a.noun.capitalize()} order differs: position {first} is '
+            f'{labels_a[first]!r} in {_describe(a)} but {labels_b[first]!r} in '
+            f'{_describe(b)}. Combining them would mix {mixes} at every grid point, and '
+            'the result would look completely plausible (G17), so these files are '
+            'refused.')
     if (a.ny, a.nx) != (b.ny, b.nx):
         raise PairError(f'{_describe(a)} is {a.ny}x{a.nx} and {_describe(b)} is '
                         f'{b.ny}x{b.nx}. Different grids cannot be combined.')
@@ -240,7 +312,8 @@ def units_look_compatible(field_a, field_b):
     before the user waits half a minute to be told no. An unknown field is allowed
     through, because only the real check is entitled to refuse.
     """
-    entry_a, entry_b = transform.UNITS.get(field_a), transform.UNITS.get(field_b)
+    entry_a = transform.UNITS.get(products.field_key(field_a))
+    entry_b = transform.UNITS.get(products.field_key(field_b))
     if entry_a is None or entry_b is None:
         return True
     return bool(set(entry_a.expected) & set(entry_b.expected))
@@ -282,6 +355,7 @@ class DerivedView:
         self.provenance = provenance
         self.note = None
         self._cached = None          # (lo, hi) in this view's own canonical space
+        self._cached_levels = None   # the same, per position on the second axis
         self._cache_stamp = None
 
     def __getattr__(self, name):
@@ -396,18 +470,35 @@ class DerivedView:
         lo, hi = self._transform_range(*self._cached)
         return (lo, hi) if lo <= hi else (hi, lo)
 
+    def level_range(self, index):
+        """One level's own range, so a 500 hPa map is not coloured against 1000 hPa."""
+        index = int(index)
+        if not self._cached_levels or not (0 <= index < len(self._cached_levels)):
+            return None
+        lo, hi = self._transform_range(*self._cached_levels[index])
+        return (lo, hi) if lo <= hi else (hi, lo)
+
     def cached_range(self):
         return self.value_range
 
     def scan_range(self, progress=None, cancel=None):
         lo, hi = np.inf, -np.inf
+        low = np.full(self.n_members, np.inf)
+        high = np.full(self.n_members, -np.inf)
         for t in range(self.n_times):
             if cancel is not None and cancel():
                 return None
-            block = self.canonical_ens_frame(t)
+            block = np.asarray(self.canonical_ens_frame(t))
             if np.isfinite(block).any():
                 lo = min(lo, float(np.nanmin(block)))
                 hi = max(hi, float(np.nanmax(block)))
+                if block.ndim == 3 and block.shape[0] == self.n_members:
+                    with np.errstate(invalid='ignore'):
+                        finite = np.isfinite(block).any(axis=(1, 2))
+                        low = np.where(finite, np.fmin(low, np.nanmin(block, axis=(1, 2))),
+                                       low)
+                        high = np.where(finite, np.fmax(high, np.nanmax(block, axis=(1, 2))),
+                                        high)
             if progress is not None:
                 progress(t + 1, self.n_times)
         if not np.isfinite(lo):
@@ -415,6 +506,9 @@ class DerivedView:
         if hi <= lo:
             hi = lo + 1.0
         self._cached = (lo, hi)
+        self._cached_levels = [(float(a), float(b) if b > a else float(a) + 1.0)
+                               for a, b in zip(low, high)
+                               if np.isfinite(a) and np.isfinite(b)] or None
         self._cache_stamp = self._canonical_stamp()
         return self.value_range
 
@@ -446,7 +540,7 @@ class DerivedView:
     def summary(self):
         sources = ' | '.join(self.source_files)
         return (f'{self.display_name} ({self.long_name}) [{self.units}] | '
-                f'run {self.run_init:%Y-%m-%d %H:%M}Z | {self.n_members} members | '
+                f'run {self.run_init:%Y-%m-%d %H:%M}Z | {self.axis.describe()} | '
                 f'{self.n_times} steps | {self.ny}x{self.nx} grid | from {sources}')
 
 
@@ -461,8 +555,10 @@ class DewPointView(DerivedView):
 
     def __init__(self, temperature, humidity):
         check_pairable(temperature, humidity)
-        _require_field_units(temperature, *DEW_POINT_INPUTS['temperature'], 'temperature')
-        _require_field_units(humidity, *DEW_POINT_INPUTS['humidity'], 'humidity')
+        _require_field_units(temperature, role_fields('temperature'),
+                             ROLE_UNITS['temperature'], 'temperature')
+        _require_field_units(humidity, role_fields('humidity'), ROLE_UNITS['humidity'],
+                             'humidity')
         super().__init__(
             (temperature, humidity), DEW_POINT_FIELD, 'dew point temperature in 2m',
             f'dew point from {temperature.field} and {humidity.field} '
@@ -555,9 +651,10 @@ def _require_field_units(view, field, expected, role, what='dew point'):
     with nothing on screen to show it, and a U_10M in km h-1 would draw barbs at 3.6x the
     real speed -- both entirely plausible-looking.
     """
-    if view.field != field:
-        raise PairError(f'The {role} input must be {field}, not {view.field} '
-                        f'({view.path.name}).')
+    accepted = (field,) if isinstance(field, str) else tuple(field)
+    if view.field not in accepted:
+        raise PairError(f'The {role} input must be {" or ".join(accepted)}, not '
+                        f'{view.field} ({view.path.name}).')
     actual = transform.normalise_units(getattr(view, 'raw', view).units)
     if actual != expected:
         raise PairError(
@@ -567,14 +664,18 @@ def _require_field_units(view, field, expected, role, what='dew point'):
             'on screen to show it.')
 
 
+def _by_role(views, role):
+    """The view among `views` whose field plays `role` in either family, else None."""
+    accepted = role_fields(role)
+    return next((view for view in views if view.field in accepted), None)
+
+
 def dew_point(temperature, humidity):
-    """Build a `DewPointView` from a T_2M and a RELHUM_2M view, in either order."""
+    """Build a `DewPointView` from a temperature and a humidity view, in either order."""
     views = [temperature, humidity]
-    by_field = {view.field: view for view in views}
-    if DEW_POINT_INPUTS['temperature'][0] in by_field and \
-            DEW_POINT_INPUTS['humidity'][0] in by_field:
-        temperature = by_field[DEW_POINT_INPUTS['temperature'][0]]
-        humidity = by_field[DEW_POINT_INPUTS['humidity'][0]]
+    picked_t, picked_rh = _by_role(views, 'temperature'), _by_role(views, 'humidity')
+    if picked_t is not None and picked_rh is not None:
+        temperature, humidity = picked_t, picked_rh
     return DewPointView(temperature, humidity)
 
 
@@ -623,7 +724,7 @@ class DifferenceView(DerivedView):
         # question is answered between one temperature isoline and the next.
         if all(isolines.interval_for(view.field) for view in (a, b)):
             self.isoline_interval = isolines.DIFFERENCE
-        if (a.field, b.field) == DEPRESSION_OPERANDS:
+        if tuple(products.field_key(v.field) for v in (a, b)) == DEPRESSION_OPERANDS:
             # Named and coloured here rather than in `dew_point_depression`, because this
             # is the same quantity however it was arrived at -- including an ad-hoc
             # `--difference T_2M TD_2M` against a saved dew point file.
@@ -727,9 +828,10 @@ class WindView(DerivedView):
 
     def __init__(self, zonal, meridional):
         check_pairable(zonal, meridional)
-        _require_field_units(zonal, *WIND_INPUTS['zonal'], 'zonal wind', what='wind map')
-        _require_field_units(meridional, *WIND_INPUTS['meridional'], 'meridional wind',
-                             what='wind map')
+        _require_field_units(zonal, role_fields('zonal'), ROLE_UNITS['zonal'],
+                             'zonal wind', what='wind map')
+        _require_field_units(meridional, role_fields('meridional'),
+                             ROLE_UNITS['meridional'], 'meridional wind', what='wind map')
         super().__init__(
             (zonal, meridional), WIND_FIELD, 'wind speed and direction in 10m',
             f'wind from {zonal.field} and {meridional.field} '
@@ -737,7 +839,11 @@ class WindView(DerivedView):
             'barbs from the component vectors',
             display_name=WIND_NAME)
         self.u, self.v = zonal, meridional
-        self.unit_choices, registry_note = transform.choices_for(WIND_FIELD, 'm s-1')
+        # Named for what it is: the 10 m wind, or the wind on whatever level is shown.
+        if zonal.field in (products.ICON.roles.get('zonal_upper'),):
+            self.field, self.display_name = UPPER_WIND_FIELD, UPPER_WIND_NAME
+            self.long_name = 'wind speed and direction on pressure levels'
+        self.unit_choices, registry_note = transform.choices_for(self.field, 'm s-1')
         self._units = self.unit_choices[0]
         self.note = registry_note
 
@@ -847,6 +953,10 @@ class WindView(DerivedView):
     def barb_label(self, mode):
         """What the barbs on screen actually are -- it is not the same for every mode."""
         if mode == 'member':
+            if not self.axis.aggregatable:
+                # There is no member to name: the map is one level of a column, and the
+                # title beside this already says which one.
+                return f'barbs ({self.barb_units}): the wind at this level'
             return f'barbs ({self.barb_units}): one member'
         if mode == 'spread':
             return (f'barbs ({self.barb_units}): mean vector - a spread has no direction '
@@ -873,9 +983,9 @@ class WindView(DerivedView):
 
 
 def wind(zonal, meridional):
-    """Build a `WindView` from a U_10M and a V_10M view, in either order."""
-    by_field = {view.field: view for view in (zonal, meridional)}
-    if WIND_INPUTS['zonal'][0] in by_field and WIND_INPUTS['meridional'][0] in by_field:
-        zonal = by_field[WIND_INPUTS['zonal'][0]]
-        meridional = by_field[WIND_INPUTS['meridional'][0]]
+    """Build a `WindView` from a U and a V view, in either order and either family."""
+    views = [zonal, meridional]
+    picked_u, picked_v = _by_role(views, 'zonal'), _by_role(views, 'meridional')
+    if picked_u is not None and picked_v is not None:
+        zonal, meridional = picked_u, picked_v
     return WindView(zonal, meridional)

@@ -4,12 +4,13 @@
 thread with progress and a cancel hook.
 """
 import bz2
-import re
 import os
 import time
 import shutil
 import sys
 from pathlib import Path
+
+from . import products
 
 CHUNK = 1 << 22                 # 4 MiB
 MIN_FREE_BYTES = 1 << 30        # refuse to decompress with under 1 GB free
@@ -130,9 +131,11 @@ def resolve(path, progress=None, cancel=None):
 
 
 # ---- finding the other fields of a run --------------------------------------------------
-# Same strictness as the server listing (download.NAME_RE): a file is only treated as an
-# ensemble product if its name says exactly what run and field it is.
-RUN_FILE_RE = re.compile(r'^ICON_ENS_(?P<run>\d{10})_(?P<field>[A-Z0-9_]+)\.nc(?P<bz2>\.bz2)?$')
+# Same strictness as the server listing: a file is only treated as an IMS product if its
+# name says exactly which family, run and field it is. The grammars live in `products.py`
+# -- `ICON_ENS_<run>_<FIELD>` for the ensemble, `IE_<run>_<field>` for the deterministic
+# run -- so there is one place that knows how these files are named.
+RUN_FILE_RE = products.ENSEMBLE.file_re          # kept: the ensemble grammar, by its old name
 
 
 def search_roots(near=None):
@@ -156,7 +159,13 @@ def search_roots(near=None):
 
 
 def scan_for_fields(roots):
-    """-> {(run, field): Path} over `roots`, in priority order.
+    """-> {(family, run, field): Path} over `roots`, in priority order.
+
+    The family is part of the key, not a detail of the name: the ensemble and the
+    deterministic run publish the same run id (`2026083100`) with different contents and,
+    in principle, different grids, so `('ens', run, 'T_2M')` and `('icon', run, 't_2m')`
+    must never collide in one dictionary and must never be offered as two fields of one
+    forecast.
 
     An already-decompressed `.nc` always wins over the `.nc.bz2` it came from -- opening
     the second field of a pair should not spend 16 s re-expanding a file that is sitting
@@ -166,11 +175,22 @@ def scan_for_fields(roots):
     found = {}
     for root in roots:
         for path in sorted(root.iterdir() if root.is_dir() else []):
-            match = RUN_FILE_RE.match(path.name)
-            if not match or not path.is_file():
+            if not path.is_file():
                 continue
-            key = (match.group('run'), match.group('field'))
-            previous = found.get(key)
-            if previous is None or (is_compressed(previous) and not match.group('bz2')):
-                found[key] = path
+            for family in products.FAMILIES:
+                match = family.match(path.name)
+                if not match:
+                    continue
+                key = (family.key, match.group('run'), match.group('field'))
+                previous = found.get(key)
+                if previous is None or (is_compressed(previous) and not match.group('bz2')):
+                    found[key] = path
+                break
     return found
+
+
+def fields_of_run(available, family, run):
+    """-> {field: Path} for one family and run, out of `scan_for_fields`' result."""
+    key = getattr(family, 'key', family)
+    return {field: path for (found_family, found_run, field), path in available.items()
+            if found_family == key and found_run == run}

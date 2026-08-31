@@ -128,11 +128,21 @@ def history_for_members(member_labels, run, field, prefix=''):
 def write_nc3(path, field, units, data, *, history=None, long_name=None,
               standard_name=None, lat=None, lon=None, time_minutes=None,
               time_units='minutes since 2026-8-23 00:00:00', global_attrs=None,
-              field_attrs=None, progress=None, cancel=None):
-    """Write `data` (n_times, n_members, ny, nx) as an `ICON_ENS_<run>_<FIELD>.nc`.
+              field_attrs=None, levels=None, level_units='hPa', variable=None,
+              progress=None, cancel=None):
+    """Write `data` (n_times, n_levels, ny, nx) as an `ICON_ENS_<run>_<FIELD>.nc`.
 
     `data` may be an ndarray or a `FrameSource`, in which case frames are pulled one at a
     time. The variable is named `<field>_eps`, matching IMS.
+
+    `levels` chooses what the second axis of the file IS:
+
+    * `None` -- the ensemble's `sfc` axis, which is what G1 describes: 20 values that are
+      all 0.0, with member identity carried only by `history`;
+    * a sequence of pressures in hPa -- a real `plev` coordinate, so the file comes back
+      out of `levels.axis_for` as the same levels it went in as;
+    * `False` -- no vertical dimension at all, i.e. the `(time, lat, lon)` shape the
+      deterministic run uses for its surface fields. `data` must then have one plane.
 
     Writes to `<path>.part` and renames, so an interrupted or cancelled write never leaves
     a file that `nc3.parse` would happily open as a truncated dataset (G26).
@@ -146,9 +156,25 @@ def write_nc3(path, field, units, data, *, history=None, long_name=None,
                     else np.asarray(time_minutes, float))
     if len(lat) != ny or len(lon) != nx or len(time_minutes) != n_times:
         raise ValueError('lat/lon/time lengths do not match the data shape')
-    sfc = np.zeros(n_members, dtype=float)          # G1: all 20 values really are 0.0
+    flat = levels is False
+    if flat and n_members != 1:
+        raise ValueError(f'a file with no vertical dimension needs one plane, '
+                         f'got {n_members}')
+    if levels is None or flat:
+        level_name, level_values = 'sfc', np.zeros(n_members, dtype=float)
+        level_attrs = {'long_name': 'surface', 'axis': 'Z'}
+    else:
+        level_name = 'plev'
+        level_values = np.asarray(levels, dtype=float)
+        if level_values.size != n_members:
+            raise ValueError(f'{level_values.size} levels for {n_members} data planes')
+        level_attrs = {'standard_name': 'air_pressure', 'long_name': 'pressure',
+                       'units': level_units, 'positive': 'down', 'axis': 'Z'}
 
-    var_name = f'{field}_eps'
+    # The ensemble names its variable `<FIELD>_eps`; the deterministic run names it after
+    # the field itself, which `nc3.field_name` also accepts. `variable` is what lets a
+    # fixture or a save produce either spelling.
+    var_name = variable or f'{field}_eps'
     gattrs = {'CDI': 'Climate Data Interface version 2.4.0',
               'Conventions': 'CF-1.6',
               'source': 'icon-2025.04-dwd',
@@ -163,7 +189,7 @@ def write_nc3(path, field, units, data, *, history=None, long_name=None,
               'units': units}
     fattrs.update(field_attrs or {})
 
-    dims = [('time', 0), ('lon', nx), ('lat', ny), ('sfc', n_members)]
+    dims = [('time', 0), ('lon', nx), ('lat', ny)]
     # (name, dimids, attrs, nc_type, itemsize, per-record element count, is_record)
     specs = [
         ('time', [0], {'standard_name': 'time', 'units': time_units,
@@ -172,9 +198,16 @@ def write_nc3(path, field, units, data, *, history=None, long_name=None,
                       'units': 'degrees_east', 'axis': 'X'}, NC_DOUBLE, 8, nx, False),
         ('lat', [2], {'standard_name': 'latitude', 'long_name': 'latitude',
                       'units': 'degrees_north', 'axis': 'Y'}, NC_DOUBLE, 8, ny, False),
-        ('sfc', [3], {'long_name': 'surface', 'axis': 'Z'}, NC_DOUBLE, 8, n_members, False),
-        (var_name, [0, 3, 2, 1], fattrs, NC_FLOAT, 4, n_members * ny * nx, True),
     ]
+    if flat:
+        # (time, lat, lon), the deterministic run's surface shape. The record bytes are
+        # identical to a one-plane vertical file's, so only the header differs.
+        specs.append((var_name, [0, 2, 1], fattrs, NC_FLOAT, 4, ny * nx, True))
+    else:
+        dims.append((level_name, n_members))
+        specs.append((level_name, [3], level_attrs, NC_DOUBLE, 8, n_members, False))
+        specs.append((var_name, [0, 3, 2, 1], fattrs, NC_FLOAT, 4,
+                      n_members * ny * nx, True))
 
     def vsize(count, itemsize):
         nbytes = count * itemsize
@@ -211,7 +244,9 @@ def write_nc3(path, field, units, data, *, history=None, long_name=None,
             within += vsize(count, item)
 
     values = {'time': time_minutes.astype('>f8'), 'lon': lon.astype('>f8'),
-              'lat': lat.astype('>f8'), 'sfc': sfc.astype('>f8')}
+              'lat': lat.astype('>f8')}
+    if not flat:
+        values[level_name] = level_values.astype('>f8')
 
     path = Path(path)
     partial = path.with_name(path.name + '.part')
@@ -258,22 +293,44 @@ def write_view(path, view, *, field=None, units=None, long_name=None, frames=Non
     units = units if units is not None else view.units
     frames = frames if frames is not None else view.ens_frame
     run = f'{view.run_init:%Y%m%d%H}'
+    axis = getattr(view, 'axis', None)
 
     def frame(t):
         return np.asarray(frames(t), dtype=np.float32)
 
     source = FrameSource((view.n_times, view.n_members, view.ny, view.nx), frame)
     provenance = getattr(view, 'provenance', None) or f'derived from {view.field}'
+    # G1's history line names ENSEMBLE MEMBERS, so it is written only for a file that has
+    # them. A pressure-level field carries its identity in a real `plev` coordinate
+    # instead, and stamping it with twenty member names would be a false claim that
+    # `nc3.member_labels` would happily read back.
+    if axis is not None and axis.is_pressure:
+        stamp = dt.datetime.now(dt.timezone.utc).strftime('%a %b %d %H:%M:%S %Y')
+        history = f'{stamp}: imsicon: {provenance}'
+        level_values = list(axis.values)
+    elif axis is not None and axis.kind == 'single':
+        # A surface field goes back out as a surface field: (time, lat, lon), with no
+        # vertical dimension invented for it and no member history to misread.
+        stamp = dt.datetime.now(dt.timezone.utc).strftime('%a %b %d %H:%M:%S %Y')
+        history = f'{stamp}: imsicon: {provenance}'
+        level_values = False
+    else:
+        history = history_for_members(view.member_labels, run, field,
+                                      prefix=f'imsicon: {provenance};')
+        level_values = None
+    # `<FIELD>_eps` is the ensemble product's spelling and a claim about what the file
+    # holds, so it is written only for a file that holds an ensemble. A pressure-level or
+    # surface field gets the deterministic run's plain variable name instead.
+    variable = (None if axis is None or axis.aggregatable
+                else nc_variable_name(field))
     return write_nc3(
-        path, nc_variable_name(field), units, source,
+        path, nc_variable_name(field), units, source, variable=variable,
         lat=np.asarray(view.lat, dtype=float), lon=np.asarray(view.lon, dtype=float),
         time_minutes=np.asarray(view.forecast_hours, dtype=float) * 60.0,
         time_units=f'minutes since {view.run_init:%Y-%m-%d %H:%M:%S}',
         long_name=long_name or getattr(view, 'long_name', field),
-        standard_name=field.lower(),
-        history=history_for_members(view.member_labels, run, field,
-                                    prefix=f'imsicon: {provenance};'),
-        global_attrs={'imsicon_provenance': provenance},
+        standard_name=field.lower(), levels=level_values,
+        history=history, global_attrs={'imsicon_provenance': provenance},
         progress=progress, cancel=cancel)
 
 

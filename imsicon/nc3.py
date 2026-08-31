@@ -123,20 +123,58 @@ def view(path, hdr, varname):
     return as_strided(base, shape=shape, strides=strides)
 
 
-def field_name(hdr):
-    """Name of the ensemble field variable, e.g. 'CAPE_ML_eps'.
+def data_variables(hdr):
+    """Names of the variables that hold a field, not a coordinate.
 
-    IMS names it '<FIELD>_eps'; fall back to the only 4-D variable so the app still
-    opens a file whose naming convention changed.
+    A coordinate variable is named after a dimension (`time`, `lat`, `lon`, `sfc`,
+    `plev`), which is the CF rule and the one thing that separates the two without
+    knowing any field names.
+    """
+    return [name for name, var in hdr['vars'].items()
+            if len(var['dims']) >= 3 and name not in hdr['dims']]
+
+
+def field_name(hdr):
+    """Name of the field variable, e.g. 'CAPE_ML_eps', 'temp' or 't_2m'.
+
+    The ensemble product names it '<FIELD>_eps'. The deterministic ICON-LAM product
+    (`IMS_ICON_manual.pdf`) names it after the field itself and publishes both 4-D fields
+    (time, pressure level, lat, lon) and 3-D surface fields (time, lat, lon) -- so the
+    fallback is "the only variable that is not a coordinate", of either rank, and a 4-D
+    one wins if a file somehow holds both.
     """
     eps = [k for k in hdr['vars'] if k.endswith('_eps')]
     if len(eps) == 1:
         return eps[0]
-    four_d = [k for k, v in hdr['vars'].items() if len(v['dims']) == 4]
+    candidates = data_variables(hdr)
+    if len(candidates) == 1:
+        return candidates[0]
+    four_d = [k for k in candidates if len(hdr['vars'][k]['dims']) == 4]
     if len(four_d) == 1:
         return four_d[0]
     raise UnsupportedFormat(
-        f'expected one ensemble field variable, found {eps or four_d or list(hdr["vars"])}')
+        f'expected one field variable, found {eps or candidates or list(hdr["vars"])}')
+
+
+def level_coordinate(path, hdr, varname):
+    """The field's second dimension and its coordinate variable, if it has one.
+
+    -> (dim name or None, values or None, attrs). `levels.axis_for` decides from these
+    whether the axis is 20 ensemble members or 20 pressure levels; reading them is all
+    this layer does.
+    """
+    dims = hdr['vars'][varname]['dims']
+    if len(dims) < 4:
+        return None, None, {}
+    name = dims[1]
+    coord = hdr['vars'].get(name)
+    if coord is None or len(coord['dims']) != 1:
+        return name, None, {}
+    try:
+        values = np.asarray(view(path, hdr, name), dtype=float)
+    except Exception:
+        return name, None, dict(coord['attrs'])
+    return name, values, dict(coord['attrs'])
 
 
 # G4: units carry a NON zero-padded date -- "minutes since 2026-8-23 00:00:00".

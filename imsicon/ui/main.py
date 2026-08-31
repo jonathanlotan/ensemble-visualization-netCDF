@@ -4,18 +4,24 @@ from pathlib import Path
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .. import derived, download, geo, ingest, nc3, ncwrite, transform
-from ..dataset import EnsembleFile, member_stats
+from .. import derived, geo, ingest, nc3, ncwrite, products, transform
+from ..dataset import EnsembleFile, level_stats, member_stats
 from ..fieldview import FieldView
 from . import colors, derivedialog, downloaddialog
 from .mapview import MapView
 from .plotview import PlotView
 from .readout import ReadoutPanel
 
-FILE_FILTER = 'ICON ensemble (*.nc *.nc.bz2);;NetCDF (*.nc);;Compressed (*.nc.bz2);;All files (*)'
+FILE_FILTER = ('IMS ICON (*.nc *.nc.bz2);;NetCDF (*.nc);;Compressed (*.nc.bz2);;'
+               'All files (*)')
 AGG_CHOICES = [('Ensemble mean', 'mean'), ('Ensemble max', 'max'), ('Ensemble min', 'min'),
                ('Ensemble median', 'median'), ('Spread (max-min)', 'spread'),
                ('Single member', 'member')]
+# A file whose second axis is pressure levels gets ONE choice, and the map always shows one
+# level. Not a restriction for its own sake: a mean, a max or a spread across 1000..150 hPa
+# is not a quantity anyone forecasts, and it would look exactly as convincing as one that
+# is (`levels.py`, and G16's family of plausible-but-meaningless statistics).
+LEVEL_CHOICES = [('Single level', 'member')]
 SEQUENTIAL_MAPS = ['turbo', 'viridis', 'inferno', 'plasma', 'magma', 'CET-L17']
 # Diverging, for a difference map: a single hue ramp cannot show which side of zero a
 # value is on, which is the only thing a difference map is for.
@@ -64,20 +70,37 @@ def _sort_tooltip(ds):
             'isolines still run through it.')
 
 
+def _level_tooltip(ds):
+    """What the level/member control does, in the words of the file that is open."""
+    if ds is None:
+        return 'Choose one member or pressure level once a file is open'
+    axis = ds.axis
+    if axis.is_pressure:
+        return (f'Which of the {axis.n} pressure levels the map shows, listed with the '
+                f'top of the atmosphere first. The Up and Down arrow keys (and the two '
+                f'buttons beside this list) step through them -- Up goes higher, towards '
+                f'{axis.labels[axis.upward[-1]]}, whichever order the file stores them in.')
+    if axis.kind == 'single':
+        return f'{ds.display_name} is a surface field: it has one level and nothing to choose.'
+    return ('Which ensemble member the map shows, when "Single member" is selected. '
+            'The Up and Down arrow keys step through them.')
+
+
 # Menu names for the fields the download catalogue does not carry. A `TD_2M` written by
 # "Save field..." opens like any other file, and listing it as a bare code would make the
 # one map the user built by hand the only one in the menu without a name.
 EXTRA_FIELD_LABELS = {derived.DEW_POINT_FIELD: 'dew point'}
 
 
-def _field_label(field, view=None):
+def _field_label(field, view=None, family=None):
     """`FIELD - what it is`, for the Map shows combo.
 
     The catalogue answers this without opening the file, which matters: most of the maps
     in the list are still compressed on disk and expanding one costs 16 s. A file whose
     field the catalogue has never heard of falls back to its own header once it is open.
     """
-    product = download.BY_FIELD.get(field)
+    family = family or products.ENSEMBLE
+    product = family.by_field.get(field)
     if product is not None:
         return f'{field} - {product.label}'[:60]
     if field in EXTRA_FIELD_LABELS:
@@ -88,9 +111,9 @@ def _field_label(field, view=None):
 
 
 def _field_of(path):
-    """The FIELD in an `ICON_ENS_<run>_<FIELD>.nc[.bz2]` name, else the name itself."""
-    match = ingest.RUN_FILE_RE.match(Path(path).name)
-    return match.group('field') if match else Path(path).name
+    """The field in an `ICON_ENS_<run>_<FIELD>` / `IE_<run>_<field>` name, else the name."""
+    parsed = products.parse_name(Path(path).name)
+    return parsed[2] if parsed else Path(path).name
 
 
 def _finite_max(frame, fallback):
@@ -212,7 +235,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings = QtCore.QSettings('IMS', 'IconEnsembleViewer')
         self.ds = None
         self.t = 0
-        self.member = 0
+        # Index on the file's SECOND axis: an ensemble member, or a pressure level. One
+        # attribute for both, because everything below it -- `frame(t, member)`,
+        # `wind_vectors`, `direction_at` -- takes a position on that axis and does not
+        # care what the axis means.
+        self.level = 0
         self.point = None            # (iy, ix)
         self.scan = None
         self.decompressor = None
@@ -258,12 +285,14 @@ class MainWindow(QtWidgets.QMainWindow):
         font.setBold(True)
         title.setFont(font)
         vbox.addWidget(title)
-        hint = QtWidgets.QLabel('Open an ICON_ENS_*.nc or .nc.bz2 file to begin '
-                                '(you can also drag one onto this window)')
+        hint = QtWidgets.QLabel(
+            'Open an ICON_ENS_*.nc (ensemble) or IE_*.nc (deterministic, on pressure '
+            'levels) file to begin - .nc.bz2 works too, and you can drag one onto this '
+            'window')
         hint.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         hint.setStyleSheet('color:#666;')
         vbox.addWidget(hint)
-        button = QtWidgets.QPushButton('Open ICON ensemble file...')
+        button = QtWidgets.QPushButton('Open an IMS ICON file...')
         button.setFixedWidth(260)
         button.clicked.connect(self.open_dialog)
         vbox.addWidget(button, alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
@@ -374,11 +403,29 @@ class MainWindow(QtWidgets.QMainWindow):
         self.agg_combo.currentIndexChanged.connect(self._on_agg_changed)
         tb.addWidget(self.agg_combo)
 
-        self.member_combo = QtWidgets.QComboBox()
-        self.member_combo.setMinimumWidth(120)
-        self.member_combo.setEnabled(False)
-        self.member_combo.currentIndexChanged.connect(self._on_member_changed)
-        tb.addWidget(self.member_combo)
+        # The second-axis picker. On an ensemble it names a member; on a pressure-level
+        # file it names the level, and the two buttons beside it are the "up and down"
+        # that walk the column. Disabled, not hidden, when there is nothing to choose --
+        # the rule Rate, Wind barbs and Isolines already follow.
+        self.level_title = QtWidgets.QLabel(' Member: ')
+        tb.addWidget(self.level_title)
+        self.level_combo = QtWidgets.QComboBox()
+        self.level_combo.setMinimumWidth(120)
+        self.level_combo.setEnabled(False)
+        self.level_combo.currentIndexChanged.connect(self._on_level_selected)
+        tb.addWidget(self.level_combo)
+        self.level_up = QtWidgets.QToolButton()
+        self.level_up.setText('\u25b2')
+        self.level_up.setAutoRepeat(True)
+        self.level_up.setEnabled(False)
+        self.level_up.clicked.connect(lambda: self.step_level(1))
+        tb.addWidget(self.level_up)
+        self.level_down = QtWidgets.QToolButton()
+        self.level_down.setText('\u25bc')
+        self.level_down.setAutoRepeat(True)
+        self.level_down.setEnabled(False)
+        self.level_down.clicked.connect(lambda: self.step_level(-1))
+        tb.addWidget(self.level_down)
 
         tb.addWidget(QtWidgets.QLabel('  Colours: '))
         self.cmap_combo = QtWidgets.QComboBox()
@@ -447,6 +494,12 @@ class MainWindow(QtWidgets.QMainWindow):
         for keys, delta in (('Left', -1), ('Right', 1), ('Shift+Left', -6), ('Shift+Right', 6)):
             shortcut = QtGui.QShortcut(QtGui.QKeySequence(keys), self)
             shortcut.activated.connect(lambda d=delta: self.set_time(self.t + d))
+        # Left/right walk time; up/down walk the second axis. On a pressure-level file that
+        # is the column -- up goes higher into the atmosphere, which is not the same as
+        # "the next index", because a file may store its levels either way round.
+        for keys, delta in (('Up', 1), ('Down', -1)):
+            shortcut = QtGui.QShortcut(QtGui.QKeySequence(keys), self)
+            shortcut.activated.connect(lambda d=delta: self.step_level(d))
 
     # ---- F1: opening files -----------------------------------------------------
     def open_dialog(self):
@@ -455,7 +508,7 @@ class MainWindow(QtWidgets.QMainWindow):
             local = Path.cwd() / 'data'
             start = str(local if local.exists() else Path.cwd())
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, 'Open IMS ICON ensemble file', start, FILE_FILTER)
+            self, 'Open an IMS ICON file', start, FILE_FILTER)
         if path:
             self.open_path(path)
 
@@ -550,7 +603,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._stop_scan()
         self.ds = ds
         self.t = 0
-        self.member = 0
+        self.level = ds.axis.default_index
         self.stack.setCurrentIndex(1)
         self.setWindowTitle(f'IMS ICON Ensemble Viewer - {title}')
         self.status_left.setText(ds.summary())
@@ -558,6 +611,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.map.set_dataset(ds, geo.overlay_for(near or ds.path))
         self.plot.set_dataset(ds)
         self.readout.configure(ds)
+        # Before the colormap, which can trigger the first redraw: `refresh_map` reads the
+        # aggregation combo, and the previous file's mode must not draw this file's frame.
+        self._sync_agg_combo(ds)
+        self._sync_level_combo(ds)
         self._sync_colormap(ds)
 
         self._sync_field_combo()
@@ -565,13 +622,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._sync_rate_combo()
         # Cleared as well as set: this runs again for every field the user opens, and a
         # warning left over from the previous one would be pointing at nothing.
-        self.status_right.setText('\u26a0 incomplete file' if ds.truncation_note else '')
-        self.status_right.setToolTip(ds.truncation_note or '')
+        self._show_standing_note()
 
-        self.member_combo.blockSignals(True)
-        self.member_combo.clear()
-        self.member_combo.addItems(ds.member_labels)
-        self.member_combo.blockSignals(False)
         self.save_action.setEnabled(True)
         self._sync_barbs_check()
         self._sync_isolines_check()
@@ -588,6 +640,30 @@ class MainWindow(QtWidgets.QMainWindow):
         iy, ix = ds.ny // 2, ds.nx // 2
         self.select_point(iy, ix)
         self.set_time(0)
+
+    def _standing_note(self):
+        """The warning this file carries, if any: `(short text, full text)`.
+
+        Two of them, and both are about a file whose header does not say what it seems to:
+        one stops early (G26), the other could not name its own levels. Held as a method
+        rather than written into the status bar once, because the bar is also used for
+        transient messages -- and a transient one must put the standing warning BACK when
+        it is done, not blank it (`_on_scan_done`, where the truncation warning used to
+        vanish for any file whose range had not been cached yet).
+        """
+        notes = [note for note in
+                 (getattr(self.ds, 'truncation_note', None),
+                  getattr(self.ds, 'axis_note', None)) if note]
+        if not notes:
+            return '', ''
+        short = ('\u26a0 incomplete file'
+                 if getattr(self.ds, 'truncation_note', None) else '\u26a0 levels assumed')
+        return short, '\n\n'.join(notes)
+
+    def _show_standing_note(self):
+        short, full = self._standing_note()
+        self.status_right.setText(short)
+        self.status_right.setToolTip(full)
 
     # ---- the "Map shows" field selector -------------------------------------------
     def _field_entries(self):
@@ -613,21 +689,27 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.base_ds is None:
             return []
         run = f'{self.base_ds.run_init:%Y%m%d%H}'
+        family = self.base_ds.family or products.ENSEMBLE
         available = ingest.scan_for_fields(self._search_roots())
-        on_disk = {field: path for (found, field), path in available.items()
-                   if found == run}
+        on_disk = ingest.fields_of_run(available, family, run)
         # The open file itself may sit somewhere the scan does not look.
         on_disk.setdefault(self.base_ds.field, self.base_ds.path)
 
         entries = []
         for field in sorted(on_disk, key=derivedialog.field_sort_key):
             if field == self.base_ds.field:
-                entries.append(('base', _field_label(field, self.base_ds), None))
+                entries.append(('base', _field_label(field, self.base_ds, family), None))
             else:
-                entries.append((f'file:{field}', _field_label(field), on_disk[field]))
+                entries.append((f'file:{field}',
+                                _field_label(field, family=family), on_disk[field]))
 
-        needed = [derived.DEW_POINT_INPUTS[role][0] for role in ('temperature', 'humidity')]
-        if all(field in on_disk for field in needed):
+        # The derived entries ask the FAMILY which field plays each role: the ensemble's
+        # dew point comes from T_2M and RELHUM_2M, the deterministic run's from t_2m and
+        # rh_2m -- and the deterministic run also publishes td_2m itself, in which case
+        # the depression below is a difference of two files rather than a computation.
+        needed = [derived.role_field(family, role)
+                  for role in ('temperature', 'humidity')]
+        if all(field and field in on_disk for field in needed):
             paths = [on_disk[field] for field in needed]
             for kind, label in ((derivedialog.DEW_POINT,
                                  f'{derived.DEW_POINT_FIELD} - dew point'),
@@ -636,11 +718,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 entries.append((kind, label,
                                 derivedialog.DerivedRequest(kind, paths, label)))
 
-        wind = [derived.WIND_INPUTS[role][0] for role in ('zonal', 'meridional')]
-        if all(field in on_disk for field in wind):
-            label = f'{derived.WIND_FIELD} - wind speed + barbs'
-            entries.append((derivedialog.WIND, label, derivedialog.DerivedRequest(
-                derivedialog.WIND, [on_disk[field] for field in wind], label)))
+        # A run can offer two wind maps: the 10 m components, and (deterministic only)
+        # the 3-D ones, which is the wind at whatever level the Level control is on.
+        for pair in derived.wind_pairs_in(family, on_disk):
+            upper = pair == (family.roles.get('zonal_upper'),
+                             family.roles.get('meridional_upper'))
+            kind = derivedialog.WIND_UPPER if upper else derivedialog.WIND
+            label = (f'{derived.UPPER_WIND_FIELD} - wind speed + barbs (pressure levels)'
+                     if upper else f'{derived.WIND_FIELD} - wind speed + barbs')
+            entries.append((kind, label, derivedialog.DerivedRequest(
+                kind, [on_disk[field] for field in pair], label)))
 
         current = getattr(self.ds, 'derived_kind', 'base')
         if current != 'base' and not any(key == current for key, _l, _t in entries):
@@ -665,9 +752,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.field_combo.setEnabled(self.field_combo.count() > 1)
         self.field_combo.blockSignals(False)
         self.field_combo.setToolTip(
-            f'Maps of run {self.base_ds.run_init:%Y-%m-%d %H}Z found beside the open '
-            'file, in ./data or in the download cache, plus the fields that can be '
-            'derived from them.' if self.base_ds is not None else '')
+            f'{(self.base_ds.family or products.ENSEMBLE).title} maps of run '
+            f'{self.base_ds.run_init:%Y-%m-%d %H}Z found beside the open file, in ./data '
+            'or in the download cache, plus the fields that can be derived from them.'
+            if self.base_ds is not None else '')
 
     def _on_field_changed(self, _index):
         key = self.field_combo.currentData()
@@ -737,8 +825,9 @@ class MainWindow(QtWidgets.QMainWindow):
         """Dew point, dew point depression, or an A-B difference map."""
         near = self.ds.path if self.ds is not None else None
         run = f'{self.ds.run_init:%Y%m%d%H}' if self.ds is not None else None
+        family = getattr(self.base_ds, 'family', None) if self.base_ds is not None else None
         dialog = derivedialog.DerivedDialog(self, near=near, run=run,
-                                            roots=self._search_roots())
+                                            roots=self._search_roots(), family=family)
         if not dialog.available:
             self._error('No ICON ensemble files were found beside the open file, in '
                         './data, or in the cache. Open or download a run first.')
@@ -787,7 +876,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.ds is None:
             return
         run = f'{self.ds.run_init:%Y%m%d%H}'
-        name = f'ICON_ENS_{run}_{ncwrite.nc_variable_name(self.ds.field)}.nc'
+        family = getattr(self.ds, 'family', None) or products.ENSEMBLE
+        name = family.local_name(run, ncwrite.nc_variable_name(self.ds.field),
+                                 compressed=False)
         start = self.settings.value('last_dir', '') or str(Path.cwd())
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, 'Write field to NetCDF', str(Path(start) / name), 'NetCDF (*.nc)')
@@ -856,7 +947,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.scan.start()
 
     def _on_scan_done(self, result):
-        self.status_right.setText('')
+        self._show_standing_note()
         if result is not None and self.ds is not None:
             self._apply_range(self.ds.value_range)
 
@@ -878,8 +969,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         mode = self.agg_combo.currentData()
         if mode == 'member':
-            frame = self.ds.frame(self.t, self.member)
-            what = self.ds.member_labels[self.member]
+            frame = self.ds.frame(self.t, self.level)
+            what = self.ds.level_label(self.level)
         else:
             frame = self.ds.agg_frame(self.t, mode)
             what = self.agg_combo.currentText()
@@ -894,6 +985,14 @@ class MainWindow(QtWidgets.QMainWindow):
             lo, hi = self.ds.value_range
             if mode == 'spread':
                 lo, hi = 0.0, _finite_max(frame, 1.0)
+            elif not self.ds.axis.aggregatable:
+                # A column spans the whole troposphere, so one level coloured against the
+                # file's range is a single flat shade. Each level has its own cached range
+                # (`EnsembleFile.level_range`): still fixed while time is scrubbed, which
+                # is what R1's "Dataset range" is for, but fixed to something with contrast.
+                per_level = self.ds.level_range(self.level)
+                if per_level is not None:
+                    lo, hi = per_level
         else:
             lo, hi = _finite_min(frame, 0.0), _finite_max(frame, 1.0)
         if sort is None and getattr(self.ds, 'diverging', False) and mode != 'spread':
@@ -992,7 +1091,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return ''
         # `t` and `member` are read when the map asks, not captured now, so a wheel zoom
         # between two redraws still draws the step that is on screen.
-        self.map.set_wind(lambda rows, cols: vectors(self.t, mode, self.member,
+        self.map.set_wind(lambda rows, cols: vectors(self.t, mode, self.level,
                                                      rows, cols))
         return self.ds.barb_label(mode)
 
@@ -1062,6 +1161,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.point = (iy, ix)
         series = self.ds.series(iy, ix)
         self.plot.set_series(series)
+        self.plot.set_level(self.level)
         lat, lon = float(self.ds.lat[iy]), float(self.ds.lon[ix])
         self.map.set_marker(lat, lon)
         self.readout.set_point(lat, lon)
@@ -1070,11 +1170,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_readout(self.t, hovering=False)
 
     def _update_readout(self, t, hovering):
+        """The six ensemble statistics, or the column's reading at the chosen level.
+
+        Which one is decided by the file's axis, in one place, so the panel and the
+        numbers in it can never disagree about what they are describing.
+        """
         if self.ds is None or self.point is None or self.plot.series is None:
             return
         t = int(np.clip(t, 0, self.ds.n_times - 1))
-        self.readout.show_stats(self.ds.label_for(t),
-                                member_stats(self.plot.series[t]), hovering)
+        values = self.plot.series[t]
+        stats = (member_stats(values) if self.ds.axis.aggregatable else
+                 level_stats(values, self.ds.member_labels, self.level))
+        self.readout.show_stats(self.ds.label_for(t), stats, hovering)
 
     # ---- signals ---------------------------------------------------------------
     def _on_hover(self, t):
@@ -1096,18 +1203,110 @@ class MainWindow(QtWidgets.QMainWindow):
             if direction is not None:
                 iy, ix = self.ds.nearest_index(lat, lon)
                 degrees = direction(self.t, iy, ix, self.agg_combo.currentData(),
-                                    self.member)
+                                    self.level)
                 text += f'   from {degrees:.0f}°'
         self.status_right.setText(text)
 
     def _on_agg_changed(self):
-        self.member_combo.setEnabled(self.agg_combo.currentData() == 'member')
+        self._sync_level_enabled()
         self.refresh_map()
 
-    def _on_member_changed(self, index):
-        self.member = max(0, index)
+    # ---- the second axis: members, or pressure levels ------------------------------
+    def _sync_agg_combo(self, ds):
+        """Offer the aggregations the file's second axis actually supports.
+
+        An ensemble gets all six. A column of pressure levels gets one entry -- the map
+        shows a level at a time -- and the combo is disabled with a tooltip saying why,
+        rather than silently dropping five entries the user might go looking for.
+        """
+        across = ds.axis.aggregatable
+        choices = AGG_CHOICES if across else LEVEL_CHOICES
+        self.agg_combo.blockSignals(True)
+        self.agg_combo.clear()
+        for label, key in choices:
+            self.agg_combo.addItem(label, key)
+        self.agg_combo.setCurrentIndex(0)
+        self.agg_combo.setEnabled(across)
+        self.agg_combo.blockSignals(False)
+        self.agg_combo.setToolTip(
+            'What the map shows across the 20 ensemble members' if across else
+            f'{ds.display_name} is on {ds.axis.describe()}, not on ensemble members. A '
+            'mean or a spread across a column of pressure levels is not a quantity '
+            'anyone forecasts, so the map shows one level at a time.')
+
+    def _level_entries(self, axis):
+        """-> [(label, index)] in the order the combo lists them.
+
+        A pressure axis is listed with the TOP OF THE ATMOSPHERE FIRST, so the list reads
+        like a vertical profile and "up" means up in both senses -- up the list and up the
+        column. It also means the Up key and the Up button agree with the combo's own
+        keyboard behaviour instead of fighting it.
+        """
+        if axis.is_pressure:
+            return [(axis.labels[i], i) for i in reversed(axis.upward)]
+        return [(axis.labels[i], i) for i in range(axis.n)]
+
+    def _sync_level_combo(self, ds):
+        self.level_title.setText(f' {ds.axis.selector_label}: ')
+        self.level_combo.blockSignals(True)
+        self.level_combo.clear()
+        for label, index in self._level_entries(ds.axis):
+            self.level_combo.addItem(label, index)
+        self.level_combo.setCurrentIndex(max(0, self.level_combo.findData(self.level)))
+        self.level_combo.blockSignals(False)
+        for widget in (self.level_combo, self.level_up, self.level_down):
+            widget.setToolTip(_level_tooltip(ds))
+        self.level_up.setToolTip(self.level_up.toolTip() + '\n\nUp arrow')
+        self.level_down.setToolTip(self.level_down.toolTip() + '\n\nDown arrow')
+        self._sync_level_enabled()
+
+    def _sync_level_enabled(self):
+        """The picker is live whenever the map is showing ONE position on the axis."""
+        single = (self.ds is not None and self.ds.n_members > 1
+                  and self.agg_combo.currentData() == 'member')
+        for widget in (self.level_combo, self.level_up, self.level_down):
+            widget.setEnabled(single)
+
+    def _on_level_selected(self, _index):
+        data = self.level_combo.currentData()
+        if data is not None:
+            self.set_level(int(data))
+
+    def set_level(self, index):
+        """Show one position on the second axis: `member 03`, or `850 hPa`."""
+        if self.ds is None:
+            return
+        index = int(np.clip(index, 0, self.ds.n_members - 1))
+        self.level = index
+        position = self.level_combo.findData(index)
+        if position >= 0 and self.level_combo.currentIndex() != position:
+            self.level_combo.blockSignals(True)
+            self.level_combo.setCurrentIndex(position)
+            self.level_combo.blockSignals(False)
+        self.plot.set_level(index)
         if self.agg_combo.currentData() == 'member':
             self.refresh_map()
+        self._update_readout(self.t, hovering=False)
+
+    def step_level(self, delta):
+        """Move one position UP (delta > 0) or DOWN the axis -- the up/down buttons.
+
+        Up is up the atmosphere, not up the index: `LevelAxis.step` orders by pressure, so
+        the key does the same thing whichever way round a file stores its levels.
+
+        On an ensemble the map may be showing a mean rather than a member, and stepping
+        "to the next member" while the map shows the mean would change nothing visible.
+        So the aggregation switches to Single member first: the title then says which
+        member is on screen, which is what the key was asking for.
+        """
+        if self.ds is None or self.ds.n_members < 2:
+            return
+        if self.agg_combo.currentData() != 'member':
+            keys = [self.agg_combo.itemData(i) for i in range(self.agg_combo.count())]
+            if 'member' not in keys:
+                return
+            self.agg_combo.setCurrentIndex(keys.index('member'))    # fires _on_agg_changed
+        self.set_level(self.ds.axis.step(self.level, delta))
 
     def _sync_units_combo(self):
         """Reflect what the registry offers for this field (v2 1.3/1.4)."""

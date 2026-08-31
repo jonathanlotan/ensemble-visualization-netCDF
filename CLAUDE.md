@@ -1623,3 +1623,325 @@ python tools/build_mapdata.py --fetch                       # rebuild the bundle
 Nothing new on the toolbar. **Colours** still chooses the ramp, and the transparency
 follows the scale rather than a switch — which is the point: it appears on the maps where
 zero means nothing happened, and nowhere else.
+
+---
+
+# Release 7 — the deterministic run, and pressure levels
+
+Requested 2026-08-31: *when downloading IMS ICON maps, rather than ensembles, the up and
+down button will move through pressure levels, and instead of single members, it will say
+the correct pressure level.* Section 0 (byte math), R1 (the two-panel viewer), R2 (the one
+transform layer), R3 (derived fields), R4 (the wind map), R5 (isolines and the sort scale)
+and R6 (the transparent zero and the grey land) are unchanged and still the contract.
+
+## R7.0 What the second product is — and which of this is measured
+
+`IMS_ICON_manual.pdf` describes the **deterministic ICON-LAM run**, which is the same
+model as the ensemble, published separately:
+
+| | ensemble (R1–R6) | deterministic (this release) |
+|---|---|---|
+| file | `ICON_ENS_<YYYYMMDDHH>_<FIELD>.nc.bz2` | `IE_<YYYYMMDDHH>_<field>.nc.bz2` |
+| runs | 00Z only, one a day | **00Z and 12Z** |
+| range | +120 h | +90 h |
+| fields | 15, all 2-D | **48**, six of them 3-D |
+| second axis | **20 ensemble members** (G1) | **20 pressure levels**, or nothing |
+| levels | — | 1000 975 950 925 900 875 850 825 800 750 700 650 600 500 400 350 300 250 200 150 hPa |
+
+**Section 0 is measured; this section is not.** The 15 ensemble fields, their units and
+their byte layout were read off real files (0.2, 0.4). Everything about the deterministic
+product here — the 48 field names, their units, which of them accumulate, and the server
+folder — is **transcribed from the manual**, because the credentials for that folder were
+not available in this environment. That difference is why the release leans so hard on
+guards rather than on assumptions:
+
+* a units string this build does not expect means **warn and offer no conversion** (v2
+  1.3), so a wrong registry row costs a conversion and can never corrupt a reading;
+* the level axis is read out of the **file**, never out of the catalogue, except in the
+  one fallback below — which says so on screen;
+* the folder `/ims/IMS_ICON/` is **inferred** from the server's own layout (the ensemble
+  is in `/ims/IMS_ICON_ENSEMBLE/`, the ICON manuals and topography in
+  `/ims/MANUALS/IMS_ICON/`). It could not be confirmed: the server answers **401 to every
+  unauthenticated path, real or not**, so a probe cannot tell a wrong folder from a
+  private one. `IMS_ICON_URL` overrides it without a new build, and the download dialog
+  says so when a listing comes back empty.
+
+## R7.1 The shape of it
+
+One question runs through every part of this release: **what is the second axis of this
+file?** It is answered once, in one small module, and everything else asks that object.
+
+```
+   IE_<run>_<field>.nc ──nc3──► field var + its 2nd dim's coordinate
+                                            │
+                                            ▼
+                                levels.axis_for(...)  ──►  LevelAxis
+                                            │              kind = member | pressure | single
+   ICON_ENS_<run>_<FIELD>.nc ──nc3──────────┘              labels, values, note
+                                            │
+                    ┌───────────────────────┼─────────────────────────┐
+                    ▼                       ▼                         ▼
+              EnsembleFile            MainWindow                  PlotView
+          n_members, member_labels   Level combo, ▲▼, agg list   curves, mean?
+                                      title, readout rows
+```
+
+`n_members` and `member_labels` keep their names and are now *the axis'* length and
+labels, so every R1–R6 reader of them — the map, the graph, the readout, `ncwrite`, the
+derived views — keeps working with no change and no special case.
+
+| file | responsibility |
+|---|---|
+| `imsicon/products.py` | the two families: name grammar, server folder, catalogue, and which field plays which role. **New, and the only place that knows how these files are named** |
+| `imsicon/levels.py` | `LevelAxis`, the detection rules, and `step` — "up" as a physical direction |
+| `imsicon/nc3.py` | `data_variables`/`field_name` accept a 3-D or 4-D variable of any name; `level_coordinate` reads the second dim's coordinate |
+| `imsicon/dataset.py` | `EnsembleFile.axis`, a 3-D surface field, `level_stats`, per-level ranges |
+| `imsicon/transform.py` | `field_key` (one registry for both spellings) + the 48 fields' units and accumulation kinds |
+| `imsicon/ui/main.py` | the Level combo, the ▲▼ buttons, Up/Down, the aggregation list, the title, the readout choice |
+| `imsicon/ui/readout.py` | a second row set for a column |
+| `imsicon/ui/plotview.py` | no mean/envelope across levels; the chosen level drawn heavier |
+| `imsicon/ui/downloaddialog.py` | a **Product** combo, and a Levels column |
+
+## R7.2 The axis is decided from the file, not from the file name
+
+`levels.axis_for` tries four things, in descending order of how much they are worth
+trusting:
+
+1. **One plane ⇒ `single`.** The deterministic run's surface fields are `(time, lat, lon)`
+   with no vertical dimension at all; `EnsembleFile` inserts one so every accessor keeps
+   its shape, and the picker has nothing to offer.
+2. **The coordinate values say it.** Distinct positive values with pressure units — or
+   with no units but unmistakably in a pressure range — *are* the levels. `Pa` is scaled
+   to hPa, because a chart is read in hPa and `85000 hPa` is not a pressure. This is the
+   only branch that can label a file this build has never seen, and it is the one that
+   normally fires.
+3. **The catalogue says the field is 3-D and the count matches the manual's ladder.** Only
+   when the file's own coordinate is degenerate — the ensemble's `sfc` axis is 20 zeros
+   (**G1**), and a deterministic file merged the same way would be too. The levels are
+   then the manual's, in the manual's order, and **`axis_note` says so out loud**: the
+   status bar reads `⚠ levels assumed` with the full reason in its tooltip. An assumed
+   order that happened to be reversed would label every map wrongly while looking entirely
+   normal, which is exactly the class of failure this codebase's gotchas are about.
+4. **Otherwise it is the ensemble's members**, named from `history` (**G1**), unchanged.
+
+## R7.3 Up is up the atmosphere — which is not the same as `+1`
+
+This is the requested behaviour and the one piece of it that is easy to get wrong.
+
+* The **Level combo lists the top of the atmosphere first** (150 hPa … 1000 hPa), so the
+  list reads like a vertical profile and "up" means up the list *and* up the column
+  instead of fighting the combo's own keyboard behaviour.
+* **`LevelAxis.step` orders by pressure, not by index** (**G40**). Up from 850 hPa is
+  825 hPa whichever way round the file stores its coordinate; a file in ascending pressure
+  and a file in descending pressure behave identically. Stepping **clamps** at both ends
+  rather than wrapping, so holding the key stops at the top of the column instead of
+  jumping back to the ground.
+* Two toolbar buttons (**▲ ▼**, auto-repeating) and the **Up / Down arrow keys** do the
+  same thing — left/right still walk time, so the four arrows are "where" and "when".
+* A file opens on **850 hPa**, the conventional low-level chart, and the map title always
+  names the level, so it is a starting point rather than a hidden assumption.
+* On an **ensemble**, Up/Down step the member and switch the map to *Single member* first.
+  Stepping "to the next member" while the map shows the ensemble mean would change nothing
+  visible; switching makes the key do what it was asking for, and the title then says
+  which member is on screen.
+
+The map title, the graph, the readout and the status bar all name the position the same
+way, from `ds.level_label(i)`: `temp [°C] - 850 hPa - 2026-08-31 03:00Z (+3 h)`.
+
+## R7.4 What must not be computed across a column
+
+An ensemble is 20 samples of one quantity, so a mean, a spread and a percentile across it
+are the whole point. **A column of pressure levels is not.** The mean of the temperature
+at 1000 hPa and at 150 hPa is not a temperature anyone forecasts, and a "P90 across
+levels" is meaningless in exactly the way a linear mean of compass directions is
+(**G16**) — and just as plausible-looking. So `LevelAxis.aggregatable` is False for a
+pressure axis, and:
+
+* the **aggregation combo** carries one entry, *Single level*, and is disabled with a
+  tooltip saying why (disabled, not hidden — the rule Rate, Wind barbs and Isolines
+  already follow);
+* the **graph** still draws all 20 curves, which is a time-height section of one point and
+  worth reading, but **not** the ensemble mean or the min–max envelope. The selected
+  level's curve is drawn heavier instead, so the up/down keys show as movement;
+* the **readout** switches to a row set that reports the column honestly: the level shown,
+  the value there, and the highest and lowest in the column **named by the level they
+  occur at** (`Highest in column  6.65 °C @ 1000 hPa`). A surface field, having one level,
+  drops those last two rather than repeating the value above them;
+* the **wind barbs** say `barbs (kt): the wind at this level` rather than naming a member
+  that does not exist.
+
+## R7.5 One level's colours, not the whole column's
+
+A temperature column spans about 60 °C between 1000 and 150 hPa, so colouring one level
+against the file's range paints every map a single flat shade — measured on the test file:
+the 850 hPa map came out uniformly red across the whole domain. **Each position on the
+axis therefore carries its own cached range**, collected in the same background pass as
+the global one, and *Dataset range* uses it. Scrubbing time at one level is still fixed,
+which is what R1's fixed scale is for; switching level rescales, which is the only way a
+level's own gradient can be seen. The sidecar gains an optional `levels` list inside its
+schema-2 entry, so an existing cache still loads and simply has no per-level detail.
+
+## R7.6 The downloader
+
+**Download…** grows a **Product** combo: *IMS ICON ensemble* or *IMS ICON deterministic
+(ICON-LAM)*. Switching re-lists the other folder **on the session already open**, so the
+password is typed once. The field list gains a **Levels** column — `20 pressure levels` or
+`surface` — which is the difference the user is choosing between, said before 262 MB is
+spent rather than after. *Select what the wind map needs* ticks that family's components.
+
+Everything else is the R3 downloader unchanged, including **G27**: the name written to
+disk is rebuilt from the validated `run` and `field` captures, never echoed back from the
+listing, for `IE_` names exactly as for `ICON_ENS_` ones.
+
+## R7.7 What the two families share, and what they must never share
+
+The field name is the registry key, and the two families spell the same quantity
+differently (`TOT_PREC` and `tot_prec`, `T_2M` and `t_2m`). Since they are the same
+physical quantity out of the same model, `products.field_key` folds the case and **one**
+registry serves both: the deterministic `t_2m` gets °C by default, `temp` on pressure
+levels is contoured at the same 1 °C a 2 m temperature is, `clct` gets the **G22** cloud
+gate, and `tot_prec` gets the **G14** de-accumulation. What is *not* folded is anything a
+name is parsed back out of — the file name, the NetCDF variable, the settings key —
+because those identify a file rather than a quantity.
+
+What they must never share is a *forecast*. The two products publish the **same run id**
+with different contents and, in principle, different grids, so:
+
+* `ingest.scan_for_fields` keys on `(family, run, field)`, and **Map shows** lists one
+  family's maps only;
+* `derived.check_pairable` refuses two files whose axes are of different kinds, before it
+  compares anything else, with a message that says an ensemble member is not a pressure
+  level.
+
+Within the deterministic family the derived fields work as they always did, and two of
+them are new in substance rather than in code: `t_2m − td_2m` is recognised as the
+**depression** (through `field_key`, so the run's *published* dew point lands on the same
+name, the same 0.5 °C isolines and the same R5 sort band as the ensemble's computed one),
+and the **wind map can be built from the 3-D `u`/`v`** — barbs at 850 or 300 hPa, from
+the R4 machinery unchanged, under the name `WSPD` rather than `WSPD_10M` because saying
+"10m" over a 300 hPa map would be a plain misstatement.
+
+## R7.8 Measured, not assumed
+
+On this machine, on a synthetic file at the real spatial resolution (261×161, 20 levels,
+6 steps). The last row is the calibration point: a plain ensemble field's aggregated map,
+measured in the same session, so these numbers can be read against R3.5's and R5.4's.
+
+| operation | ms |
+|---|---|
+| read one level's frame | **0.01** |
+| read the whole column at one time step | 2.39 |
+| point time series (20 levels × 6 steps) | 0.004 |
+| `refresh_map`, one level, isolines off | 0.48 |
+| `refresh_map`, one level, isolines on | 2.92 |
+| **`set_level` — map, graph highlight and readout together** | **2.96** |
+| ensemble `refresh_map`, mean of 20 members (calibration) | 3.59 |
+| ensemble `refresh_map`, single member (calibration) | 0.38 |
+
+So stepping a level costs about what redrawing one frame costs, well inside v2's 16.7 ms
+budget, and a level map is *cheaper* than an ensemble mean because it reads one plane
+instead of aggregating twenty.
+
+| claim | measurement |
+|---|---|
+| the per-level ranges are nearly free | one scan collecting both: **12 ms against 9 ms** for the global range alone, over 6 steps — a third more on a pass that is 0.6 s for a real 407 MB file |
+| a level's own range has contrast the column's does not | on the test file: global −50.7…13.1 °C, **850 hPa −12.2…4.8 °C**, 500 hPa −31.5…−14.5 °C |
+| a written pressure file reopens as itself | values equal to 1e-3, labels identical, `plev` in hPa, and **no fabricated member history** |
+| the sampling of a level is the file's own bytes | every level's frame equals what was written, and `series` equals the column at that point |
+| the two families do not collide on one run | `('ens', run, 'T_2M')` and `('icon', run, 't_2m')` in one directory scan, each listed only under its own product |
+
+## R7.9 Gotchas found while building v7
+
+* **G39 — the second axis cannot be identified from its dimension's NAME.** The ensemble's
+  is called `sfc` and tagged `axis="Z"`, `long_name="surface"` — and holds 20 members
+  (**G1**). A pressure file's may be called anything. So the decision is made from the
+  coordinate *values* and their units, with the dimension name only allowed to break a tie
+  when the units are missing, and the field catalogue only as a last resort that announces
+  itself. Deciding from the name would have read the ensemble as 20 levels of 0 hPa.
+* **G40 — "up" is not `+1`.** A level coordinate may ascend or descend in the file, and
+  both are ordinary. Stepping by index therefore walks *down* the atmosphere in half the
+  files it meets, silently, and a map labelled `700 hPa` would still be correct — only the
+  key would be wrong. `LevelAxis.step` orders by pressure, and the combo is listed in the
+  same order so the control and the key cannot disagree.
+* **G41 — a column's dataset range flattens every map in it.** 60 °C of range across the
+  troposphere against ~17 °C within one level: the first render of an 850 hPa map was one
+  uniform red rectangle, with the colorbar spanning −50…+13 °C. Fixed with a per-level
+  cached range (R7.5). Worth noticing that this is the *same* failure R1's fixed scale
+  exists to prevent, arriving from the other direction — a scale can be too stable.
+* **G42 — a transient status message must put the standing warning BACK.** The status bar
+  is used both for a file's standing warning (`⚠ incomplete file`, and now `⚠ levels
+  assumed`) and for progress (`scanning for dataset range...`). `_on_scan_done` cleared it
+  to `''`, so the truncation warning **G26** exists to raise had been vanishing on every
+  file whose range was not already cached — since R1, unnoticed, because the tests that
+  cover it happen to hit the cached path. There is now one `_show_standing_note()` and the
+  transient message restores it.
+* **G43 — `<FIELD>_eps` is a claim, not a suffix.** `eps` means ensemble. `ncwrite` used
+  to append it to every variable it wrote, which on a saved pressure-level or surface
+  field would tell the next reader — and `nc3.field_name`, and a human with `ncdump` —
+  that the file holds an ensemble it does not hold. It is now written only for a file
+  whose axis really is one, and the same rule governs the `history` line: a level file
+  gets no fabricated `ICON_ENS_<run>_<member>_` tokens for `member_labels` to read back.
+
+## R7.10 Status — shipped and verified 2026-08-31
+
+`530 passed, 28 skipped` — 476 from R1–R6, unchanged and green, + 54 new (one assertion in
+`test_rate.py` was re-scoped, not weakened: it pinned the accumulation table exactly, and
+now pins the ensemble's 15 fields within it while `test_levels.py` pins the deterministic
+run's). The skips are the tests that need the 407 MB reference file, which is gitignored.
+
+| item | where | verified by |
+|---|---|---|
+| the axis, read from the file | `levels.py`, `nc3.py`, `dataset.py` | `test_levels.py` (30) — hPa and Pa coordinates; the ensemble's `sfc` still members; a 3-D surface field; the manual fallback *and its note*; a non-pressure coordinate refused; values read back per level |
+| **up and down** | `levels.LevelAxis.step`, `ui/main.py` | `test_levels.py`, `test_ui_levels.py` (24) — up is lower pressure in a file stored either way round; clamping at both ends; the ▲▼ buttons and the keys agree; the map really changes to that level's data |
+| **the level, not the member** | `ui/main.py`, `ui/readout.py`, `ui/plotview.py` | `test_ui_levels.py` — the picker lists `850 hPa` top-first, the title says it, the status bar counts levels, the readout switches row sets, the graph drops the mean and highlights the level |
+| nothing aggregated across a column | `levels.py`, `ui/main.py` | `test_ui_levels.py` — one aggregation entry, disabled, with the reason in its tooltip |
+| the ensemble is untouched | `ui/main.py` | `test_ui_levels.py` — six aggregations, member names, the mean curve, the six F4 rows; and switching between the two products in one window restores every control |
+| the downloader | `products.py`, `download.py`, `ui/downloaddialog.py` | `test_levels.py`, `test_ui_levels.py` — the `IE_` listing parsed, `local_name` rebuilt (**G27**), the folder overridable, the Product combo, the Levels column |
+| pairing and derived fields | `derived.py` | `test_levels.py` — an ensemble and a column refused as a pair; two different ladders refused; the wind map on levels; the native `t_2m − td_2m` recognised as T-Td |
+| writing one back | `ncwrite.py` | `test_levels.py` — levels survive, a surface field stays `(time, lat, lon)`, no member history invented |
+
+End to end under `QT_QPA_PLATFORM=offscreen`, on a 261×161×20 deterministic run: `temp`
+opens at 850 hPa with 1 °C isolines over the bundled coastline and a colorbar that fits
+the level; `--level 500` and the ▲▼ buttons move it; `--derive wind` on `u` draws barbs at
+300 hPa in knots; `--difference t_2m td_2m --sort` opens as `T-Td` with the R5 band;
+`--level 500 --write` produces a file that reopens as the same 20 levels; and the
+synthetic ensemble still renders exactly as it did in R6.
+
+## R7.11 Deliberately not done
+
+* **A dew point on pressure levels.** `temp` + `rh` would give one, and the formula does
+  not care what the second axis is — but the roles that feed *Derived field…* name the
+  2 m pair, and an upper-air dew point is read as a depression against `temp` rather than
+  on its own. It is a table entry away when someone asks for it.
+* **A cross-section or a tephigram.** The graph is already a time-height section at a
+  point; a *pressure*-height section (value against level, at one time) is the natural
+  next panel and a different piece of work.
+* **Renaming the app.** The window still says "IMS ICON Ensemble Viewer" and the settings
+  still live under `IconEnsembleViewer`. It opens both products now, so the name is half
+  right — but what an app is called, and the settings key that goes with it, is the user's
+  call, not a side effect of adding a product.
+* **A live test against the deterministic folder.** Every downloader test drives a fake
+  session with real `Range` semantics, exactly as in R3.6; the folder itself and the 48
+  fields' real units remain unmeasured until someone runs it with credentials. The first
+  thing to do then is `python tools/sniff_headers.py`, which settles a field's units from a
+  4 MiB prefix instead of a 262 MB download.
+* **12Z vs 00Z run comparison.** The deterministic run publishes twice a day, which makes
+  run-to-run consistency newly cheap to look at — and it needs alignment on *valid* time,
+  which `check_pairable` still refuses (R3.6).
+
+## R7.12 Running it
+
+```bash
+venv/bin/python -m imsicon                                   # Download... -> Product: deterministic
+venv/bin/python -m imsicon data/IE_2026083100_temp.nc        # opens at 850 hPa
+venv/bin/python -m imsicon --level 500 data/IE_2026083100_temp.nc
+venv/bin/python -m imsicon --derive wind --level 300 --units kt data/IE_2026083100_u.nc
+venv/bin/python -m imsicon --difference t_2m td_2m --sort data/IE_2026083100_t_2m.nc
+IMS_ICON_URL=https://.../ims/SOME_OTHER_FOLDER/ venv/bin/python -m imsicon   # if the folder moved
+```
+
+Toolbar row 1 now reads **Map shows: [field] [aggregation] Level: [850 hPa] ▲ ▼**. On a
+pressure file the aggregation is fixed at *Single level*; on an ensemble it is the six
+R1 choices and the picker names members instead. **Up** and **Down** step the axis from
+anywhere in the window: up the atmosphere on a column, and to the next member (switching
+the map to that member) on an ensemble.

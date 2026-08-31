@@ -14,16 +14,29 @@ Security rules, all of them load-bearing:
   Credential Manager / macOS Keychain) first, `IMS_USER`/`IMS_PASS` second, prompt last.
   They are never logged, never put in a URL or query string, and a failure says
   "authentication failed" without echoing what was tried.
-* **The listing is UNTRUSTED input.** Only `ICON_ENS_<10 digits>_<FIELD>.nc.bz2` is
-  accepted, by a strict regex; everything else in the HTML is ignored, and a local path is
-  never built from a server string without `Path(name).name` on top of that (G27).
+* **The listing is UNTRUSTED input.** Only a name matching the family's grammar --
+  `ICON_ENS_<10 digits>_<FIELD>.nc.bz2`, or `IE_<10 digits>_<field>.nc.bz2` for the
+  deterministic run -- is accepted, by a strict regex; everything else in the HTML is
+  ignored, and a local path is never built from a server string without rebuilding it from
+  the validated captures (G27).
+
+Two families are offered (see `products.py`): the **ensemble**, whose second data axis is
+20 members, and the **deterministic ICON-LAM run**, six of whose fields are 3-D on 20
+pressure levels. They differ only in the folder, the name grammar and the catalogue, so
+everything below takes a `family` and nothing below knows which one it is holding.
 """
 import os
 import re
 import shutil
 from pathlib import Path
 
-BASE = 'https://data.israel-meteo-service.org/ims/IMS_ICON_ENSEMBLE/'
+from . import products
+from .products import ENSEMBLE, ICON, FAMILIES     # noqa: F401  (re-exported)
+
+BASE = ENSEMBLE.base_url
+# The deterministic folder is inferred rather than measured (products.py). This env var
+# points the app at the right one without a code change if the inference is wrong.
+ICON_URL_ENV = 'IMS_ICON_URL'
 CHUNK = 1 << 20
 TIMEOUT = 120
 MIN_FREE_BYTES = 1 << 30        # refuse to start a 262 MB download under 1 GB free
@@ -49,46 +62,16 @@ class Cancelled(Exception):
 
 
 # ---- the catalogue: "choose a map (cape, precipitation or other)" ----------------------
-# One file per field per run (CLAUDE.md 0.2). `group` only drives how the dialog sorts the
-# list; `field` is what the file name is built from.
-class Product:
-    __slots__ = ('field', 'label', 'group', 'note')
-
-    def __init__(self, field, label, group, note=''):
-        self.field, self.label, self.group, self.note = field, label, group, note
-
-    def __repr__(self):
-        return f'<Product {self.field}>'
+# One file per field per run (CLAUDE.md 0.2, and Table 1 of IMS_ICON_manual.pdf). Both
+# catalogues live in `products.py`, because `ingest.py` needs the same naming rules to
+# find those files again on disk and two copies would drift.
+Product = products.Product
 
 
-PRODUCTS = (
-    Product('CAPE_ML', 'CAPE - instability', 'Convection',
-            'CAPE of the mean surface layer parcel [J kg-1] - the "cape index"'),
-    Product('TOT_PREC', 'Precipitation - total', 'Convection',
-            'accumulated since model start [kg m-2 = mm]; the viewer can show 1 h / 3 h rates'),
-    Product('T_2M', 'Temperature - 2 m', 'Temperature and humidity',
-            'stored in K, shown in °C by default'),
-    Product('T_S', 'Temperature - surface', 'Temperature and humidity',
-            'weighted surface temperature, stored in K'),
-    Product('RELHUM_2M', 'Relative humidity - 2 m', 'Temperature and humidity',
-            'needed, with T_2M, to derive the dew point'),
-    Product('U_10M', 'Wind - zonal component (U) 10 m', 'Wind', 'm s-1, positive eastward'),
-    Product('V_10M', 'Wind - meridional component (V) 10 m', 'Wind',
-            'm s-1, positive northward'),
-    Product('VMAX_10M', 'Wind - gust at 10 m', 'Wind',
-            'max since the previous full hour - already per-interval, never de-accumulate'),
-    Product('CLCT', 'Cloud cover - total', 'Cloud', '%'),
-    Product('CLCL', 'Cloud cover - low', 'Cloud', '%'),
-    Product('CLCM', 'Cloud cover - medium', 'Cloud', '%'),
-    Product('CLCH', 'Cloud cover - high', 'Cloud', '%'),
-    Product('ASWDIFD_S', 'Solar radiation - diffuse downward', 'Radiation',
-            'W m-2, stored as a MEAN since model start'),
-    Product('ASWDIR_S', 'Solar radiation - direct downward', 'Radiation',
-            'W m-2, stored as a MEAN since model start'),
-    Product('H_SNOW', 'Snow depth', 'Surface', 'm; ~all zero in summer'),
-)
-BY_FIELD = {p.field: p for p in PRODUCTS}
-GROUPS = tuple(dict.fromkeys(p.group for p in PRODUCTS))
+# The ensemble catalogue, under the names the rest of the app has always imported.
+PRODUCTS = ENSEMBLE.products
+BY_FIELD = ENSEMBLE.by_field
+GROUPS = ENSEMBLE.groups
 
 # The two fields the dew point is derived from (derived.dew_point).
 DEW_POINT_FIELDS = ('T_2M', 'RELHUM_2M')
@@ -97,9 +80,36 @@ DEW_POINT_FIELDS = ('T_2M', 'RELHUM_2M')
 WIND_FIELDS = ('U_10M', 'V_10M')
 
 
-def product_label(field):
-    product = BY_FIELD.get(field)
-    return product.label if product else field
+def role_fields(family, roles):
+    """The fields playing `roles` in `family`, or () when it does not have them all."""
+    fields = tuple(family.roles.get(role) for role in roles)
+    return fields if all(fields) else ()
+
+
+def dew_point_fields(family=ENSEMBLE):
+    return role_fields(family, ('temperature', 'humidity'))
+
+
+def wind_fields(family=ENSEMBLE):
+    return role_fields(family, ('zonal', 'meridional'))
+
+
+def base_url(family=ENSEMBLE):
+    """Where a family's files are listed. `IMS_ICON_URL` overrides the deterministic one.
+
+    The ensemble folder is measured (CLAUDE.md 0.1); the deterministic folder is inferred
+    from the server's layout and could not be confirmed without credentials, so it is the
+    one that can be pointed elsewhere without a new build.
+    """
+    if family is ICON:
+        override = (os.environ.get(ICON_URL_ENV) or '').strip()
+        if override:
+            return override if override.endswith('/') else override + '/'
+    return family.base_url
+
+
+def product_label(field, family=ENSEMBLE):
+    return family.label_for(field)
 
 
 # ---- credentials -----------------------------------------------------------------------
@@ -179,7 +189,7 @@ def make_session(user, password):
 # ---- the listing -----------------------------------------------------------------------
 # Strict: 10-digit run id, upper-case field, exactly this extension. Anything else in the
 # server's HTML is ignored rather than interpreted.
-NAME_RE = re.compile(r'^ICON_ENS_(?P<run>\d{10})_(?P<field>[A-Z0-9_]+)\.nc\.bz2$')
+NAME_RE = ENSEMBLE.name_re
 _ANCHOR_RE = re.compile(r'<a\b[^>]*?href\s*=\s*["\']([^"\']*)["\'][^>]*>(.*?)</a>',
                         re.IGNORECASE | re.DOTALL)
 # A size is a standalone integer. The lookarounds exclude the digits of the timestamp that
@@ -190,19 +200,25 @@ _SIZE_TOKEN = re.compile(r'(?<![\d.,:/\-])(\d[\d,]*)(?![\d.,:/\-])')
 
 
 class RemoteFile:
-    """One `ICON_ENS_<run>_<FIELD>.nc.bz2` offered by the server."""
-    __slots__ = ('name', 'run', 'field', 'size')
+    """One `ICON_ENS_<run>_<FIELD>.nc.bz2` / `IE_<run>_<field>.nc.bz2` on the server."""
+    __slots__ = ('name', 'run', 'field', 'size', 'family')
 
-    def __init__(self, name, run, field, size=None):
+    def __init__(self, name, run, field, size=None, family=ENSEMBLE):
         self.name, self.run, self.field, self.size = name, run, field, size
+        self.family = family
 
     @property
     def url(self):
-        return BASE + self.name
+        return base_url(self.family) + self.name
 
     @property
     def label(self):
-        return product_label(self.field)
+        return self.family.label_for(self.field)
+
+    @property
+    def levels(self):
+        """True for a field the catalogue says is 3-D on pressure levels."""
+        return self.family.has_levels(self.field)
 
     def local_name(self):
         """G27: the file name used on disk is re-derived, never taken from the server.
@@ -211,7 +227,7 @@ class RemoteFile:
         oddities on some platforms -- so the name is REBUILT from the two validated
         capture groups. A server string can therefore never choose a path.
         """
-        return f'ICON_ENS_{self.run}_{self.field}.nc.bz2'
+        return self.family.local_name(self.run, self.field)
 
     def __repr__(self):
         return f'<RemoteFile {self.name} size={self.size}>'
@@ -249,11 +265,11 @@ def _size_after(text):
     return _int_or_none(last.group(1)) if last is not None else None
 
 
-def parse_listing(html):
+def parse_listing(html, family=ENSEMBLE):
     """IIS/nginx/apache directory HTML -> [RemoteFile], newest run first.
 
-    Untrusted input (v2.md 6.2.3): every candidate must satisfy NAME_RE, and the name that
-    ends up on disk is rebuilt from the captures rather than echoed back.
+    Untrusted input (v2.md 6.2.3): every candidate must satisfy the family's name grammar,
+    and the name that ends up on disk is rebuilt from the captures rather than echoed back.
     """
     text = html if isinstance(html, str) else html.decode('utf8', 'replace')
     found = {}
@@ -263,7 +279,7 @@ def parse_listing(html):
         # ellipsis, so fall back to the href's last segment.
         for candidate in (re.sub(r'<[^>]*>', '', inner).strip(),
                           href.rstrip('/').rpartition('/')[2]):
-            name_match = NAME_RE.match(candidate)
+            name_match = family.name_re.match(candidate)
             if name_match:
                 break
         else:
@@ -274,7 +290,7 @@ def parse_listing(html):
         if size is None:
             size = _size_after(after)
         entry = RemoteFile(candidate, name_match.group('run'), name_match.group('field'),
-                           size)
+                           size, family)
         # A listing can name the same file twice (anchor text and href); keep the richer.
         previous = found.get(candidate)
         if previous is None or (previous.size is None and size is not None):
@@ -282,20 +298,24 @@ def parse_listing(html):
     return sorted(found.values(), key=lambda f: (f.run, f.field), reverse=True)
 
 
-def fetch_listing(session, url=BASE):
-    """Download and parse the ensemble directory index."""
+def fetch_listing(session, url=None, family=ENSEMBLE):
+    """Download and parse one family's directory index."""
+    url = base_url(family) if url is None else url
     try:
         response = session.get(url, timeout=TIMEOUT)
     except Exception as exc:
         raise DownloadError(f'Could not reach the IMS server: {exc}') from exc
     _raise_for_auth(response)
     if getattr(response, 'status_code', 200) >= 400:
-        raise DownloadError(f'The server returned HTTP {response.status_code} '
-                            'for the ensemble directory.')
-    files = parse_listing(response.text)
+        raise DownloadError(f'The server returned HTTP {response.status_code} for '
+                            f'{url} - the {family.short} directory.')
+    files = parse_listing(response.text, family)
     if not files:
-        raise DownloadError('The ensemble directory listing held no '
-                            'ICON_ENS_<run>_<FIELD>.nc.bz2 entries.')
+        raise DownloadError(
+            f'{url} held no {family.prefix}<run>_<field>.nc.bz2 entries.'
+            + (f' The deterministic folder is inferred from the server layout rather than '
+               f'measured: set {ICON_URL_ENV} to its real address if this is the wrong one.'
+               if family is ICON else ''))
     return files
 
 

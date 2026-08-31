@@ -18,6 +18,8 @@ from typing import NamedTuple
 
 import numpy as np
 
+from .products import field_key            # noqa: F401  (re-exported: one canonical key)
+
 
 class Affine(NamedTuple):
     """display = a * raw + b, carrying the label that describes the result."""
@@ -115,6 +117,10 @@ _TEMPERATURE = [Affine('°C', 1.0, -273.15), Affine('K', 1.0, 0.0),
 # 1 m s-1 = 3600/1852 kt exactly, by the definition of the nautical mile.
 _WIND = [Affine('m s-1'), Affine('kt', 3600.0 / 1852.0, 0.0), Affine('km h-1', 3.6, 0.0)]
 _CLOUD_FIELDS = ('CLCT', 'CLCL', 'CLCM', 'CLCH')
+# 1 kg m-2 of water over 1 m2 is 1 mm of depth: exact, so only the label changes.
+_WATER = [Affine('mm'), Affine('kg m-2')]
+# Pa -> hPa is what every pressure chart is drawn in, so it leads. The file stays Pa.
+_PRESSURE = [Affine('hPa', 0.01), Affine('Pa')]
 
 
 class FieldUnits(NamedTuple):
@@ -146,6 +152,9 @@ UNITS = {
     # and ncwrite can save it. Registered so a written WSPD_10M reopens with exactly the
     # treatment its components get -- m s-1, kt, km h-1.
     'WSPD_10M':  FieldUnits(('m s-1',), _WIND),
+    # ...and the same view built from the deterministic run's 3-D components, which is a
+    # wind at a pressure level rather than at 10 m (derived.UPPER_WIND_FIELD).
+    'WSPD':      FieldUnits(('m s-1',), _WIND),
     # VMAX_10M stays in file units: guessing a forecaster wants knots is a preference.
     'VMAX_10M':  FieldUnits(('m s-1',), [Affine('m s-1'), Affine('kt', 3600.0 / 1852.0),
                                          Affine('km h-1', 3.6)]),
@@ -153,12 +162,85 @@ UNITS = {
     'ASWDIR_S':  FieldUnits(('W m-2',), []),
     'H_SNOW':    FieldUnits(('m',), [Affine('cm', 100.0), Affine('m'), Affine('mm', 1000.0)]),
 }
+
+# ---- the deterministic ICON-LAM catalogue (IMS_ICON_manual.pdf, Table 1) ---------------
+# Keyed like everything else on `field_key`, i.e. upper-cased, which is what makes the
+# deterministic run's `t_2m`, `tot_prec` and `clct` inherit the entries their ensemble
+# spellings already have: they are the same quantity out of the same model.
+#
+# UNMEASURED, unlike the 15 above. Every `expected` string here is transcribed from the
+# manual's units column, not read off a file -- the credentials for the deterministic
+# folder were not available here. That is exactly the case the registry's guard is for
+# (v2 1.3): a units string this build does not expect means "warn and offer no
+# conversion", never "convert on a guess", so a wrong row below costs a conversion and
+# cannot corrupt a reading.
+UNITS.update({
+    # 3-D on pressure levels.
+    'TEMP':    FieldUnits(('K',), _TEMPERATURE),
+    'RH':      FieldUnits(('%',), []),
+    'U':       FieldUnits(('m s-1',), _WIND),
+    'V':       FieldUnits(('m s-1',), _WIND),
+    # Pa s-1, and NEGATIVE is rising air. No conversion: the sign convention is the thing
+    # to know about omega, and hPa h-1 would invite reading it as a speed.
+    'OMEGA':   FieldUnits(('pa s-1',), []),
+    # Geopotential is published as m2 s-2; a chart is drawn in geopotential metres, which
+    # is that divided by the standard gravity. Exact by definition of gpm, so it leads.
+    'GEOPOT':  FieldUnits(('m2 s-2',), [Affine('gpm', 1.0 / 9.80665), Affine('m2 s-2')]),
+    # Surface.
+    'T_G':     FieldUnits(('K',), _TEMPERATURE),
+    'TMAX_2M': FieldUnits(('K',), _TEMPERATURE),
+    'TMIN_2M': FieldUnits(('K',), _TEMPERATURE),
+    'RH_2M':   FieldUnits(('%',), []),
+    'QV_S':    FieldUnits(('kg kg-1',), [Affine('g kg-1', 1000.0), Affine('kg kg-1')]),
+    'PRES_MSL': FieldUnits(('pa',), _PRESSURE),
+    'PRES_SFC': FieldUnits(('pa',), _PRESSURE),
+    'GUST10':  FieldUnits(('m s-1',), [Affine('m s-1'), Affine('kt', 3600.0 / 1852.0),
+                                       Affine('km h-1', 3.6)]),
+    # Convection.
+    'CAPE':    FieldUnits(('J kg-1',), []),
+    'CIN_ML':  FieldUnits(('J kg-1',), []),
+    'HZEROCL': FieldUnits(('m',), []),
+    'HBAS_CON': FieldUnits(('m',), []),
+    'HTOP_CON': FieldUnits(('m',), []),
+    # Precipitation: the same exact kg m-2 = mm identity TOT_PREC gets.
+    'RAIN_GSP': FieldUnits(('kg m-2',), _WATER),
+    'RAIN_CON': FieldUnits(('kg m-2',), _WATER),
+    'SNOW_GSP': FieldUnits(('kg m-2',), _WATER),
+    'SNOW_CON': FieldUnits(('kg m-2',), _WATER),
+    'GRAUPEL_GSP': FieldUnits(('kg m-2',), _WATER),
+    # Column integrals stay in kg m-2: a column of ice is not a depth of rain, so the
+    # mm identity that TOT_PREC earns is not offered here.
+    'TQV': FieldUnits(('kg m-2',), []),
+    'TQC': FieldUnits(('kg m-2',), []),
+    'TQI': FieldUnits(('kg m-2',), []),
+    'TQR': FieldUnits(('kg m-2',), []),
+    'TQS': FieldUnits(('kg m-2',), []),
+    'TQG': FieldUnits(('kg m-2',), []),
+    # Radiation.
+    'ASODIFD_S': FieldUnits(('W m-2',), []),
+    'ASODIFU_S': FieldUnits(('W m-2',), []),
+    'ASODIRD_S': FieldUnits(('W m-2',), []),
+    'SODIFD_S':  FieldUnits(('W m-2',), []),
+    'SOB_T':     FieldUnits(('W m-2',), []),
+    'ASOB_T':    FieldUnits(('W m-2',), []),
+    'ATHB_T':    FieldUnits(('W m-2',), []),
+})
 # MEASURED 2026-08-24 against run 2026082400: all four report units='%' and values
 # spanning 0..100, i.e. PERCENT -- not the 0-1 that CLAUDE.md 0.2 documented. The gate
 # stays because the encoding is a property of the data, not of the header (G22): a future
 # run that switches to fractions is decided correctly without a code change.
 for _f in _CLOUD_FIELDS:
     UNITS[_f] = FieldUnits(('1', '%'), [], gate='cloud')
+
+
+def is_cloud_field(field):
+    """G22's runtime encoding test applies to `CLCT` and to the ICON run's `clct` alike."""
+    return field_key(field) in _CLOUD_FIELDS
+
+
+def accumulation_kind(field):
+    """'sum' | 'mean' | None -- G14, for either family's spelling of the field."""
+    return ACCUMULATION.get(field_key(field))
 
 
 CLOUD_FRACTION = [Affine('%', 100.0), Affine('fraction')]
@@ -193,7 +275,7 @@ def choices_for(field, file_units, sample=None):
     """
     label = (file_units or '').strip()
     passthrough = [Affine(label)]
-    entry = UNITS.get(field)
+    entry = UNITS.get(field_key(field))
     if entry is None:
         return passthrough, None
 
@@ -261,6 +343,19 @@ def aggregate(stack, mode):
 #   np.diff            -> [100, 150, 183.33, -33.33, -70]     wrong, and plausible
 #   mean-kind formula  -> [100, 400, 800, 300, 50]            the true hourly signal
 ACCUMULATION = {'TOT_PREC': 'sum', 'ASWDIFD_S': 'mean', 'ASWDIR_S': 'mean'}
+
+# The deterministic run's fields, from the manual. The five radiation fields whose names
+# begin with `a` are described there as "mean since model start" in as many words -- that
+# is the manual's own wording, not an inference -- while `sodifd_s` and `sob_t`, which are
+# not, are deliberately absent. The precipitation amounts are accumulations by the ICON
+# convention and by the measured behaviour of the ensemble's TOT_PREC; if one of them ever
+# turns out not to be, the G24 guard says so on screen rather than showing fake drizzle.
+ACCUMULATION.update({
+    'RAIN_GSP': 'sum', 'RAIN_CON': 'sum', 'SNOW_GSP': 'sum', 'SNOW_CON': 'sum',
+    'GRAUPEL_GSP': 'sum',
+    'ASODIFD_S': 'mean', 'ASODIFU_S': 'mean', 'ASODIRD_S': 'mean',
+    'ASOB_T': 'mean', 'ATHB_T': 'mean',
+})
 
 # VMAX_10M is deliberately absent: it is already a per-interval quantity ("max over the
 # previous 1 h", CLAUDE.md 0.2) and must never be differenced.
