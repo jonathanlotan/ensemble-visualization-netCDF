@@ -61,8 +61,20 @@ def test_a_degenerate_level_axis_falls_back_to_the_manual_and_says_so(tmp_path):
                              variable='temp')          # levels=None -> the `sfc` axis
     ds = EnsembleFile(path)
     assert ds.axis.kind == 'pressure'
-    assert ds.member_labels[0] == '1000 hPa' and ds.member_labels[-1] == '150 hPa'
-    assert 'manual' in ds.axis_note and "manual's order" in ds.axis_note
+    assert ds.member_labels[0] == '150 hPa' and ds.member_labels[-1] == '1000 hPa'
+    assert 'measured on the server' in ds.axis_note and 'upside down' in ds.axis_note
+
+
+def test_the_manuals_shorter_ladder_is_still_recognised(tmp_path):
+    """The manual lists 20 levels and the server publishes 22, so a file with either
+    count gets a ladder -- and a note that says which one it fell back to."""
+    data = np.zeros((2, len(products.MANUAL_PRESSURE_LEVELS), 3, 4), dtype=np.float32)
+    path = ncwrite.write_nc3(tmp_path / 'IE_2026083100_rh.nc', 'rh', '%', data,
+                             variable='rh')
+    ds = EnsembleFile(path)
+    assert ds.axis.kind == 'pressure' and ds.n_members == 20
+    assert ds.member_labels[0] == '1000 hPa'
+    assert "manual's table" in ds.axis_note
 
 
 def test_a_field_the_catalogue_does_not_call_3d_is_not_given_levels(tmp_path):
@@ -207,13 +219,33 @@ def test_the_deterministic_folder_can_be_pointed_elsewhere(monkeypatch):
     assert download.base_url(products.ENSEMBLE) == products.ENSEMBLE.base_url
 
 
-def test_the_catalogue_matches_the_manual():
+def test_the_catalogue_matches_what_the_server_publishes():
+    """MEASURED against run 2026083012: 50 fields, two of which the manual omits."""
     fields = [p.field for p in products.ICON.products]
-    assert len(fields) == 48 and len(set(fields)) == 48
+    assert len(fields) == 50 and len(set(fields)) == 50
+    assert {'sob_s', 'sou_s'} <= set(fields)          # on the server, not in the manual
     assert [p.field for p in products.ICON.products if p.levels] == \
         ['temp', 'rh', 'u', 'v', 'omega', 'geopot']
-    assert len(products.PRESSURE_LEVELS) == 20
-    assert products.PRESSURE_LEVELS[0] == 1000 and products.PRESSURE_LEVELS[-1] == 150
+    # 22 levels, stored ascending in pressure: 150 hPa first, 1000 hPa last. The manual
+    # says 20, the other way up -- which is exactly why the axis is read from the file.
+    assert len(products.PRESSURE_LEVELS) == 22
+    assert products.PRESSURE_LEVELS[0] == 150 and products.PRESSURE_LEVELS[-1] == 1000
+    assert len(products.MANUAL_PRESSURE_LEVELS) == 20
+    assert products.MANUAL_PRESSURE_LEVELS[0] == 1000
+
+
+def test_a_one_plane_field_is_named_by_the_height_it_carries():
+    """Measured: t_2m is (time, height, lat, lon) with height = 2 m, u_10m with 10 m.
+    Calling a 10 m gust "surface" is not wrong enough to matter, and naming it what the
+    file says is free."""
+    assert levels.axis_for(1, dim='height', coord=np.array([2.0]),
+                           units='m').labels == ('2 m',)
+    assert levels.axis_for(1, dim='height', coord=np.array([10.0]),
+                           units='m').describe() == '10 m (single level)'
+    assert levels.axis_for(1, dim='height', coord=np.array([0.0]),
+                           units='m').labels == ('surface',)
+    assert levels.axis_for(1, dim='sfc', coord=np.array([0.0]),
+                           units=None).labels == ('surface',)
 
 
 # ---- pairing across families and axes ----------------------------------------------------
@@ -257,6 +289,8 @@ def test_the_wind_map_works_on_pressure_levels(tmp_path):
     assert np.allclose(bu, u.raw.frame(1, 2) * 3600.0 / 1852.0, atol=1e-3)
     # ...and the title says so without claiming an ensemble member that does not exist.
     assert view.barb_label('member') == 'barbs (kt): the wind at this level'
+    assert view.barb_label('member', over='temp').startswith(
+        'barbs (kt) from u/v:')
     assert view.field == derived.UPPER_WIND_FIELD and view.display_name == 'wind'
 
 
@@ -303,3 +337,19 @@ def test_a_surface_field_is_written_back_as_a_surface_field(tmp_path):
     out = ncwrite.write_canonical(tmp_path / 'IE_2026083100_t_2m_copy.nc', view)
     assert nc3.parse(out)['vars']['t_2m']['dims'] == ['time', 'lat', 'lon']
     assert EnsembleFile(out).axis.kind == 'single'
+
+
+def test_two_one_plane_fields_at_different_heights_still_pair(tmp_path):
+    """A 10 m wind belongs over a surface precipitation map, and `t_2m - t_g` is an R5
+    example -- so the height LABEL of a single-level field must not be read as an identity
+    the way a member number is (G17 needs more than one position to be in danger)."""
+    from imsicon import ncwrite
+    surface = ncwrite.write_nc3(tmp_path / 'IE_2026083100_tot_prec.nc', 'tot_prec',
+                                'kg m-2', np.zeros((4, 1, 4, 5), dtype=np.float32),
+                                levels=False, variable='tot_prec')
+    at_10m = ncwrite.write_nc3(tmp_path / 'IE_2026083100_u_10m.nc', 'u_10m', 'm s-1',
+                               np.ones((4, 1, 4, 5), dtype=np.float32),
+                               levels=[10.0], level_units='m', variable='u_10m')
+    a, b = _view(surface), _view(at_10m)
+    assert a.axis.labels == ('surface',) and b.axis.labels == ('10 m',)
+    derived.check_pairable(a, b)            # must not raise

@@ -24,7 +24,7 @@ from typing import NamedTuple
 
 import numpy as np
 
-from .products import PRESSURE_LEVELS
+from .products import MANUAL_PRESSURE_LEVELS, PRESSURE_LEVELS
 
 # The conventional low-level chart, and what a temperature or wind map on pressure levels
 # is read at first. The map title always names the level, so this is a starting point
@@ -109,9 +109,9 @@ class LevelAxis(NamedTuple):
         return {MEMBER: 'Member', PRESSURE: 'Level', SINGLE: 'Level'}[self.kind]
 
     def describe(self):
-        """`20 pressure levels` / `20 members` / `surface (single level)`."""
+        """`22 pressure levels` / `20 members` / `2 m (single level)`."""
         if self.kind == SINGLE:
-            return 'surface (single level)'
+            return f'{self.labels[0]} (single level)'
         return f'{self.n} {self.noun}{"s" if self.n != 1 else ""}'
 
     def label(self, index):
@@ -166,6 +166,23 @@ def single_axis(label='surface'):
     return LevelAxis(SINGLE, (label,))
 
 
+def _single_label(coord, units):
+    """`2 m` / `10 m` for a one-plane field that carries a height, else `surface`.
+
+    Measured: the deterministic run's `t_2m` is (time, height, lat, lon) with height = 2 m
+    and `u_10m` with height = 10 m. Calling a 10 m gust "surface" is not wrong enough to
+    matter, and naming it what the file says is free.
+    """
+    METRES = ('m', 'meter', 'metre', 'meters', 'metres')
+    if str(units or '').strip().lower() not in METRES:
+        return 'surface'
+    try:
+        value = float(np.asarray(coord, dtype=float).ravel()[0])
+    except (TypeError, ValueError, IndexError):
+        return 'surface'
+    return f'{value:g} m' if np.isfinite(value) and value > 0 else 'surface'
+
+
 def pressure_axis(hpa, note=None):
     values = tuple(float(v) for v in hpa)
     return LevelAxis(PRESSURE, tuple(format_level(v) for v in values), values, note)
@@ -193,7 +210,7 @@ def axis_for(n, *, dim=None, coord=None, units=None, attrs=None, field=None,
 
     n = int(n)
     if n <= 1:
-        return single_axis()
+        return single_axis(_single_label(coord, units) if coord is not None else 'surface')
 
     values = None if coord is None else np.asarray(coord, dtype=float).ravel()
     if values is not None and values.size == n and len(set(values.tolist())) == n:
@@ -206,14 +223,16 @@ def axis_for(n, *, dim=None, coord=None, units=None, attrs=None, field=None,
         if scale is not None:
             return pressure_axis(values * scale)
 
-    if family is not None and field is not None and family.has_levels(field) \
-            and n == len(PRESSURE_LEVELS):
-        return pressure_axis(
-            PRESSURE_LEVELS,
-            note=(f'{field} is a 3-D field, but its level coordinate carries no usable '
-                  'pressures, so the levels shown are the 20 in the IMS ICON manual, in '
-                  "the manual's order (1000 hPa first, 150 hPa last). If a file ever "
-                  'stores them the other way round, every level here would be labelled '
-                  'upside down -- check one value against the model before relying on it.'))
+    if family is not None and field is not None and family.has_levels(field):
+        for ladder, source in ((PRESSURE_LEVELS, 'the 22 measured on the server'),
+                               (MANUAL_PRESSURE_LEVELS, "the 20 in the manual's table")):
+            if n == len(ladder):
+                return pressure_axis(ladder, note=(
+                    f'{field} is a 3-D field, but its level coordinate carries no usable '
+                    f'pressures, so the levels shown are {source}, in that order. The '
+                    'server and the manual disagree about both the count and the order '
+                    'of that ladder, so if a file stores them differently again every '
+                    'level here would be labelled upside down -- check one value against '
+                    'the model before relying on it.'))
 
     return member_axis(nc3.member_labels(history, n))

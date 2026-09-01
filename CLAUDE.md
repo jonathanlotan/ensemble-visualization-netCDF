@@ -1176,10 +1176,10 @@ field; and `--derive wind` with only `U_10M` beside it exits **2** with one sent
 
 * **An on-map key.** The barb scale lives in the *Wind barbs* tooltip and the dialog rather
   than in a corner of the map. A drawn key is a good idea and a separate one.
-* **Barbs over another field** (wind over CAPE, say). The plumbing is duck-typed — any view
-  exposing `wind_vectors` gets barbs — so this is a pairing question, not a drawing one:
-  it needs a second view alongside the one on screen, which is v2.md 6.1's shared-cursor
-  workspace.
+* ~~**Barbs over another field**~~ (wind over CAPE, say). The plumbing is duck-typed — any
+  view exposing `wind_vectors` gets barbs — so this is a pairing question, not a drawing
+  one: it needs a second view alongside the one on screen. **Built in Release 8**, and it
+  was exactly that: `MapView` and `barbs.py` did not change at all.
 * **A direction map, and direction statistics in the readout.** Refused on purpose:
   **G16** says min / max / P10 / P90 of a direction are not meaningful, and a panel with
   four `n/a (circular)` rows teaches less than barbs do.
@@ -1648,11 +1648,13 @@ model as the ensemble, published separately:
 | second axis | **20 ensemble members** (G1) | **20 pressure levels**, or nothing |
 | levels | — | 1000 975 950 925 900 875 850 825 800 750 700 650 600 500 400 350 300 250 200 150 hPa |
 
-**Section 0 is measured; this section is not.** The 15 ensemble fields, their units and
-their byte layout were read off real files (0.2, 0.4). Everything about the deterministic
-product here — the 48 field names, their units, which of them accumulate, and the server
-folder — is **transcribed from the manual**, because the credentials for that folder were
-not available in this environment. That difference is why the release leans so hard on
+**Section 0 is measured; this section was not, when it was written.** The 15 ensemble
+fields, their units and their byte layout were read off real files (0.2, 0.4). Everything
+about the deterministic product here — the 48 field names, their units, which of them
+accumulate, and the server folder — was **transcribed from the manual**, because the
+credentials for that folder were not available at the time. **They arrived on 2026-08-31
+and all of it has since been checked against the real server: see R7.13, which corrects
+the four things the manual gets wrong.** That difference is why the release leans so hard on
 guards rather than on assumptions:
 
 * a units string this build does not expect means **warn and offer no conversion** (v2
@@ -1907,6 +1909,69 @@ the level; `--level 500` and the ▲▼ buttons move it; `--derive wind` on `u` 
 `--level 500 --write` produces a file that reopens as the same 20 levels; and the
 synthetic ensemble still renders exactly as it did in R6.
 
+## R7.13 Measured against the live server — 2026-08-31
+
+R7.0 said the deterministic product was transcribed from the manual and not measured,
+because there were no credentials. There are now, and everything in R7 has been checked
+against the real server and real files. **Four of the manual's facts are wrong, and the
+code was right about all four** — not by luck: each is a case the design refused to take
+on trust.
+
+| what R7 assumed | what the server says | how it landed |
+|---|---|---|
+| the folder is `/ims/IMS_ICON/`, inferred from the layout | **confirmed** — HTTP 200 with NTLM; 2,900 files across 58 runs, 00Z and 12Z | the inference held, and `IMS_ICON_URL` stayed unnecessary |
+| 48 fields, from the manual's Table 1 | **50** — `sob_s` and `sou_s` are published and undocumented | they parsed and listed already (an unknown field goes to the end of the catalogue); both are now named, and in the registry as `W m-2` |
+| 20 pressure levels, 1000 hPa first | **22 levels, 150 hPa first, stored in Pa** | the axis is read from the file's own `plev` (**G39**), so the labels were right anyway; `PRESSURE_LEVELS` now carries the measured ladder |
+| a level index counts down the atmosphere | it counts **up**: 15000 Pa is index 0 | **G40** — "up" is defined by pressure, so ▲ gives 825 hPa from 850 hPa in this file exactly as it would in a file stored the other way |
+
+Had the fallback ladder been used, every map would have been labelled upside down. It was
+never reached: the real files carry a proper coordinate, which is the branch that fires.
+
+**Measured on run `2026083012`:**
+
+| | |
+|---|---|
+| 3-D fields | `(time, plev, lat, lon)`, `plev` in **Pa**, `standard_name=air_pressure`, `positive=down`, 22 values ascending 15000..100000 |
+| grid | **281 x 201**, lat 29.000..36.000, lon 32.000..37.000, 0.025° — a **different domain from the ensemble's** 261x161 (28..34.5 N, 33..37 E) |
+| steps | 91, hourly, +0..+90 h (the manual's range, confirmed) |
+| record stride | 4,970,336 B for a 3-D field (**G2** again: `time` is a record variable too) |
+| surface fields | two shapes: `(time, lat, lon)`, and `(time, height, lat, lon)` with height = **2 m** for `t_2m`/`td_2m`/`rh_2m` and **10 m** for `u_10m`/`gust10` |
+| units | all 12 fields sniffed match the registry, `W/m**2` (**G21**) and `%` included. No row was stale -- and the same product uses BOTH spellings: `asodird_s` says `W/m**2` while `sob_s` says `W m-2` |
+| accumulation | measured, not inferred: `tot_prec`, `rain_gsp`, `snow_gsp` and `graupel_gsp` are non-decreasing over 91 steps (**`sum`**); `asodird_s` and `asob_t` are not (a running mean, **`mean`**); `sob_s` is not either, which is why it is not in the table (**G14**) |
+| sizes | 3-D 259..424 MB compressed; surface 12..19 MB; `h_snow` **2,123 B** — all-zero summer snow, as in the ensemble |
+
+Both shapes of surface field already opened (`levels.axis_for` answers "one plane" before
+it looks at anything else), and the height coordinate is now used for the label: the
+picker reads **`2 m`** or **`10 m`** rather than "surface", because calling a 10 m gust a
+surface field is a small lie the file itself can correct.
+
+**The downloader, live, for the first time** (R3.6 and R7.11 both listed this as not
+done):
+
+* both listings parse — 435 ensemble files across 29 runs, 2,900 deterministic across 58
+  — with sizes, the run picker, the Levels column (`22 pressure levels` / `surface`) and
+  the per-family wind shortcut all filled from the real HTML;
+* a real **resumable** transfer: seeded with 3,000,000 bytes of a `.part`, the app sent
+  `Range: bytes=3000000-`, the server answered **206**, and the finished file was
+  **byte-identical (SHA-256) to the whole one**;
+* a completed file is not refetched, and a size mismatch is what would have refused it.
+
+`tools/sniff_headers.py --product icon` is what produced most of the table above: it
+takes a 4 MiB prefix (16 MiB with `--deep`) of each field instead of 259..424 MB, and it
+now reports the level axis as well as the units, the range and the monotonicity. Six
+fields, deep, settled the whole accumulation question in one command.
+
+**G44 — a truncated `.nc.bz2` is readable data, not a broken file.** Fetching a 24 MiB
+prefix of a 271 MB field is the cheap way to look at a 3-D product, and it is also what an
+interrupted download leaves behind. `ingest.decompress` raised `EOFError` from
+`bz2.read()` at the end of the stream and threw away everything it had already written,
+reporting "could not decompress" about several hundred MB of good forecast. bz2
+decompresses incrementally, so the bytes already written are real: the loop now stops at
+the truncation and lets **G26** clamp the header to the records that survived, which is
+exactly the path the app already had for a short `.nc`. An empty or corrupt stream is
+still an error. Measured: a 24 MiB prefix of `temp` opens as 7 of 91 steps, all 22 levels,
+with `⚠ incomplete file` in the status bar.
+
 ## R7.11 Deliberately not done
 
 * **A dew point on pressure levels.** `temp` + `rh` would give one, and the formula does
@@ -1920,14 +1985,14 @@ synthetic ensemble still renders exactly as it did in R6.
   still live under `IconEnsembleViewer`. It opens both products now, so the name is half
   right — but what an app is called, and the settings key that goes with it, is the user's
   call, not a side effect of adding a product.
-* **A live test against the deterministic folder.** Every downloader test drives a fake
-  session with real `Range` semantics, exactly as in R3.6; the folder itself and the 48
-  fields' real units remain unmeasured until someone runs it with credentials. The first
-  thing to do then is `python tools/sniff_headers.py`, which settles a field's units from a
-  4 MiB prefix instead of a 262 MB download.
-* **12Z vs 00Z run comparison.** The deterministic run publishes twice a day, which makes
-  run-to-run consistency newly cheap to look at — and it needs alignment on *valid* time,
-  which `check_pairable` still refuses (R3.6).
+* ~~**A live test against the deterministic folder.**~~ **Done 2026-08-31 — see R7.13.**
+  The folder, the catalogue, the units, the level ladder and a real resumable transfer are
+  all measured now, and `tools/sniff_headers.py --product icon` is what settles a field
+  from a 4 MiB prefix instead of a 262 MB download.
+* **12Z vs 00Z run comparison.** The deterministic run publishes twice a day — measured:
+  58 runs on the server, 00Z and 12Z — which makes run-to-run consistency newly cheap to
+  look at, and it needs alignment on *valid* time, which `check_pairable` still refuses
+  (R3.6).
 
 ## R7.12 Running it
 
@@ -1945,3 +2010,163 @@ pressure file the aggregation is fixed at *Single level*; on an ensemble it is t
 R1 choices and the picker names members instead. **Up** and **Down** step the axis from
 anywhere in the window: up the atmosphere on a column, and to the next member (switching
 the map to that member) on an ensemble.
+
+---
+
+# Release 8 — wind barbs over any map
+
+Requested 2026-08-31: *make it possible to add wind barbs to any map, in addition to the
+current map.* Sections 0 and R1–R7 are unchanged and still the contract. This is R4.8's
+one deliberate omission, built:
+
+> **Barbs over another field** (wind over CAPE, say). The plumbing is duck-typed — any
+> view exposing `wind_vectors` gets barbs — so this is a pairing question, not a drawing
+> one: it needs a second view alongside the one on screen.
+
+That is exactly what it turned out to be. Nothing in `MapView` or `barbs.py` changed.
+
+## R8.1 The shape of it
+
+R4 drew barbs from *the view on screen*, so only a `WindView` could have them. Now the
+window can hold a **second** view beside the one being drawn:
+
+```
+   MainWindow.ds ────────────────────────────► colours, graph, readout   (any field)
+                                                        │
+   MainWindow.wind_overlay  (a WindView) ───────────────┼──► MapView.set_wind(...)
+        built from the run's u/v, on demand             │
+                                                        ▼
+                            wind_source() -> (view, is_overlay)
+```
+
+`wind_source()` is the whole of the new logic: the map's own vectors if it has them (so
+the wind map is untouched), else the overlay if one is open *and still fits*, else none.
+`_push_wind` asks it and hands `MapView` the same `f(rows, cols)` source R4 defined, so
+the zoom-dependent stride, the pixel-space glyphs and the knots are all unchanged.
+
+| where | what changed |
+|---|---|
+| `ui/main.py` | `wind_overlay`, `wind_source`, `_overlay_request`, `_overlay_shape`, and the Wind barbs checkbox becoming live over any map |
+| `derived.py` | `wind_pair_for(..., levels=)` picks the pair by SHAPE; `barb_label(mode, over=)` names the source; `WindView.source_label` |
+| `ui/mapview.py`, `barbs.py` | **nothing** |
+
+## R8.2 Which wind, over which map
+
+The pair is chosen by the shape of the map it is going over, from the catalogue, before
+any file is opened:
+
+* over a **surface or ensemble** map — the 10 m pair (`U_10M`/`V_10M`, `u_10m`/`v_10m`);
+* over a **pressure level** — the run's 3-D `u`/`v`, so barbs over an 850 hPa temperature
+  are the wind *at 850 hPa*. Anything else would draw a wind from the wrong place and look
+  entirely normal.
+
+The barbs then follow the map: the same time step, the same aggregation (an ensemble mean
+map gets the mean *vector*, **G16**), and the same position on the second axis — so
+stepping up the column with ▲ moves the barbs with it.
+
+**The title says the feathers are a different quantity**, because they now can be:
+
+```
+CAPE_ML [J kg-1] - Ensemble mean - 2026-08-23 11:00Z (+11 h)  |  barbs (kt) from U_10M/V_10M: ensemble mean vector
+t_2m [°C] - 2 m - 2026-08-31 00:00Z (+12 h)  |  barbs (kt) from u_10m/v_10m: the wind at 10 m  |  isolines 1 °C
+```
+
+## R8.3 Opt-in, and honest about what it costs
+
+**Wind barbs** is now enabled whenever barbs are *possible* — on the wind map as before,
+and over any other map of a run whose wind components are on disk — with the tooltip
+naming the two files it would use, or saying to download them.
+
+It is **unticked** on a plain map and ticked on a wind map. That asymmetry is deliberate:
+a wind map is barbs by definition, while an overlay opens two more files (up to 262 MB
+each, decompressed on the `Open…` worker with the progress the app already has), and a
+field map that silently opened two more files on every launch would be a surprise nobody
+asked for. Once built, the overlay is **kept** while it fits, so flipping between the maps
+of one run is free after the first tick.
+
+The tick always reflects what is actually drawn — there is never a ticked box with no
+barbs under it, and never barbs the box does not admit to.
+
+## R8.4 The overlay has to fit the map, not just itself (G45)
+
+**This is the one that mattered, and only real data found it.** The two components are
+checked against *each other* inside `derived.wind` (**G17** — member order, grid, run,
+time axis). That says nothing about whether they fit the map they are being drawn over.
+
+On the real 2026-08-30 12Z run, fetched as prefixes, `temp` held 7 forecast steps and
+`u`/`v` held 5 — an interrupted download stops each file at its own point (**G26**), and
+the two are separate files. The overlay built happily, drew correct-looking barbs at
++3 h, and **wedged the app** at +6 h: `wind_vectors(6, …)` indexed past the end of a
+5-step wind, inside a paint handler, where the exception never reached a `try`. No
+traceback, no error dialog, just a window that stopped redrawing.
+
+So `check_pairable(self.ds, overlay)` now runs against **the view on screen** before the
+overlay is accepted, and `_overlay_shape` — the key that decides whether an open overlay
+can be reused on the next map — carries `n_times` along with the run, the axis, the level
+count and the grid. A wind that does not fit is refused with the reason in the status bar
+(`⚠ no barbs over this map`, the full sentence in its tooltip) and the tick put back:
+a status note rather than a modal, because the barbs are a secondary thing asked for on
+top of a map that is perfectly fine to read.
+
+## R8.4b Two more things real data found
+
+Both were latent before this release and both were reached by the same session:
+
+* **A one-plane field's label is a name, not an identity.** R7 started labelling a
+  single-level axis from its `height` coordinate (`2 m`, `10 m`) instead of "surface",
+  which is better -- and `check_pairable` compared those labels the way it compares member
+  numbers, so a 10 m wind was refused over a surface precipitation map, and `t_2m - t_g`
+  would have been refused too. **G17**'s danger is pairing position *i* of one file with a
+  different position *i* of another, which needs there to be more than one position: the
+  label check now applies only when the axis has more than one.
+* **G46 — a range that arrives after the view moved on.** A range scan is per transform
+  signature (**G19**), so changing the Rate while one is running leaves the view with no
+  range for the new signature; the finished scan then handed `_apply_range` a `None`,
+  which it unpacked. It took `--rate 3h --barbs on` together to see it: opening the wind
+  held the event loop long enough for the two to cross. `_apply_range(None)` is now a
+  no-op, because `_ensure_range` has already started the scan for the signature that is
+  actually on screen.
+
+## R8.5 Verified
+
+`546 passed, 28 skipped`. `tests/test_ui_barbs.py` (13) is new and drives the real
+widgets:
+
+| what | how |
+|---|---|
+| the run's wind draws over a CAPE map | the box is enabled and **unticked**; ticking it opens the pair and draws; the map is still CAPE |
+| the title names the source | `barbs (kt) from U_10M/V_10M: ensemble mean vector` |
+| it follows the map | switching to a single member changes the label and the glyphs; scrubbing time turns the staffs |
+| the right pair, by shape | over a pressure level it takes `u`/`v` and moves with ▲; over a 2 m temperature it takes `u_10m`/`v_10m` |
+| kept, and dropped | reused unchanged across two fields of one run; dropped when the shape changes, and rebuilt for the new one |
+| **G45** | a 3-step wind over a 6-step map is refused, the status bar says so, and scrubbing to a step the wind never had is safe |
+| the wind map is untouched | its own vectors still win over an open overlay |
+| no wind on disk | disabled, unticked, tooltip says what to download |
+
+On real IMS data (run 2026083012): the 2 m temperature at +12 h with the 10 m wind over
+it, and the 850 hPa zonal wind with the wind at that level over it — both rendered
+headlessly with `--barbs on`.
+
+## R8.6 Deliberately not done
+
+* **Two coloured fields at once.** The barbs are a second *quantity*, not a second colour
+  scale; a proper two-field workspace with a shared cursor is v2.md 6.1 and still open.
+* **Barbs from another run.** `check_pairable` refuses two runs (R3.6), and comparing a
+  06Z wind against a 00Z map needs alignment on valid time, which this build does not do.
+* **Gusts as a second layer.** `VMAX_10M`/`gust10` is per-interval already (**G14**) and
+  would drop straight in as a second glyph, but two overlapping glyph sets need a legend
+  and a colour rule of their own.
+* **Remembering the tick between sessions.** `QSettings` could carry it, but "open two
+  more files" is not a preference to restore silently on a launch the user did not ask
+  for it on.
+
+## R8.7 Running it
+
+```bash
+venv/bin/python -m imsicon data/ICON_ENS_..._CAPE_ML.nc     # tick "Wind barbs"
+venv/bin/python -m imsicon --barbs on --screenshot cape.png data/ICON_ENS_..._CAPE_ML.nc
+venv/bin/python -m imsicon --barbs on --level 850 data/IE_..._temp.nc
+```
+
+The checkbox is on toolbar row 2 where it always was; what changed is that it is no
+longer greyed out unless the map is the wind map.

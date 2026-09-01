@@ -20,12 +20,20 @@ and only falls back to this table when it does not (see `levels.axis_for`).
 import re
 from pathlib import Path
 
-# The manual, section "Table 1" footnote: FI/OMEGA/RELHUM/T/U/V are 3-D fields on these
-# pressure levels [hPa]. Note the spacing is NOT uniform -- 25 hPa apart at the bottom,
-# 50 in the middle, 100 near the top -- so a level index is not a linear function of
-# pressure and the ladder has to be carried literally.
-PRESSURE_LEVELS = (1000, 975, 950, 925, 900, 875, 850, 825, 800, 750,
-                   700, 650, 600, 500, 400, 350, 300, 250, 200, 150)
+# MEASURED 2026-08-31 against run 2026083012, from the `plev` coordinate of all six 3-D
+# files: 22 levels, stored in Pa, ASCENDING in pressure -- 15000 Pa (150 hPa) first and
+# 100000 Pa (1000 hPa) last. The spacing is not uniform (50 hPa apart at the top, 25 at
+# the bottom), so a level index is not a linear function of pressure.
+#
+# The manual's Table 1 footnote lists TWENTY levels in the OPPOSITE order, and it is
+# stale on both counts: the files add 450 and 550 hPa, and store the ladder the other way
+# up. Both are kept here because the difference is the point -- it is why the axis is read
+# out of each file's own coordinate (G39) and why "up" is defined by pressure rather than
+# by index (G40). Either would have been enough on its own to label every map wrongly.
+PRESSURE_LEVELS = (150, 200, 250, 300, 350, 400, 450, 500, 550, 600, 650,
+                   700, 750, 800, 825, 850, 875, 900, 925, 950, 975, 1000)
+MANUAL_PRESSURE_LEVELS = (1000, 975, 950, 925, 900, 875, 850, 825, 800, 750,
+                          700, 650, 600, 500, 400, 350, 300, 250, 200, 150)
 
 
 class Product:
@@ -149,6 +157,12 @@ ICON_PRODUCTS = (
             'W m-2, stored as a MEAN since model start'),
     Product('sodifd_s', 'Solar radiation - diffuse downward flux', 'Radiation',
             'W m-2, instantaneous'),
+    # Measured on the server 2026-08-31 and absent from the manual's Table 1: the
+    # catalogue follows what is published, not only what is documented.
+    Product('sob_s', 'Radiation - net solar at the surface', 'Radiation',
+            'W m-2, instantaneous; on the server, not in the manual'),
+    Product('sou_s', 'Radiation - upward solar at the surface', 'Radiation',
+            'W m-2, instantaneous; on the server, not in the manual'),
     Product('sob_t', 'Radiation - net solar at top of atmosphere', 'Radiation',
             'W m-2, instantaneous'),
     Product('asob_t', 'Radiation - net solar at TOA (mean)', 'Radiation',

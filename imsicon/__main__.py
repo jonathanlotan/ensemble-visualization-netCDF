@@ -43,6 +43,10 @@ def main(argv=None):
                          'in hPa on a 3-D field of the deterministic run (e.g. --level '
                          '850, snapped to the nearest level), or a member number on an '
                          'ensemble file')
+    ap.add_argument('--barbs', choices=('on', 'off'), default=None,
+                    help="draw the run's wind barbs over the map, whatever field it "
+                         'shows (needs the run\'s wind components beside the file); the '
+                         'wind map draws its own either way')
     ap.add_argument('--sort', action='store_true',
                     help='T-Td only: colour the map only where the depression is under '
                          '2 degC (2 white, 1 yellow-orange, 0 red), leaving drier air '
@@ -58,10 +62,10 @@ def main(argv=None):
 
     wants_post = any((args.units, args.rate is not None, args.derive, args.difference,
                       args.write, args.isolines is not None, args.sort,
-                      args.level is not None))
+                      args.level is not None, args.barbs is not None))
     if wants_post and not args.path:
-        ap.error('--units/--rate/--derive/--difference/--write/--isolines/--sort/--level '
-                 'need a file path')
+        ap.error('--units/--rate/--derive/--difference/--write/--isolines/--sort/--level'
+                 '/--barbs need a file path')
     if args.screenshot:
         if not args.path:
             ap.error('--screenshot needs a file path')
@@ -163,6 +167,14 @@ def _apply_display(window, args, ap, tries=0):
         window.isolines_check.setChecked(args.isolines == 'on')
     if args.level is not None:
         _apply_level(window, args.level)
+    if args.barbs is not None:
+        if args.barbs == 'on' and not window.barbs_check.isEnabled():
+            print(f'--barbs on: neither {window.ds.display_name} nor the rest of this run '
+                  'on disk has a wind to draw', file=sys.stderr)
+        window.barbs_check.setChecked(args.barbs == 'on')
+        if window._overlay_builder is not None and window._overlay_builder.isRunning():
+            window._overlay_builder.wait(60000)
+            QtWidgets.QApplication.processEvents()
     if args.sort:
         if not window.sort_check.isEnabled():
             print(f'--sort: {window.ds.display_name} has no sort band; it applies to the '
@@ -206,7 +218,7 @@ def _shoot(app, window, args):
             window._on_scan_done(window.ds.value_range)
         if any((args.units, args.rate is not None, args.derive, args.difference,
                 args.write, args.isolines is not None, args.sort,
-                args.level is not None)):
+                args.level is not None, args.barbs is not None)):
             _apply_display(window, args, None)
         if args.point:
             window.select_point(*window.ds.nearest_index(*args.point))

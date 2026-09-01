@@ -108,7 +108,16 @@ def decompress(path, progress=None, cancel=None):
             while True:
                 if cancel is not None and cancel():
                     raise KeyboardInterrupt
-                block = src.read(CHUNK)
+                try:
+                    block = src.read(CHUNK)
+                except EOFError:
+                    # G44: the .bz2 itself stops early -- an interrupted download, or a
+                    # deliberate prefix (tools/sniff_headers.py). bz2 decompresses
+                    # incrementally, so everything already written is REAL data: keep it
+                    # and let G26 clamp the header to the records that survived. Throwing
+                    # it away would refuse a file the app can read and the user can use,
+                    # and would say "could not decompress" about 400 MB of good forecast.
+                    break
                 if not block:
                     break
                 dst.write(block)
@@ -116,6 +125,9 @@ def decompress(path, progress=None, cancel=None):
                 if progress is not None:
                     # ~1.55x expansion measured on real files; only drives the bar
                     progress(written, int(compressed * 1.55))
+        if written == 0:
+            raise ValueError(f'{path.name} holds no readable data: the bz2 stream is '
+                             'empty or corrupt.')
         partial.replace(target)
     except BaseException:
         partial.unlink(missing_ok=True)
