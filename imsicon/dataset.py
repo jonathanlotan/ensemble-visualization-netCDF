@@ -14,7 +14,7 @@ import json
 import numpy as np
 from pathlib import Path
 
-from . import levels, nc3, products, transform
+from . import levels, nc3, products, timefmt, transform
 from .transform import AGGREGATIONS      # noqa: F401  (re-exported: v1 import site)
 
 
@@ -122,8 +122,8 @@ class EnsembleFile:
         return self.axis.label(index)
 
     def label_for(self, t):
-        """'2026-08-27 14:00Z  (+110 h)' - the F4 time readout."""
-        return (f'{self.times[t]:%Y-%m-%d %H:%M}Z  '
+        """'2026-08-27 14:00Z  (+110 h)' - the F4 time readout, in the chosen clock (R11)."""
+        return (f'{timefmt.stamp(self.times[t])}  '
                 f'(+{self.forecast_hours[t]:.0f} h)')
 
     # ---- global range, cached --------------------------------------------------
@@ -260,7 +260,7 @@ class EnsembleFile:
         short = (f' | INCOMPLETE: {self.n_times}/{self.declared_times} steps'
                  if self.truncated else '')
         return (f'{self.path.name} | {self.field} ({self.long_name}) [{self.units}] | '
-                f'run {self.run_init:%Y-%m-%d %H:%M}Z | {self.axis.describe()} | '
+                f'run {timefmt.stamp(self.run_init)} | {self.axis.describe()} | '
                 f'{self.n_times} steps{short} | {self.ny}x{self.nx} grid')
 
 

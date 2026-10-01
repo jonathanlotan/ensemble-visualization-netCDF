@@ -345,3 +345,48 @@ def test_a_saved_configuration_applies_to_the_open_window(window, qapp, isolated
     assert window.cmap_combo.currentText() == 'magma'
     assert window.scale_combo.currentIndex() == SCALE_FRAME
     assert len(window.map.points.data) == 1
+
+
+# ---- R11: Zulu or Israel time ---------------------------------------------------------
+def _every_time_on_screen(w):
+    return {'time bar': w.time_label.text(),
+            'map title': w.map.plot.titleLabel.text,
+            'graph axis': w.plot.getAxis('bottom').labelText,
+            'readout': w.readout.subtitle.text(),
+            'status bar': w.status_left.text()}
+
+
+def test_the_time_combo_rewrites_every_time_on_screen_and_nothing_else(qapp, run_dir):
+    w = open_window(qapp, run_dir / T2M)
+    w.set_time(2)
+    before = _every_time_on_screen(w)
+    assert all('Z' in text and 'IDT' not in text for text in before.values()), before
+    frame = w.map.img.image.copy()
+
+    w.tz_combo.setCurrentIndex(w.tz_combo.findData('IL'))
+    settle(qapp)
+    after = _every_time_on_screen(w)
+    assert all('IDT' in text for text in after.values()), after
+    assert '2026-08-23 05:00 IDT' in after['time bar'] and '(+2 h)' in after['time bar']
+    assert w.t == 2 and w.slider.value() == 2
+    assert w.readout._rows[('member', 'time')][0].text() == 'Time (Israel)'
+    assert np.array_equal(w.map.img.image, frame, equal_nan=True)
+
+    w.set_time_zone('Z')
+    assert _every_time_on_screen(w) == before
+    w.close()
+
+
+def test_the_window_opens_in_the_clock_the_file_names(qapp, run_dir, isolated_config):
+    configure(isolated_config, '[display]\ntime = "Israel"\n')
+    w = open_window(qapp, run_dir / T2M)
+    assert w.tz_combo.currentData() == 'IL'
+    assert 'IDT' in w.time_label.text()
+    w.close()
+
+
+def test_the_dialog_saves_the_clock(dialog, isolated_config):
+    dialog.time_combo.setCurrentIndex(dialog.time_combo.findData('IL'))
+    saved = dialog.save()
+    assert saved is not None and saved.time_zone == 'IL'
+    assert 'time = "Israel"' in isolated_config.read_text(encoding='utf-8')

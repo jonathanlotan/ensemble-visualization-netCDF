@@ -15,7 +15,7 @@ verbatim, so MapView / PlotView / ReadoutPanel need no change at all.
 """
 import numpy as np
 
-from . import isolines, transform
+from . import isolines, timefmt, transform
 from .transform import Affine
 
 
@@ -299,13 +299,13 @@ class FieldView:
         if t < k:
             return f'{base}  [no {self.rate_hours} h window yet]'
         return (f'{base}  [{self.rate_hours} h to '
-                f'{self.raw.times[t]:%H:%M}Z]')
+                f'{timefmt.stamp(self.raw.times[t], date=False)}]')
 
     def summary(self):
         short = (f' | INCOMPLETE: {self.n_times}/{self.raw.declared_times} steps'
                  if self.raw.truncated else '')
         return (f'{self.path.name} | {self.field} ({self.long_name}) [{self.units}] | '
-                f'run {self.run_init:%Y-%m-%d %H:%M}Z | {self.axis.describe()} | '
+                f'run {timefmt.stamp(self.run_init)} | {self.axis.describe()} | '
                 f'{self.n_times} steps{short} | {self.ny}x{self.nx} grid')
 
     # ---- range caching, per transform view (G19) --------------------------------------

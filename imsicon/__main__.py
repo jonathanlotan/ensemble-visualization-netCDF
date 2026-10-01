@@ -4,7 +4,7 @@ import sys
 
 from PySide6 import QtCore, QtWidgets
 
-from . import derived, ingest, isolines, ncwrite, products, transform
+from . import derived, ingest, isolines, ncwrite, products, timefmt, transform
 from .ui import derivedialog
 from .ui.main import MainWindow
 
@@ -68,10 +68,18 @@ def main(argv=None):
                     help='T-Td only: colour the map only where the depression is under '
                          '2 degC (2 white, 1 yellow-orange, 0 red), leaving drier air '
                          'uncoloured')
+    ap.add_argument('--tz', metavar='ZONE', default=None,
+                    help='write times in Z (UTC, the default) or Israel (IDT/IST); '
+                         'overrides [display] time in the settings file for this run')
     ap.add_argument('--settings', action='store_true',
                     help='open the Settings window on its own (credentials, points on '
                          'the map, per-map defaults) and exit when it closes')
     args = ap.parse_args(argv)
+    if args.tz:
+        try:
+            timefmt.parse(args.tz)
+        except ValueError as exc:
+            ap.error(f'--tz: {exc}')
     if args.settings:
         from .ui.settingsdialog import SettingsDialog
         app = QtWidgets.QApplication(sys.argv[:1])
@@ -85,6 +93,8 @@ def main(argv=None):
     app = QtWidgets.QApplication(sys.argv[:1])
     app.setApplicationName('IMS ICON Ensemble Viewer')
     window = MainWindow(args.path)
+    if args.tz:
+        window.set_time_zone(args.tz)
     window.show()
 
     wants_post = any((args.units, args.rate is not None, args.derive, args.difference,

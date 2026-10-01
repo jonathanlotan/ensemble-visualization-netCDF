@@ -12,7 +12,7 @@ one -- G30, G38).
 """
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .. import config, download, isolines, products, transform
+from .. import config, download, isolines, products, timefmt, transform
 from . import colors
 
 DEFAULT = '(default)'
@@ -79,6 +79,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self.tabs.addTab(self._build_credentials(), 'IMS account')
         self.tabs.addTab(self._build_points(), 'Points on the map')
         self.tabs.addTab(self._build_fields(), 'Map defaults')
+        self.tabs.addTab(self._build_display(), 'Display')
         layout.addWidget(self.tabs, 1)
 
         self.error = QtWidgets.QLabel('')
@@ -136,6 +137,23 @@ class SettingsDialog(QtWidgets.QDialog):
             'button. It is kept in plain text in the settings file below, which only '
             'your user account can read. Leave both empty to use IMS_USER / IMS_PASS '
             f'from the environment{keychain} instead; those take precedence when set.')
+        note.setWordWrap(True)
+        note.setStyleSheet('color:#666;')
+        form.addRow(note)
+        return page
+
+    def _build_display(self):
+        page = QtWidgets.QWidget()
+        form = QtWidgets.QFormLayout(page)
+        self.time_combo = QtWidgets.QComboBox()
+        for zone in timefmt.ZONES:
+            self.time_combo.addItem(timefmt.LABELS[zone], zone)
+        form.addRow('Times shown in:', self.time_combo)
+        note = QtWidgets.QLabel(
+            'The model files are in UTC (Zulu). Israel time is IDT (UTC+3) in summer and '
+            'IST (UTC+2) in winter, decided for each time step, so a forecast that crosses '
+            'the change shows it. The "Time" combo on the toolbar changes this for one '
+            'session; this is what the app opens with.')
         note.setWordWrap(True)
         note.setStyleSheet('color:#666;')
         form.addRow(note)
@@ -228,6 +246,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self.user_edit.setText(cfg.user)
         self.password_edit.setText(cfg.password)
         self.show_points.setChecked(cfg.show_points)
+        self.time_combo.setCurrentIndex(max(0, self.time_combo.findData(cfg.time_zone)))
         self.points_table.setRowCount(0)
         for point in cfg.points:
             self.add_point(point)
@@ -456,6 +475,7 @@ class SettingsDialog(QtWidgets.QDialog):
         cfg.user = self.user_edit.text().strip()
         cfg.password = self.password_edit.text()
         cfg.show_points = self.show_points.isChecked()
+        cfg.time_zone = self.time_combo.currentData()
         cfg.points = points
         cfg.path = self.path
         return cfg, errors

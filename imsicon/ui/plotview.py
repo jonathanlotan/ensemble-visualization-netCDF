@@ -11,6 +11,8 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore
 
+from .. import timefmt
+
 
 class PlotView(pg.PlotWidget):
     """20 member curves, ensemble mean, min-max envelope, hover and time cursors."""
@@ -79,8 +81,14 @@ class PlotView(pg.PlotWidget):
         self.envelope.setVisible(across)
         self.getAxis('left').enableAutoSIPrefix(False)   # J kg-1, never 'kJ kg-1'
         self.setLabel('left', ds.display_name, units=ds.units or None)
-        self.setLabel('bottom', f'forecast hour from {ds.run_init:%Y-%m-%d %H:%M}Z run')
+        self.label_time_axis()
         self.setXRange(float(ds.forecast_hours[0]), float(ds.forecast_hours[-1]), padding=0.01)
+
+    def label_time_axis(self):
+        """The x axis is forecast hours, which no clock changes; the run it counts from is
+        written in the chosen one (R11)."""
+        if self.ds is not None:
+            self.setLabel('bottom', f'forecast hour from {timefmt.stamp(self.ds.run_init)} run')
 
     def set_level(self, index):
         """Draw one curve heavier -- the level (or member) the map is showing.

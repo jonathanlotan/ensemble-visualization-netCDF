@@ -15,6 +15,8 @@ pressure file does not rebuild the layout under the cursor.
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from .. import timefmt
+
 ROWS = (('time', 'Time (Zulu)'), ('mean', 'Ensemble mean'), ('max', 'Maximum'),
         ('min', 'Minimum'), ('p90', 'Top 90 % (P90)'), ('p10', 'Bottom 90 % (P10)'))
 
@@ -153,9 +155,16 @@ class ReadoutPanel(QtWidgets.QFrame):
             if not getattr(ds.axis, 'is_pressure', False) or self._is_height_field(ds):
                 hide = tuple(hide) + ('height',)
             self._show_mode('level', hide=hide)
+        self.label_run(ds)
+
+    def label_run(self, ds):
+        """The subtitle names the run, and the time row its clock (R11)."""
+        clock = 'Zulu' if timefmt.zone() == timefmt.ZULU else 'Israel'
+        for mode in ('member', 'level'):
+            self._rows[(mode, 'time')][0].setText(f'Time ({clock})')
         self.subtitle.setText(
             f'{ds.display_name} - {ds.long_name} [{ds.units}] | {ds.axis.describe()} | '
-            f'run {ds.run_init:%Y-%m-%d %H:%M}Z')
+            f'run {timefmt.stamp(ds.run_init)}')
 
     @staticmethod
     def _is_height_field(ds):

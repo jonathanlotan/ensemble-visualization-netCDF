@@ -5,7 +5,8 @@ from pathlib import Path
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from .. import config as user_config
-from .. import derived, geo, ingest, isolines, nc3, ncwrite, products, terrain, transform
+from .. import (derived, geo, ingest, isolines, nc3, ncwrite, products, terrain, timefmt,
+               transform)
 from ..dataset import EnsembleFile, level_stats, member_stats
 from ..fieldview import FieldView
 from . import colors, derivedialog, downloaddialog, settingsdialog
@@ -368,6 +369,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # A choice made in the app wins over it for the rest of the session, which is what
         # these per-field dicts remember: units, and whether the isolines are on.
         self.config = user_config.load()
+        timefmt.set_zone(self.config.time_zone)     # R11: before any label is written
         self._install_config_isolines()
         self._units_chosen = {}
         self._iso_on = {}
@@ -471,6 +473,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.time_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight
                                      | QtCore.Qt.AlignmentFlag.AlignVCenter)
         bar.addWidget(self.time_label)
+        # R11: which clock the times are written in. The files are UTC and the slider, the
+        # forecast hour and the run id stay so; only the text changes.
+        self.tz_combo = QtWidgets.QComboBox()
+        for zone in timefmt.ZONES:
+            self.tz_combo.addItem(timefmt.LABELS[zone], zone)
+        self.tz_combo.setCurrentIndex(self.tz_combo.findData(timefmt.zone()))
+        self.tz_combo.setToolTip('Show times in Zulu (UTC, as the model files are) or in '
+                                 'Israel time -- IDT (UTC+3) in summer, IST (UTC+2) in '
+                                 'winter, decided for each time step.\nThe default is '
+                                 'in Settings... > Display.')
+        self.tz_combo.currentIndexChanged.connect(
+            lambda _i: self.set_time_zone(self.tz_combo.currentData()))
+        bar.addWidget(self.tz_combo)
         self.timer = QtCore.QTimer(self)
         self.timer.setInterval(120)
         self.timer.timeout.connect(self._advance)
@@ -1590,6 +1605,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         self.config = cfg
         self._install_config_isolines()
+        self.set_time_zone(cfg.time_zone)
         self.points_check.blockSignals(True)
         self.points_check.setChecked(bool(cfg.show_points))
         self.points_check.blockSignals(False)
@@ -1607,6 +1623,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self._sync_isolines_check()
         self._sync_profile_check()
         self._refresh_units()
+
+    # ---- R11: Zulu or Israel time ------------------------------------------------------
+    def set_time_zone(self, zone):
+        """Rewrite every time on screen in another clock. Nothing is re-read or rescaled:
+        the index, the slider and the data are the same instant either way."""
+        zone = timefmt.set_zone(zone)
+        index = self.tz_combo.findData(zone)
+        if self.tz_combo.currentIndex() != index:
+            self.tz_combo.blockSignals(True)
+            self.tz_combo.setCurrentIndex(index)
+            self.tz_combo.blockSignals(False)
+        ds = self.ds
+        if ds is None:
+            return
+        self.status_left.setText(ds.summary())
+        self.plot.label_time_axis()
+        self.readout.label_run(ds)
+        self.time_label.setText(ds.label_for(self.t))
+        self.refresh_map()                          # the map title carries the time
+        self._update_readout(self.t, hovering=False)
 
     # ---- R8: the wind, over any map ------------------------------------------------
     def _overlay_shape(self):

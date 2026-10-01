@@ -26,7 +26,7 @@ from typing import NamedTuple
 
 import numpy as np
 
-from . import barbs, isolines, products, transform
+from . import barbs, isolines, products, timefmt, transform
 from .dataset import EnsembleFile
 from .fieldview import FieldView
 
@@ -596,7 +596,7 @@ class DerivedView:
     def summary(self):
         sources = ' | '.join(self.source_files)
         return (f'{self.display_name} ({self.long_name}) [{self.units}] | '
-                f'run {self.run_init:%Y-%m-%d %H:%M}Z | {self.axis.describe()} | '
+                f'run {timefmt.stamp(self.run_init)} | {self.axis.describe()} | '
                 f'{self.n_times} steps | {self.ny}x{self.nx} grid | from {sources}')
 
 

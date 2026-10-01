@@ -1,6 +1,9 @@
 numpy>=1.26
 PySide6>=6.6
 pyqtgraph>=0.13
+# R11: Israel time on Windows, which has no system time-zone database. Without it the
+# app falls back to the post-2013 IDT/IST rule built into imsicon/timefmt.py.
+tzdata; sys_platform == "win32"
 requests>=2.31
 requests-ntlm>=1.2
 # Optional -- the built-in downloader only (Download... in the toolbar). The viewer opens

@@ -2714,3 +2714,71 @@ venv/bin/python -m imsicon --settings          # the Settings window on its own
 venv/bin/python -m imsicon                     # Settings... on the toolbar, Ctrl+, / Cmd+,
 IMSICON_CONFIG=~/other.toml venv/bin/python -m imsicon <file>
 ```
+
+---
+
+# Release 11 — Zulu or Israel time
+
+Requested 2026-10-01: *make the time configurable from zulu (Z) and Israel (IDT).*
+
+## R11.1 The shape of it
+
+Every time in a file is UTC, and that stays the truth underneath: the slider, the time
+index, the forecast hour, the run id in a file name and the data are untouched. Only the
+**text** changes, and all of it goes through one function, `timefmt.stamp`, so the time
+bar, the map title, the readout (row label and subtitle), the graph's x-axis label and the
+status bar cannot disagree about which clock they are reading.
+
+| where | what |
+|---|---|
+| `imsicon/timefmt.py` | the zone setting (module state), `parse`, `localise`, `stamp`. No Qt |
+| `dataset.py`, `fieldview.py`, `derived.py` | `label_for` / `summary` write times through `stamp` (the rate window's end too: `[1 h to 06:00 IDT]`) |
+| `ui/main.py` | the **time combo** beside the time label, `set_time_zone` |
+| `config.py`, `ui/settingsdialog.py` | `[display] time = "Z" \| "Israel"`, and a *Display* tab |
+| `__main__.py` | `--tz Z\|Israel` |
+
+The combo changes it for the session; the settings file is what the app opens with — the
+R10 rule. Run identifiers in the download and derive dialogs stay `00Z`/`12Z`, because
+they are names of runs (and of files), not readings of a clock.
+
+## R11.2 Israel is two offsets, decided per time step
+
+IDT (UTC+3) in summer, IST (UTC+2) in winter, and a 120 h forecast issued in the last week
+of October **crosses the change** — so the offset is decided for each timestamp, never
+once per file. Measured on a synthetic 2026-10-24 run: +22 h reads `2026-10-25 01:00 IDT`
+and +23 h reads `2026-10-25 01:00 IST`. Two consecutive steps with the same wall-clock
+time is correct, and the suffix is what makes it readable; the forecast hour beside it is
+what disambiguates.
+
+`zoneinfo('Asia/Jerusalem')` supplies the rules. **A Windows Python has no system
+time-zone database**, so `requirements.txt` adds `tzdata` on win32, and if even that is
+missing (a frozen build that left it out) `timefmt` falls back to the post-2013 rule: IDT
+from the Friday before the last Sunday of March, 02:00 local, to the last Sunday of
+October, 02:00 local. `test_the_built_in_rule_agrees_with_the_time_zone_database` checks
+the fallback against zoneinfo for every hour of 2024–2027.
+
+## R11.3 Verified
+
+`tests/test_timefmt.py` (19): both clocks, both abbreviations, midnight rollover, both
+2026 transitions, the fallback against zoneinfo, aliases (`Z`, `UTC`, `IL`, `Israel`,
+`IDT`), a refused unknown zone, the views' labels, the rate window, a forecast across the
+October change, and the settings file round trip with a bad value as a warning.
+`tests/test_ui_settings.py` (+3), on the real widgets: switching the combo rewrites all
+five places a time appears while the time index and the map's pixels stay identical,
+switching back restores the exact text, the window opens in the file's clock, and the
+dialog saves it. `tests/conftest.py` resets the zone around every test (G25/G49 family:
+it is module state).
+
+End to end: `--tz Israel --time 110` on the real CAPE file renders
+`2026-08-27 17:00 IDT (+110 h)` in the title, time bar and readout, and
+`run 2026-08-23 03:00 IDT` on the axis and status bar; `--tz Mars` exits 2 with one
+sentence.
+
+## R11.4 Running it
+
+```bash
+venv/bin/python -m imsicon --tz Israel data/ICON_ENS_..._CAPE_ML.nc
+```
+
+or pick *Israel (IDT/IST)* in the combo at the right of the time bar, or set it in
+*Settings… → Display*.

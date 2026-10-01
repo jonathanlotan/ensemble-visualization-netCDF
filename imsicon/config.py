@@ -38,6 +38,7 @@ import tomllib
 from dataclasses import dataclass, field as dc_field, fields as dc_fields, replace
 from pathlib import Path
 
+from . import timefmt
 from .products import field_key
 
 ENV = 'IMSICON_CONFIG'
@@ -109,6 +110,7 @@ class Config:
     user: str = ''
     password: str = ''
     show_points: bool = True
+    time_zone: str = timefmt.ZULU  # R11: the clock every time on screen is written in
     points: list = dc_field(default_factory=list)
     fields: dict = dc_field(default_factory=dict)      # field_key -> FieldDefaults
     warnings: list = dc_field(default_factory=list)
@@ -289,6 +291,16 @@ def from_dict(data, path=None):
         except ValueError as exc:
             cfg.warnings.append(f'[map] point {i} ({value!r}): {exc}; skipped')
 
+    display = data.get('display', {})
+    if not isinstance(display, dict):
+        cfg.warnings.append('[display] is not a table; ignored')
+        display = {}
+    if 'time' in display:
+        try:
+            cfg.time_zone = timefmt.parse(display['time'])
+        except ValueError as exc:
+            cfg.warnings.append(f'[display] time: {exc}; using Z')
+
     tables = data.get('fields', {})
     if not isinstance(tables, dict):
         cfg.warnings.append('[fields] is not a table; ignored')
@@ -341,6 +353,13 @@ HEADER = """\
 # The IMS server account (from the IMS product PDF). Kept in plain text in this file,
 # which only your user account can read. Leave both empty to use IMS_USER / IMS_PASS
 # from the environment, or the system keychain.
+"""
+
+DISPLAY_HELP = """
+[display]
+# The clock every time on screen is written in: "Z" (UTC, as the model files are) or
+# "Israel" (IDT in summer, IST in winter -- decided per time step, so a forecast that
+# crosses the change shows it). The "Time" combo on the toolbar changes it for a session.
 """
 
 MAP_HELP = """
@@ -400,6 +419,8 @@ def dumps(cfg):
     out = [HEADER,
            f'user = {_toml_string(cfg.user)}',
            f'password = {_toml_string(cfg.password)}',
+           DISPLAY_HELP,
+           f'time = {_toml_string("Israel" if cfg.time_zone == timefmt.ISRAEL else "Z")}',
            MAP_HELP,
            f'show_points = {"true" if cfg.show_points else "false"}']
     if cfg.points:
