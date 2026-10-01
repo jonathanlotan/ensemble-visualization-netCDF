@@ -76,14 +76,15 @@ DEGREES = Ladder((0.5, 1.0, 2.0, 3.0, 4.0), 1.0,
 
 # Standard gravity: the m2 s-2 of geopotential per geopotential metre, by definition.
 G0 = 9.80665
-# One kilofoot of geopotential height, in m2 s-2: 304.8 m exactly, times g.
-KFT = 304.8 * G0
-# The height ladder, in kilofeet -- the unit the chart is read in by default (R9). 0.2 kft
-# is 61 gpm, close to the 6 dam a 500 hPa chart is conventionally drawn at; 0.1 kft (30 m)
-# suits 850 hPa and 1 kft a jet-level chart. The emphasis puts the heavy line on a whole
-# kilofoot from every notch: every 10th at 0.1, 5th at 0.2, 4th at 0.25, 2nd at 0.5.
-HEIGHT = Ladder((0.1, 0.2, 0.25, 0.5, 1.0, 2.0), KFT,
-                {0.1: 10, 0.2: 5, 0.25: 4, 0.5: 2, 1.0: 5, 2.0: 5}, 'kft')
+# One foot of geopotential height, in m2 s-2: 0.3048 m exactly, times g.
+FT = 0.3048 * G0
+# The height ladder, in feet -- the unit the chart is read in by default (R9). 200 ft is
+# 61 gpm, close to the 6 dam a 500 hPa chart is conventionally drawn at; 100 ft (30 m)
+# suits 850 hPa and 1,000 ft a jet-level chart. The emphasis puts the heavy line on a
+# whole thousand feet from every notch: every 10th at 100, 5th at 200, 4th at 250, 2nd
+# at 500.
+HEIGHT = Ladder((100.0, 200.0, 250.0, 500.0, 1000.0, 2000.0), FT,
+                {100.0: 10, 200.0: 5, 250.0: 4, 500.0: 2, 1000.0: 5, 2000.0: 5}, 'ft')
 
 
 # ---- the interval policy ---------------------------------------------------------------
@@ -154,10 +155,10 @@ STEPS = {
     'TMAX_2M': _TEMPERATURE,
     'TMIN_2M': _TEMPERATURE,
     # R9: the geopotential on pressure levels, read as a HEIGHT chart. The file is m2 s-2
-    # (canonical); the lines are every 0.2 kft (61 gpm, about the conventional 6 dam of a
-    # 500 hPa chart), anchored at 0 so they sit on round kilofeet, with every 5th (1 kft)
+    # (canonical); the lines are every 200 ft (61 gpm, about the conventional 6 dam of a
+    # 500 hPa chart), anchored at 0 so they sit on round feet, with every 5th (1,000 ft)
     # heavier. The HEIGHT ladder is what the slider offers instead of the degrees one.
-    'GEOPOT': Interval(0.2 * KFT, 5, 0.0, HEIGHT),
+    'GEOPOT': Interval(200.0 * FT, 5, 0.0, HEIGHT),
 }
 
 # A DIFFERENCE of two contoured fields -- the dew point depression above all, but equally

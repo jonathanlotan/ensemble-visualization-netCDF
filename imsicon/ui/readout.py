@@ -49,8 +49,8 @@ def format_value(value, span=None, units=''):
 
 
 def format_height(height, units=''):
-    """`4.35 kft` / `1,325 gpm`: two decimals below 100, none above -- a kilofoot
-    rounded to a whole number would put every low level at the same height."""
+    """`4,350 ft` / `1,325 gpm`: whole numbers, with two decimals kept below 100 so a
+    unit that happens to be large (decametres at the surface) does not round to one."""
     if height is None or not np.isfinite(height):
         return '--'
     text = f'{height:,.2f}' if abs(height) < 100 else f'{height:,.0f}'

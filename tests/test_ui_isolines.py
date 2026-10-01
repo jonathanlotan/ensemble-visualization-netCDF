@@ -480,42 +480,42 @@ def height(qapp, height_run):
     w.close()
 
 
-def test_a_height_chart_offers_kilofoot_spacings_and_opens_at_a_fifth(height):
+def test_a_height_chart_offers_foot_spacings_and_opens_at_200(height):
     slider = height.isoline_step_slider
-    assert height.units_combo.currentText() == 'kft'
+    assert height.units_combo.currentText() == 'ft'
     assert height.isolines_check.isEnabled() and slider.isEnabled()
     assert slider.maximum() == len(iso.HEIGHT.steps) - 1
-    assert slider.value() == iso.HEIGHT.steps.index(0.2)
-    assert height.isoline_step_label.text() == '0.2 kft'
-    assert height.map.isoline_step == pytest.approx(0.2)
-    assert 'kft' in slider.toolTip() and '0.25' in slider.toolTip()
-    assert 'isolines 0.2 kft' in height.map.plot.titleLabel.text
+    assert slider.value() == iso.HEIGHT.steps.index(200.0)
+    assert height.isoline_step_label.text() == '200 ft'
+    assert height.map.isoline_step == pytest.approx(200.0)
+    assert 'ft' in slider.toolTip() and '250' in slider.toolTip()
+    assert 'isolines 200 ft' in height.map.plot.titleLabel.text
 
 
-def test_moving_the_slider_on_a_height_chart_spaces_the_lines_in_kilofeet(height, qapp):
-    height.isoline_step_slider.setValue(iso.HEIGHT.steps.index(0.5))
+def test_moving_the_slider_on_a_height_chart_spaces_the_lines_in_feet(height, qapp):
+    height.isoline_step_slider.setValue(iso.HEIGHT.steps.index(500.0))
     settle(qapp)
-    assert height.isoline_step_label.text() == '0.5 kft'
-    assert height.map.isoline_step == pytest.approx(0.5)
+    assert height.isoline_step_label.text() == '500 ft'
+    assert height.map.isoline_step == pytest.approx(500.0)
     levels = np.array(height.map.isoline_levels)
-    assert levels.size and np.allclose(levels * 2.0, np.rint(levels * 2.0))
-    assert 'isolines 0.5 kft' in height.map.plot.titleLabel.text
+    assert levels.size and np.allclose(levels / 500.0, np.rint(levels / 500.0))
+    assert 'isolines 500 ft' in height.map.plot.titleLabel.text
 
 
 def test_metres_and_decametres_relabel_the_same_lines(height, qapp):
-    height.isoline_step_slider.setValue(iso.HEIGHT.steps.index(0.5))
+    height.isoline_step_slider.setValue(iso.HEIGHT.steps.index(500.0))
     settle(qapp)
-    in_kft = np.array(height.map.isoline_levels)
+    in_ft = np.array(height.map.isoline_levels)
     height.units_combo.setCurrentText('gpm')
     settle(qapp)
     assert height.isoline_step_label.text() == '152.4 gpm'
-    np.testing.assert_allclose(np.array(height.map.isoline_levels) / 304.8, in_kft)
+    np.testing.assert_allclose(np.array(height.map.isoline_levels) / 0.3048, in_ft)
     height.units_combo.setCurrentText('dam')
     settle(qapp)
     assert height.isoline_step_label.text() == '15.24 dam'
     assert height.map.isoline_step == pytest.approx(15.24)
-    np.testing.assert_allclose(np.array(height.map.isoline_levels) / 30.48, in_kft)
-    assert height.isoline_step_slider.value() == iso.HEIGHT.steps.index(0.5)
+    np.testing.assert_allclose(np.array(height.map.isoline_levels) / 0.03048, in_ft)
+    assert height.isoline_step_slider.value() == iso.HEIGHT.steps.index(500.0)
 
 
 def test_switching_to_a_temperature_puts_the_degree_ladder_back(height, qapp):
@@ -533,13 +533,13 @@ def test_switching_to_a_temperature_puts_the_degree_ladder_back(height, qapp):
 
 
 def test_the_command_line_spacing_is_snapped_to_the_field_s_ladder(height, capsys):
-    """`--isoline-step 0.3` on a height chart means 0.3 kft, and the nearest notch is 0.25."""
+    """`--isoline-step 300` on a height chart means 300 ft, and the nearest notch is 250."""
     import argparse
     from imsicon.__main__ import _apply_display
     args = argparse.Namespace(derive=None, difference=None, units=None, rate=None,
-                              isolines=None, isoline_step=0.3, level=None, barbs=None,
+                              isolines=None, isoline_step=300.0, level=None, barbs=None,
                               topo=None, profile=None, sort=False, write=None,
                               screenshot=None)
     _apply_display(height, args, None)
-    assert height.isoline_step_label.text() == '0.25 kft'
-    assert 'using 0.25' in capsys.readouterr().err
+    assert height.isoline_step_label.text() == '250 ft'
+    assert 'using 250' in capsys.readouterr().err

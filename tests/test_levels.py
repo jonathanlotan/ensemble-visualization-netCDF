@@ -170,7 +170,7 @@ def test_the_deterministic_spellings_inherit_the_ensembles_registry():
     for icon, ensemble in (('t_2m', 'T_2M'), ('tot_prec', 'TOT_PREC'), ('clct', 'CLCT')):
         assert transform.UNITS[products.field_key(icon)] is transform.UNITS[ensemble]
     assert transform.choices_for('pres_msl', 'Pa')[0][0].label == 'hPa'
-    assert transform.choices_for('geopot', 'm2 s-2')[0][0].label == 'kft'
+    assert transform.choices_for('geopot', 'm2 s-2')[0][0].label == 'ft'
 
 
 def test_the_manuals_accumulated_fields_are_de_accumulable_and_the_others_are_not():
