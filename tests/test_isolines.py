@@ -525,29 +525,35 @@ def test_a_derived_view_is_spaced_on_its_own_and_not_on_its_operand_s(pair):
 # ---- R9: a ladder per quantity, and the geopotential height -------------------------------
 def test_a_ladder_converts_between_its_natural_unit_and_the_canonical_one():
     ladder = isolines.HEIGHT
-    assert ladder.unit == 'gpm'
-    assert ladder.canonical(40.0) == pytest.approx(40.0 * isolines.G0)
-    assert ladder.natural(40.0 * isolines.G0) == pytest.approx(40.0)
-    assert ladder.nearest(50.0) == 40.0 and ladder.nearest(55.0) == 60.0
-    assert ladder.index_of(120.0 * isolines.G0) == ladder.steps.index(120.0)
+    assert ladder.unit == 'kft'
+    assert isolines.KFT == pytest.approx(304.8 * isolines.G0)
+    assert ladder.canonical(0.5) == pytest.approx(0.5 * isolines.KFT)
+    assert ladder.natural(0.5 * isolines.KFT) == pytest.approx(0.5)
+    assert ladder.nearest(0.3) == 0.25 and ladder.nearest(0.8) == 1.0
+    assert ladder.index_of(2.0 * isolines.KFT) == ladder.steps.index(2.0)
     assert ladder.index_of(0.0) == 0
     assert isolines.DEGREES.steps == isolines.STEP_CHOICES
-    assert isolines.DEGREES.emphasis_for(0.5) == 2 and isolines.HEIGHT.emphasis_for(40.0) == 5
+    assert isolines.DEGREES.emphasis_for(0.5) == 2
+    # every notch puts the heavy line on a whole kilofoot
+    for step in ladder.steps:
+        assert step * ladder.emphasis_for(step) == pytest.approx(1.0) or step >= 1.0
 
 
-def test_the_geopotential_is_contoured_every_40_gpm_whatever_the_units_say():
-    """The file is m2 s-2; the chart is read in gpm or dam. Same lines, three labels."""
+def test_the_geopotential_is_contoured_every_fifth_of_a_kilofoot_whatever_the_units_say():
+    """The file is m2 s-2; the chart is read in kft, gpm or dam. Same lines, four labels."""
     interval = isolines.interval_for('geopot')
     assert interval is isolines.interval_for('GEOPOT')
     assert interval.ladder is isolines.HEIGHT
-    assert interval.step == pytest.approx(40.0 * isolines.G0) and interval.anchor == 0.0
-    gpm, dam, raw = transform.choices_for('geopot', 'm2 s-2')[0]
-    assert (gpm.label, dam.label, raw.label) == ('gpm', 'dam', 'm2 s-2')
-    assert interval.scaled(gpm).step == pytest.approx(40.0)
-    assert interval.scaled(dam).step == pytest.approx(4.0)
-    assert interval.scaled(raw).step == pytest.approx(392.266)
-    # the same lines: 5,560 gpm is 556 dam is 54,524.97 m2 s-2
-    for affine, value in ((gpm, 5560.0), (dam, 556.0), (raw, 5560.0 * isolines.G0)):
+    assert interval.step == pytest.approx(0.2 * isolines.KFT) and interval.anchor == 0.0
+    kft, gpm, dam, raw = transform.choices_for('geopot', 'm2 s-2')[0]
+    assert (kft.label, gpm.label, dam.label, raw.label) == ('kft', 'gpm', 'dam', 'm2 s-2')
+    assert interval.scaled(kft).step == pytest.approx(0.2)
+    assert interval.scaled(gpm).step == pytest.approx(60.96)
+    assert interval.scaled(dam).step == pytest.approx(6.096)
+    assert interval.scaled(raw).step == pytest.approx(0.2 * isolines.KFT)
+    # the same lines: 18 kft is 5,486.4 gpm is 548.64 dam
+    for affine, value in ((kft, 18.0), (gpm, 5486.4), (dam, 548.64),
+                          (raw, 18.0 * isolines.KFT)):
         levels, _ = isolines.levels_for(value - 1e-6, value + 1e-6,
                                         interval.scaled(affine).step, 0.0)
         assert levels.size == 1 and levels[0] == pytest.approx(value)
@@ -558,9 +564,9 @@ def test_ladder_for_names_the_right_ladder_and_a_re_spaced_height_keeps_it():
     assert isolines.ladder_for('T_2M') is isolines.DEGREES
     assert isolines.ladder_for('temp') is isolines.DEGREES
     assert isolines.ladder_for('CAPE_ML') is isolines.DEGREES      # not contoured: the default
-    coarse = isolines.interval_for('geopot').at_step(120.0 * isolines.G0)
-    assert coarse.ladder is isolines.HEIGHT and coarse.emphasis == 5
-    assert coarse.step == pytest.approx(120.0 * isolines.G0)
+    coarse = isolines.interval_for('geopot').at_step(0.5 * isolines.KFT)
+    assert coarse.ladder is isolines.HEIGHT and coarse.emphasis == 2
+    assert coarse.step == pytest.approx(0.5 * isolines.KFT)
     assert coarse.scaled(transform.choices_for('geopot', 'm2 s-2')[0][0]).ladder \
         is isolines.HEIGHT
 
@@ -569,11 +575,12 @@ def test_a_view_offers_its_own_ladder(tmp_path):
     synth.pressure_field(tmp_path / 'IE_2026083100_geopot.nc', 'geopot', 'm2 s-2')
     height = FieldView(EnsembleFile(tmp_path / 'IE_2026083100_geopot.nc'))
     assert height.isoline_ladder is isolines.HEIGHT
-    assert height.units == 'gpm'
-    assert height.isolines.step == pytest.approx(40.0)
-    assert height.set_isoline_step(isolines.HEIGHT.canonical(60.0))
-    assert height.isolines.step == pytest.approx(60.0)
-    assert height.isoline_step == pytest.approx(60.0 * isolines.G0)
+    assert height.units == 'kft'
+    assert height.isolines.step == pytest.approx(0.2)
+    assert height.set_isoline_step(isolines.HEIGHT.canonical(1.0))
+    assert height.isolines.step == pytest.approx(1.0)
+    assert height.isoline_step == pytest.approx(isolines.KFT)
+    assert height.set_units('gpm') and height.isolines.step == pytest.approx(304.8)
     synth.temperature(tmp_path / 'ICON_ENS_2026082300_T_2M.nc')
     warm = FieldView(EnsembleFile(tmp_path / 'ICON_ENS_2026082300_T_2M.nc'))
     assert warm.isoline_ladder is isolines.DEGREES

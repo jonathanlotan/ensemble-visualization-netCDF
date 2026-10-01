@@ -119,12 +119,19 @@ def temperature(qapp, run_dir):
     w.close()
 
 
+KFT = isolines.KFT
+
+
 def expected_heights(window, t=None):
-    """What the readout and the profile must show: the run's geopot, in gpm, at the point."""
+    """What the readout and the profile must show: the run's geopot, in kft, at the point."""
     iy, ix = window.point
     raw = window.height_companion.raw.series(iy, ix)
-    gpm = raw / G0
-    return gpm if t is None else gpm[t]
+    kft = raw / KFT
+    return kft if t is None else kft[t]
+
+
+def shown(height):
+    return readout.format_height(height, 'kft')
 
 
 # ---- the profile ----------------------------------------------------------------------------
@@ -134,7 +141,7 @@ def test_relative_humidity_opens_as_a_profile_with_height_up_and_value_across(hu
     assert w.profile_shown
     assert w.profile.by_height
     assert w.profile.getAxis('left').labelText == 'geopotential height'
-    assert w.profile.getAxis('left').labelUnits == 'gpm'
+    assert w.profile.getAxis('left').labelUnits == 'kft'
     assert w.profile.getAxis('bottom').labelText == 'rh'
     assert w.profile.getAxis('bottom').labelUnits == '%'
     assert not w.profile.getPlotItem().vb.yInverted()
@@ -194,7 +201,7 @@ def test_hovering_a_level_reports_that_level_and_leaving_restores_the_map_s(humi
     assert w.readout.values['level'].text() == '925 hPa'
     assert w.readout.values['value'].text().startswith(
         readout.format_value(float(w.ds.series(iy, ix)[w.t, other]), w.readout.span, '%'))
-    assert w.readout.values['height'].text() == f'{expected_heights(w, w.t)[other]:,.0f} gpm'
+    assert w.readout.values['height'].text() == shown(expected_heights(w, w.t)[other])
     w.profile.levelHovered.emit(-1)
     settle(qapp)
     assert w.readout.values['level'].text() == '850 hPa'
@@ -282,14 +289,15 @@ def test_without_geopot_the_profile_is_drawn_against_pressure_and_says_so(qapp, 
 def test_the_height_row_is_the_run_s_geopotential_at_the_level_point_and_time(humidity, qapp):
     w = humidity
     assert w.readout.row_visible('height')
-    assert w.height_companion is not None and w.height_companion.units == 'gpm'
+    assert w.height_companion is not None and w.height_companion.units == 'kft'
     for t in (0, 3):
         w.set_time(t)
         settle(qapp)
-        assert w.readout.values['height'].text() == f'{expected_heights(w, t)[w.level]:,.0f} gpm'
+        assert w.readout.values['height'].text() == shown(expected_heights(w, t)[w.level])
+        assert w.readout.values['height'].text().endswith(' kft')
     w.step_level(-1)                                       # 925 hPa: lower, so a smaller height
     settle(qapp)
-    assert w.readout.values['height'].text() == f'{expected_heights(w, 3)[w.level]:,.0f} gpm'
+    assert w.readout.values['height'].text() == shown(expected_heights(w, 3)[w.level])
     assert expected_heights(w, 3)[w.level] < expected_heights(w, 3)[w.ds.axis.nearest(850)]
 
 
@@ -307,9 +315,35 @@ def test_the_geopotential_map_itself_does_not_repeat_its_value_as_a_height(qapp,
         assert w.height_companion is None
         assert not w.readout.row_visible('height')
         assert w.readout.row_visible('value')
-        assert w.ds.units == 'gpm'
+        assert w.ds.units == 'kft'
     finally:
         w.close()
+
+
+def test_the_height_unit_is_configurable_and_the_row_follows_the_chart(humidity, qapp):
+    """The height row reads in whatever the geopot chart is set to: kft by default,
+    gpm, dam or the raw m2 s-2 -- one choice, remembered, shared with the chart."""
+    w = humidity
+    before = w.readout.values['height'].text()
+    assert before.endswith(' kft')
+    w.settings.setValue('units/geopot', 'gpm')
+    w.height_companion, w._height_key = None, None
+    w._sync_height_companion()
+    wait_heights(w, qapp)
+    assert w.height_companion.units == 'gpm'
+    text = w.readout.values['height'].text()
+    assert text.endswith(' gpm')
+    assert float(text.split()[0].replace(',', '')) == pytest.approx(
+        float(before.split()[0]) * 304.8, rel=1e-3)
+    assert w.profile.getAxis('left').labelUnits == 'gpm'
+    # the chart itself shares the view, so a change there moves the row too
+    companion = w.height_companion
+    choose(w, qapp, 'geopot')
+    assert w.ds is companion and w.units_combo.currentText() == 'gpm'
+    w.units_combo.setCurrentText('dam')
+    settle(qapp)
+    choose(w, qapp, 'rh')
+    assert w.readout.values['height'].text().endswith(' dam')
 
 
 def test_a_surface_field_has_no_level_to_be_the_height_of(qapp, tmp_path):
@@ -362,6 +396,7 @@ def test_a_four_digit_colorbar_fits_inside_the_map_widget(qapp, run_dir):
     w = open_window(qapp, run_dir / f'IE_{RUN}_geopot.nc')
     try:
         w.resize(1500, 880)
+        w.units_combo.setCurrentText('gpm')                        # a four-digit scale
         settle(qapp)
         m = w.map
         assert m.cbar.axis.fixedWidth is None                   # sizes itself to its text

@@ -48,6 +48,15 @@ def format_value(value, span=None, units=''):
     return f'{text} {units}'.strip()
 
 
+def format_height(height, units=''):
+    """`4.35 kft` / `1,325 gpm`: two decimals below 100, none above -- a kilofoot
+    rounded to a whole number would put every low level at the same height."""
+    if height is None or not np.isfinite(height):
+        return '--'
+    text = f'{height:,.2f}' if abs(height) < 100 else f'{height:,.0f}'
+    return f'{text} {units}'.strip()
+
+
 class ReadoutPanel(QtWidgets.QFrame):
     """Values for the hovered time step at the selected grid point."""
 
@@ -180,9 +189,7 @@ class ReadoutPanel(QtWidgets.QFrame):
             self.values['level'].setText(str(stats.get('level', '') or '--'))
             self._set('value', stats.get('value'))
             height = stats.get('height')
-            self.values['height'].setText(
-                '--' if height is None or not np.isfinite(height)
-                else f'{height:,.0f} {self.height_units}'.strip())
+            self.values['height'].setText(format_height(height, self.height_units))
             # The extremes carry the level they came from: "12.3 °C at 700 hPa" is a
             # reading, "12.3 °C" from somewhere in a 10 km column is not.
             self._set('max', stats.get('max'), stats.get('max_level'))

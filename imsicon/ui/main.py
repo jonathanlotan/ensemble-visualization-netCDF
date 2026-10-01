@@ -74,7 +74,7 @@ def _isoline_step_tooltip(ds, live):
                else f'{name} is not contoured, so there is nothing to space')
         return f'{why}. The spacings on offer are {choices} {ladder.unit}.'
     example = (' (2 °C reads as 3.6 °F)' if ladder is isolines.DEGREES
-               else ' (40 gpm reads as 4 dam)')
+               else ' (0.5 kft reads as 152.4 gpm)')
     return (f'How close the isolines are: {choices} {ladder.unit}. The spacing is fixed '
             f'in {ladder.unit}, so switching the display units relabels the lines'
             f'{example} rather than drawing a different set of them.')
@@ -1597,7 +1597,7 @@ class MainWindow(QtWidgets.QMainWindow):
         heights = self._height_column(t)
         pressures = (np.asarray(self.ds.axis.values, dtype=float)
                      if self.ds.axis.is_pressure else None)
-        units = self.height_companion.units if self.height_companion is not None else 'gpm'
+        units = self.height_companion.units if self.height_companion is not None else 'kft'
         self.profile.set_profile(values, heights, pressures, level=self.level,
                                  height_units=units)
 
@@ -1674,7 +1674,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.readout.set_height_source('', note=(
                 f'The run\'s {view.field} cannot be read against this map:\n\n{exc}'))
             return
-        view.set_units('gpm')
+        # The same units the geopot MAP would open in -- kft by default, or whatever the
+        # Units combo was last set to on it -- so the height row, the profile axis and the
+        # chart never disagree. The view is shared with "Map shows", so a later change on
+        # the chart moves the row with it.
+        saved = self.settings.value(f'units/{view.field}', None)
+        if saved:
+            view.set_units(saved)
         self.opened.setdefault(Path(view.path), view)
         self.height_companion = view
         self._height_key = self._overlay_shape()

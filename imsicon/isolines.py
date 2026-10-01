@@ -76,11 +76,14 @@ DEGREES = Ladder((0.5, 1.0, 2.0, 3.0, 4.0), 1.0,
 
 # Standard gravity: the m2 s-2 of geopotential per geopotential metre, by definition.
 G0 = 9.80665
-# The height ladder, in geopotential metres. A 500 hPa chart is conventionally drawn at
-# 4 dam (40 gpm) and an 850 hPa one at 3 dam; 120 gpm is what a 300 hPa jet-level chart
-# needs to stay readable. The heavy line lands on a round multiple every time.
-HEIGHT = Ladder((10.0, 20.0, 30.0, 40.0, 60.0, 80.0, 120.0), G0,
-                {10.0: 5, 20.0: 5, 30.0: 5, 40.0: 5, 60.0: 5, 80.0: 5, 120.0: 5}, 'gpm')
+# One kilofoot of geopotential height, in m2 s-2: 304.8 m exactly, times g.
+KFT = 304.8 * G0
+# The height ladder, in kilofeet -- the unit the chart is read in by default (R9). 0.2 kft
+# is 61 gpm, close to the 6 dam a 500 hPa chart is conventionally drawn at; 0.1 kft (30 m)
+# suits 850 hPa and 1 kft a jet-level chart. The emphasis puts the heavy line on a whole
+# kilofoot from every notch: every 10th at 0.1, 5th at 0.2, 4th at 0.25, 2nd at 0.5.
+HEIGHT = Ladder((0.1, 0.2, 0.25, 0.5, 1.0, 2.0), KFT,
+                {0.1: 10, 0.2: 5, 0.25: 4, 0.5: 2, 1.0: 5, 2.0: 5}, 'kft')
 
 
 # ---- the interval policy ---------------------------------------------------------------
@@ -151,10 +154,10 @@ STEPS = {
     'TMAX_2M': _TEMPERATURE,
     'TMIN_2M': _TEMPERATURE,
     # R9: the geopotential on pressure levels, read as a HEIGHT chart. The file is m2 s-2
-    # (canonical); the lines are every 40 gpm -- 4 dam, the conventional 500 hPa interval
-    # -- anchored at 0 so they sit on whole decametres, with every 5th (200 gpm) heavier.
-    # The HEIGHT ladder is what the slider offers instead of the degrees one.
-    'GEOPOT': Interval(40.0 * G0, 5, 0.0, HEIGHT),
+    # (canonical); the lines are every 0.2 kft (61 gpm, about the conventional 6 dam of a
+    # 500 hPa chart), anchored at 0 so they sit on round kilofeet, with every 5th (1 kft)
+    # heavier. The HEIGHT ladder is what the slider offers instead of the degrees one.
+    'GEOPOT': Interval(0.2 * KFT, 5, 0.0, HEIGHT),
 }
 
 # A DIFFERENCE of two contoured fields -- the dew point depression above all, but equally

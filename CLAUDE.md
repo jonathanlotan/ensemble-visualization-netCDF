@@ -2320,8 +2320,8 @@ Four things, and the fourth is the only one that needed a new panel:
   mapdata/levant_etopo1.npz ──► terrain.py ──► MapView.terrain  (Multiply, z = 1)   [both]
                                    hillshade      "Topography" tick, remembered
 
-  isolines.Ladder  ─► Interval.ladder ─► the slider's notches  (degrees | gpm)      [both]
-                                        GEOPOT: 40 gpm, every 5th heavier           [single]
+  isolines.Ladder  ─► Interval.ladder ─► the slider's notches  (degrees | kft)      [both]
+                                        GEOPOT: 0.2 kft, every 5th heavier          [single]
 
   the run's geopot ─► MainWindow.height_companion ─► ReadoutPanel 'Height (geopot)' [single]
                             (opened beside any column, G45-checked)   ─► ProfileView y axis
@@ -2393,21 +2393,25 @@ conventional spacing is 4 dam. So an `Interval` now carries a `Ladder`:
 | ladder | notches | natural unit | canonical scale | heavy line |
 |---|---|---|---|---|
 | `DEGREES` | 0.5, 1, 2, 3, 4 | °C | 1 K per degree | 1, 5, 10, 6, 20 °C (the R5.9 table) |
-| `HEIGHT` | 10, 20, 30, 40, 60, 80, 120 | gpm | 9.80665 m² s⁻² per gpm | every 5th |
+| `HEIGHT` | 0.1, 0.2, 0.25, 0.5, 1, 2 | kft | 304.8 × 9.80665 m² s⁻² per kft | every 10th, 5th, 4th, 2nd, 5th, 5th — a whole kilofoot from every notch |
 
 The slider re-ranges to the field's ladder and its label stays in display units, so a
-500 hPa `geopot` map opens at `40 gpm` with seven notches, reads `4 dam` when the Units
-combo says decametres, and draws the **same lines** either way (**G15** — the ladder is
-canonical, the label is not). `--isoline-step` takes the spacing in the field's natural
-unit and snaps to the nearest notch, saying so (`--isoline-step 50` on a height → "offers
-10, 20, 30, 40, 60, 80, 120 gpm; using 40"); it used to refuse anything off the degree
-list, which would have made every height spacing an error.
+500 hPa `geopot` map opens at `0.2 kft` with six notches, reads `60.96 gpm` or `6.096 dam`
+when the Units combo says so, and draws the **same lines** either way (**G15** — the
+ladder is canonical, the label is not). `--isoline-step` takes the spacing in the field's
+natural unit and snaps to the nearest notch, saying so (`--isoline-step 0.3` on a height →
+"offers 0.1, 0.2, 0.25, 0.5, 1, 2 kft; using 0.25"); it used to refuse anything off the
+degree list, which would have made every height spacing an error.
 
-**Geopotential → height.** `GEOPOT` was already converted to gpm by default (R7); it now has
-`dam` as a second choice and is contoured at `40 gpm × g` in its canonical m² s⁻², anchored
-at 0 so the lines sit on whole decametres. The isolines slider, the Level control, the
-units combo and the map title all work on it unchanged — the request's "both optional
-isolines and level" was the registry entry plus the ladder.
+**Geopotential → height, in kilofeet by default** (asked for 2026-10-01, after the first
+cut had used gpm). `GEOPOT` offers `kft` first, then `gpm`, `dam` and the raw `m² s⁻²`;
+1 kft is 304.8 m exactly, so the affine is `1 / (304.8 g)`. It is contoured at
+`0.2 kft` in its canonical m² s⁻², anchored at 0 so the lines sit on round kilofeet with
+every 5th (a whole kilofoot) heavier. The height row and the profile axis read in the same
+unit the chart is set to — one choice, remembered under `units/geopot`, and the companion
+view is the very object "Map shows" installs as the chart, so changing the unit on the
+chart moves the row. The isolines slider, the Level control, the units combo and the map
+title all work on it unchanged.
 
 ## R9.4 The date, the value, and the height beside them
 
@@ -2480,8 +2484,8 @@ about 0.7 ms a step over the time graph.
 | the hillshade is right-way-up | a flat field is exactly 1.0 everywhere; a ramp falling to the north-west is 1.0 (lit) and the same ramp the other way up 0.73; an east-facing ramp is darker than a north-facing one of equal degrees per cell, because a degree of longitude is shorter |
 | the mask is the coastline | Jerusalem and the Dead Sea shore opaque; the Mediterranean off Haifa, Gaza and Beirut clear — 402,649 land cells of 541,501 |
 | the bundle is the real relief | Hermon > 2000 m, Jerusalem 600–1000 m, the Dead Sea < −300 m, the sea off Haifa < 0 |
-| the same lines in gpm, dam and m² s⁻² | 5,560 gpm = 556 dam = 54,524.97 m² s⁻² each land on one level of their own ladder |
-| the profile is the column | x equals `series(iy, ix)[t]` and y the companion's `geopot / g`, at two points and two times |
+| the same lines in kft, gpm, dam and m² s⁻² | 18 kft = 5,486.4 gpm = 548.64 dam each land on one level of their own ladder |
+| the profile is the column | x equals `series(iy, ix)[t]` and y the companion's `geopot / (304.8 g)` in kft, at two points and two times |
 
 ## R9.7 Gotchas found while building v9
 
@@ -2512,23 +2516,23 @@ about 0.7 ms a step over the time graph.
 
 ## R9.8 Verified
 
-`638 passed` (589 from R1–R8 and the merged R5.9, unchanged and green except one row-set
-assertion that gained the height row, + 49 new). Nothing skips here: the 407 MB reference
+`639 passed` (589 from R1–R8 and the merged R5.9, unchanged and green except one row-set
+assertion that gained the height row, + 50 new). Nothing skips here: the 407 MB reference
 file and `netCDF4` are both present.
 
 | what | where | verified by |
 |---|---|---|
 | the relief arithmetic and the bundle | `terrain.py`, `mapdata/levant_etopo1.npz` | `test_terrain.py` (13) — flat is 1.0, lit stays white, away darkens, cos(lat) in the gradient, the mask in the alpha, known places, the clamp, a missing or descending bundle refused |
 | the option | `ui/mapview.py`, `ui/main.py` | `test_ui_terrain.py` (8) — off until ticked; Multiply at z between field and isolines; sea clear and land shaded at named places; built once across time and fields; unticked takes the note down; remembered for the next window; disabled with the reason when the bundle is missing |
-| the ladder | `isolines.py`, `fieldview.py`, `derived.py` | `test_isolines.py` (+4) and `test_ui_isolines.py` (+5) — gpm/dam/raw are the same lines; the slider re-ranges to seven notches and back to five; decametres relabel without moving; the CLI snaps and says so |
-| the readout and the height | `ui/readout.py`, `ui/main.py` | `test_ui_profile.py` — the height row is the run's `geopot / g` at the level, point and time; larger date and value; hidden on `geopot`, on a 2 m field and on the ensemble; a short `geopot` refused (G45); the companion kept across fields and reused as the `geopot` map |
+| the ladder | `isolines.py`, `fieldview.py`, `derived.py` | `test_isolines.py` (+4) and `test_ui_isolines.py` (+5) — kft/gpm/dam/raw are the same lines; the slider re-ranges to six notches and back to five; metres and decametres relabel without moving; the CLI snaps and says so |
+| the readout and the height | `ui/readout.py`, `ui/main.py` | `test_ui_profile.py` — the height row is the run's `geopot / (304.8 g)` at the level, point and time, kft by default and following the chart's unit; larger date and value; hidden on `geopot`, on a 2 m field and on the ensemble; a short `geopot` refused (G45); the companion kept across fields and reused as the `geopot` map |
 | the profile | `ui/profileview.py` | `test_ui_profile.py` (19 in all) — `rh` opens as a profile with height up; the column at the point and time; hPa on the right axis; the level marked and following ▲▼; click moves the map, hover the readout; the slider moves it; pinned value axis; `temp` opens on the time graph and can switch; the choice kept per field; pressure fallback without `geopot` |
 | the colorbar | `ui/mapview.py` | `test_ui_profile.py` — a four-digit scale fits inside the widget |
 
 End to end under `QT_QPA_PLATFORM=offscreen`: the real CAPE file at +110 h with
 `--topo on` shows the plume vivid over the shaded Judean hills, white sea and legible
 coastline; a synthetic deterministic run at the real 281×201×22 resolution renders `rh` as
-a profile against its `geopot` heights with the readout's height row at 1,325 gpm, `temp`
+a profile against its `geopot` heights with the readout's height row in kft (4.35 kft at 850 hPa), `temp`
 at 850 hPa with 1 °C isolines over the relief, `geopot` at 500 hPa with `--isoline-step
 60` and again with `--isoline-step 500 --units dam` (snapped to 12 dam, with the sentence);
 `--profile on` on the ensemble prints one sentence and carries on.
@@ -2551,8 +2555,8 @@ at 850 hPa with 1 °C isolines over the relief, `geopot` at 500 hPa with `--isol
 
 ```bash
 venv/bin/python -m imsicon --topo on data/ICON_ENS_..._CAPE_ML.nc            # relief under any map
-venv/bin/python -m imsicon --level 500 --isoline-step 40 data/IE_..._geopot.nc  # a height chart, 4 dam
-venv/bin/python -m imsicon --units dam data/IE_..._geopot.nc
+venv/bin/python -m imsicon --level 500 --isoline-step 0.5 data/IE_..._geopot.nc  # a height chart, kft
+venv/bin/python -m imsicon --units gpm data/IE_..._geopot.nc                    # or dam, or m2 s-2
 venv/bin/python -m imsicon --point 31.8 35.2 data/IE_..._rh.nc                 # the profile, if geopot is beside it
 venv/bin/python -m imsicon --profile on --level 700 data/IE_..._temp.nc
 venv/bin/python tools/build_terrain.py --fetch                                 # rebuild the elevation bundle (dev only)

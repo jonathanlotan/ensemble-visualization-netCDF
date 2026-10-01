@@ -54,8 +54,8 @@ def main(argv=None):
                          + ' degrees Celsius on a temperature or a difference such as '
                            'T-Td; '
                          + ', '.join(f'{step:g}' for step in isolines.HEIGHT.steps)
-                         + " gpm on a geopotential height chart (default: the field's "
-                           'own, 1 degC on a temperature, 0.5 on a difference, 40 gpm '
+                         + " kft on a geopotential height chart (default: the field's "
+                           'own, 1 degC on a temperature, 0.5 on a difference, 0.2 kft '
                            'on a height)')
     ap.add_argument('--topo', choices=('on', 'off'), default=None,
                     help='shaded relief under the map, from the bundled ETOPO1 elevation '
