@@ -2930,3 +2930,27 @@ venv/bin/python -m imsicon --isoline-labels on --level 500 data/IE_..._geopot.nc
 
 **Not done:** labels that follow the line's angle (above), and a per-field or settings-file
 default — the tick is one preference for every map, like Topography.
+
+---
+
+# Windows launcher — `IMS ICON Viewer.bat`
+
+Added 2026-10-01: *a file for Windows that opens the tool when clicked, instead of typing
+the command.* Double-click `IMS ICON Viewer.bat` in the checkout (or a desktop shortcut to
+it). Dropping a `.nc` / `.nc.bz2` onto it opens that file (`%*` is passed through).
+
+* **First run** finds Python 3.11+ (`tomllib`, R10) — the `py -3` launcher first, because a
+  bare `python` on Windows may be the Microsoft Store placeholder — creates `venv\`,
+  installs `requirements.txt`, and imports `imsicon.ui.main` once *with* a console so a
+  broken install prints why. No Python found → a message pointing at python.org, and pause.
+* **Every later run** starts `venv\Scripts\pythonw.exe -m imsicon` with `start`, so no
+  console window stays open. `cd /d "%~dp0"` first, because `./data` is resolved against
+  the working directory (`ingest.search_roots`).
+* **After an update** a changed `requirements.txt` (byte-compared with
+  `venv\requirements-installed.txt`) reinstalls the packages before starting.
+* A failed setup pauses with its messages and leaves the stamp unwritten, so the next
+  double-click retries.
+* `.gitattributes` pins `*.bat` to CRLF: cmd.exe misreads `goto` labels in an LF file.
+
+Not tested on a Windows machine yet (written on macOS). It is not the Phase 9 PyInstaller
+build: it needs Python installed, and it runs from the checkout.
