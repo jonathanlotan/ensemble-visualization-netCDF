@@ -1221,7 +1221,7 @@ class MainWindow(QtWidgets.QMainWindow):
         scale = self.scale_combo.currentIndex()
         # R10: a fixed range from the settings file. Not on `spread`, which is a width
         # across the members and starts at zero whatever the field's own range is.
-        fixed = self._active_fixed_range() if mode != 'spread' else None
+        fixed = self._active_map_range() if mode != 'spread' else None
         if sort is not None:
             # The band IS the scale: fixed, so that a cell's colour means the same
             # depression in every frame and at every time step, which is the whole
@@ -1563,8 +1563,11 @@ class MainWindow(QtWidgets.QMainWindow):
                     f'\u26a0 settings file: {ds.display_name} is not offered in '
                     f'{configured!r} (offered: {offered})', 10000)
 
-    def _fixed_range(self, ds=None):
+    def _fixed_range(self, ds=None, which='scale'):
         """The settings file's fixed range for this view, in the units on screen, or None.
+
+        `which` is 'scale' -- the range for the map AND the graph -- or 'map_scale', the
+        map's colours only (R13), stated in the same units.
 
         Stated in the field's configured units (or `scale_units`), and converted when the
         Units combo says otherwise -- a CAPE scale of [0, 3000] or a temperature scale of
@@ -1575,19 +1578,28 @@ class MainWindow(QtWidgets.QMainWindow):
         if ds is None or getattr(ds, 'rate_hours', 0):
             return None
         defaults = self._defaults(ds)
-        if defaults.fixed_range is None:
+        wanted = defaults.fixed_range if which == 'scale' else defaults.map_scale
+        if wanted is None:
             return None
         choices = list(getattr(ds, 'unit_choices', None) or [])
         source = defaults.scale_units or defaults.units or (choices[0].label if choices
                                                             else ds.units)
-        return convert_range(defaults.fixed_range, source, choices,
+        return convert_range(wanted, source, choices,
                              getattr(ds, 'units_affine', None),
                              difference=getattr(ds, 'is_difference_view', False))
 
     def _active_fixed_range(self):
+        """The GRAPH's fixed range while Scale says Fixed: the file's `scale`, if any."""
         if self.scale_combo.currentIndex() != SCALE_FIXED:
             return None
         return self._fixed_range()
+
+    def _active_map_range(self):
+        """The MAP's fixed range while Scale says Fixed: its own `map_scale` when the file
+        gives one (R13), else the `scale` it shares with the graph."""
+        if self.scale_combo.currentIndex() != SCALE_FIXED:
+            return None
+        return self._fixed_range(which='map_scale') or self._fixed_range()
 
     def _sync_scale_combo(self, apply_default):
         """Name the fixed range on its entry, and pick the entry the file asks for.
@@ -1595,16 +1607,27 @@ class MainWindow(QtWidgets.QMainWindow):
         `apply_default` on opening a map; a units or rate change only re-labels, so it
         never undoes the Scale a reader has just chosen.
         """
-        fixed = self._fixed_range()
+        graph = self._fixed_range()
+        on_map = self._fixed_range(which='map_scale')
+        fixed = on_map or graph
         item = self.scale_combo.model().item(SCALE_FIXED)
         item.setEnabled(fixed is not None)
         units = f' {self.ds.units}' if self.ds is not None and self.ds.units else ''
-        item.setText(f'Fixed {fixed[0]:g} to {fixed[1]:g}{units}' if fixed is not None
-                     else 'Fixed (set one under Settings...)')
+        if on_map is not None and graph is not None:
+            text = (f'Fixed: map {on_map[0]:g} to {on_map[1]:g}, graph {graph[0]:g} to '
+                    f'{graph[1]:g}{units}')
+        elif on_map is not None:
+            text = f'Fixed map {on_map[0]:g} to {on_map[1]:g}{units}'
+        elif graph is not None:
+            text = f'Fixed {graph[0]:g} to {graph[1]:g}{units}'
+        else:
+            text = 'Fixed (set one under Settings...)'
+        item.setText(text)
         defaults = self._defaults()
         wanted = None
         if apply_default:
-            if defaults.fixed_range is not None and fixed is not None:
+            if fixed is not None and (defaults.fixed_range is not None
+                                      or defaults.map_scale is not None):
                 wanted = SCALE_FIXED
             elif defaults.scale in user_config.SCALE_MODES:
                 wanted = SCALE_DATASET if defaults.scale == 'dataset' else SCALE_FRAME

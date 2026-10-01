@@ -19,7 +19,7 @@ DEFAULT = '(default)'
 ON_OFF = [DEFAULT, 'On', 'Off']
 SCALE_CHOICES = [DEFAULT, 'Dataset range', 'This frame', 'Fixed range']
 FIELD_COLUMNS = ['Map', 'Units', 'Colours', 'Scale', 'Min', 'Max', 'Isolines',
-                 'Spacing', 'Profile']
+                 'Spacing', 'Profile', 'Map min', 'Map max']
 COL = {name: i for i, name in enumerate(FIELD_COLUMNS)}
 POINT_COLUMNS = ['Latitude', 'Longitude', 'Colour', 'Name']
 # The derived maps, by the names they carry on screen, after both families' catalogues.
@@ -237,7 +237,9 @@ class SettingsDialog(QtWidgets.QDialog):
             'What each map opens with. Anything left at (default) keeps the app\'s own '
             'choice, and the toolbar still changes all of it while you read. Names ignore '
             'case, so T_2M also covers the deterministic run\'s t_2m. Min and Max are in '
-            'the map\'s Units (or its default units). Spacing is in degrees C on a '
+            'the map\'s Units (or its default units), and set the map and the graph alike; '
+            'Map min and Map max, when given, set the map\'s colours only, so the map can '
+            'have a different range from the graph. Spacing is in degrees C on a '
             'temperature and ft on a geopotential height; on any other map it is in the '
             'file\'s units, and setting one makes that map contourable.')
         intro.setWordWrap(True)
@@ -418,6 +420,18 @@ class SettingsDialog(QtWidgets.QDialog):
                            'time graph')
         table.setCellWidget(row, COL['Profile'], profile)
 
+        # R13: the map's own colour range, independent of Scale / Min / Max (which keep
+        # setting the graph). Always editable: it applies whatever Scale says.
+        lo, hi = defaults.map_scale or (None, None)
+        for col, value in ((COL['Map min'], lo), (COL['Map max'], hi)):
+            edit = QtWidgets.QLineEdit('' if value is None else f'{value:g}')
+            edit.setValidator(QtGui.QDoubleValidator())
+            edit.setMaximumWidth(80)
+            edit.setToolTip('The map\'s colour range only, in the same units as Min and '
+                            'Max. The graph keeps Scale. Leave both empty to colour the '
+                            'map like the graph.')
+            table.setCellWidget(row, col, edit)
+
         # Carried through unedited: the dialog has no column for it, and dropping a line
         # the user wrote by hand is not something a Save should ever do.
         name.setProperty('scale_units', defaults.scale_units or '')
@@ -508,6 +522,13 @@ class SettingsDialog(QtWidgets.QDialog):
                     errors.append(f'{name}: a fixed range needs both Min and Max')
                     continue
                 table['scale'] = [lo.replace(',', '.'), hi.replace(',', '.')]
+            map_lo = cell(row, COL['Map min']).text().strip()
+            map_hi = cell(row, COL['Map max']).text().strip()
+            if map_lo or map_hi:
+                if not map_lo or not map_hi:
+                    errors.append(f'{name}: a map range needs both Map min and Map max')
+                    continue
+                table['map_scale'] = [map_lo.replace(',', '.'), map_hi.replace(',', '.')]
             scale_units = cell(row, COL['Map']).property('scale_units')
             if scale_units:
                 table['scale_units'] = scale_units

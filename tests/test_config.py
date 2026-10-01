@@ -255,3 +255,22 @@ def test_the_custom_ramp_skips_what_is_not_a_colour():
     assert colors.ramp_named('CUSTOM') == 'custom' and colors.ramps()[-1] == 'custom'
     assert colors.set_custom_ramp(['red']) == [] and colors.custom_stops() == ()
     assert colors.ramp_named('custom') is None
+
+
+# ---- R13: the map's own range ----------------------------------------------------------
+def test_a_map_scale_is_read_beside_the_scale_and_round_trips(tmp_path):
+    cfg = config.loads('[fields.CAPE_ML]\nscale = [0, 3000]\nmap_scale = [0, 1500]\n')
+    entry = cfg.fields['CAPE_ML']
+    assert cfg.warnings == [] and entry.fixed_range == (0.0, 3000.0)
+    assert entry.map_scale == (0.0, 1500.0)
+    again = config.load(config.save(cfg, tmp_path / 'c.toml'))
+    assert again.fields['CAPE_ML'].map_scale == (0.0, 1500.0)
+    assert again.fields['CAPE_ML'].fixed_range == (0.0, 3000.0)
+
+
+def test_a_bad_map_scale_costs_only_that_line():
+    cfg = config.loads('[fields.CAPE_ML]\nmap_scale = [100, 0]\ncolours = "inferno"\n'
+                       '[fields.T_2M]\nmap_scale = "dataset"\n')
+    assert cfg.fields['CAPE_ML'].map_scale is None
+    assert cfg.fields['CAPE_ML'].colours == 'inferno'
+    assert cfg.fields['T_2M'].map_scale is None and len(cfg.warnings) == 2

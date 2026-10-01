@@ -90,6 +90,8 @@ class FieldDefaults:
     colours: str | None = None     # a colour ramp from the Colours combo: 'turbo', 'viridis'
     scale: object = None           # 'dataset' | 'frame' | (lo, hi)
     scale_units: str | None = None  # units (lo, hi) are stated in; default: `units`
+    map_scale: tuple | None = None  # R13: the MAP's colours only, (lo, hi), same units;
+                                    # the graph keeps `scale`
     isolines: bool | None = None   # lines on or off when the map opens
     isoline_step: float | None = None   # spacing, in the field's isoline unit
     profile: bool | None = None    # right-hand panel as a vertical profile
@@ -199,6 +201,15 @@ def normalise_units_label(label):
     return UNIT_ALIASES.get(label, label)
 
 
+def _range(value):
+    if len(value) != 2:
+        raise ValueError('a range is two numbers, [min, max]')
+    lo, hi = _number(value[0]), _number(value[1])
+    if not hi > lo:
+        raise ValueError(f'max ({hi:g}) must be above min ({lo:g})')
+    return lo, hi
+
+
 def _tristate(value, what):
     if isinstance(value, bool):
         return value
@@ -222,7 +233,8 @@ def parse_field(name, table):
 
     known = {f.name for f in dc_fields(FieldDefaults)} - {'name'}
     aliases = {'colors': 'colours', 'colour': 'colours', 'color': 'colours',
-               'isoline_spacing': 'isoline_step', 'spacing': 'isoline_step'}
+               'isoline_spacing': 'isoline_step', 'spacing': 'isoline_step',
+               'map_range': 'map_scale'}
     for raw_key, value in table.items():
         key = aliases.get(raw_key, raw_key)
         if key not in known:
@@ -237,14 +249,13 @@ def parse_field(name, table):
                 text = str(value).strip()
                 if text:
                     out.colours = text
+            elif key == 'map_scale':
+                if not isinstance(value, (list, tuple)):
+                    raise ValueError('a range is two numbers, [min, max]')
+                out.map_scale = _range(value)
             elif key == 'scale':
                 if isinstance(value, (list, tuple)):
-                    if len(value) != 2:
-                        raise ValueError('a range is two numbers, [min, max]')
-                    lo, hi = _number(value[0]), _number(value[1])
-                    if not hi > lo:
-                        raise ValueError(f'max ({hi:g}) must be above min ({lo:g})')
-                    out.scale = (lo, hi)
+                    out.scale = _range(value)
                 else:
                     text = str(value).strip().lower()
                     mode = {'dataset range': 'dataset', 'this frame': 'frame'}.get(text, text)
@@ -418,6 +429,8 @@ FIELDS_HELP = """
 #                                (diverging: CET-D1A CET-D9 CET-D3), or custom
 #   scale        = [0, 3000]     a fixed colour scale, in `units` (or `scale_units`);
 #                                or "dataset" / "frame" to pick that Scale entry
+#   map_scale    = [0, 2000]     the MAP's colour range only, in the same units; the
+#                                graph keeps `scale` (or the dataset range without one)
 #   isolines     = true          contour lines on or off when the map opens
 #   isoline_step = 2             their spacing: degrees C on a temperature, ft on a
 #                                geopotential height, the file's units on anything else
@@ -483,6 +496,9 @@ def dumps(cfg):
             out.append(f'scale = {_toml_string(defaults.scale)}')
         if defaults.scale_units:
             out.append(f'scale_units = {_toml_string(defaults.scale_units)}')
+        if defaults.map_scale is not None:
+            lo, hi = defaults.map_scale
+            out.append(f'map_scale = [{_toml_number(lo)}, {_toml_number(hi)}]')
         if defaults.isolines is not None:
             out.append(f'isolines = {"true" if defaults.isolines else "false"}')
         if defaults.isoline_step is not None:

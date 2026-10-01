@@ -2816,3 +2816,31 @@ custom_colours     = ["white", "gold", "orange", "red", "purple"]   # bottom -> 
 
 Verified by 11 new tests in `tests/test_config.py` and `tests/test_ui_settings.py`, and
 end to end on the real CAPE file with a white→purple custom ramp.
+
+---
+
+# Release 13 — a map range of its own, per parameter
+
+Requested 2026-10-01, as the correction to R12: *for each parameter, make a map colour
+range and a graph range; keep the scale as it is now, just add more columns at the end
+for a "map scale" that can differ from the rest.*
+
+* `[fields.<NAME>] map_scale = [lo, hi]` — the **map's colours only**, in the same units
+  as `scale` (`scale_units`, else `units`, else the field's default) and converted through
+  the same `convert_range`, so it follows the Units combo exactly as `scale` does.
+* `scale` is unchanged and still sets the map **and** the graph; with a `map_scale` beside
+  it, it sets the graph alone. With `map_scale` and no `scale`, the graph stays on the
+  dataset range (A1).
+* A map with a `map_scale` opens on Scale → **Fixed**, labelled
+  `Fixed: map 0 to 1000, graph 0 to 3000 J kg-1` (or `Fixed map 0 to 1000 …` without a
+  `scale`). Choosing Dataset range / This frame on the toolbar still overrides both.
+  Not applied to `spread` or to a Rate view, for the reasons `scale` is not (R10.3).
+* In `MainWindow`: `_fixed_range(ds, which='scale'|'map_scale')`, `_active_fixed_range`
+  (the graph) and `_active_map_range` (the map: `map_scale`, else `scale`).
+* Settings → **Map defaults** gains two columns at the end, **Map min** and **Map max**,
+  always editable; one without the other is refused with a sentence.
+
+Verified by 7 new tests (`test_config.py`, `test_ui_settings.py`): the map and the graph
+read different ranges at once, both follow a units change, the toolbar still overrides,
+a map range alone leaves the graph on the dataset range, and the dialog round-trips it.
+End to end on the real CAPE file: map 0–1000 J kg⁻¹, graph 0–3000.

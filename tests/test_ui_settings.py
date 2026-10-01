@@ -483,3 +483,72 @@ def test_the_dialog_refuses_a_custom_scale_it_cannot_draw(dialog, isolated_confi
     dialog.map_ramp_combo.setCurrentText('custom')
     assert dialog.save() is None and 'no colours' in dialog.error.text()
     assert isolated_config.read_text(encoding='utf-8') == before
+
+
+# ---- R13: a map range of its own, beside the graph's ----------------------------------
+MAP_SCALE = '''
+[fields.T_2M]
+units = "F"
+scale = [10, 40]
+map_scale = [15, 30]
+scale_units = "C"
+'''
+
+
+def _graph_range(window):
+    return window.plot.getPlotItem().vb.viewRange()[1]
+
+
+def test_the_map_takes_its_own_range_and_the_graph_keeps_the_scale(qapp, run_dir,
+                                                                    isolated_config):
+    configure(isolated_config, MAP_SCALE)
+    w = open_window(qapp, run_dir / T2M)
+    try:
+        assert w.scale_combo.currentIndex() == SCALE_FIXED
+        # [15, 30] degC is [59, 86] degF on the map; [10, 40] degC is [50, 104] on the graph.
+        assert w.map.cbar.levels() == pytest.approx((59.0, 86.0))
+        lo, hi = _graph_range(w)
+        assert lo == pytest.approx(50.0, abs=3.0) and hi == pytest.approx(104.0, abs=3.0)
+        assert 'map 59 to 86' in w.scale_combo.itemText(SCALE_FIXED)
+        assert 'graph 50 to 104' in w.scale_combo.itemText(SCALE_FIXED)
+        w.units_combo.setCurrentText('K')            # both follow the units, separately
+        settle(qapp)
+        assert w.map.cbar.levels() == pytest.approx((288.15, 303.15))
+        w.scale_combo.setCurrentIndex(SCALE_DATASET)  # and the toolbar still overrides
+        settle(qapp)
+        assert w.map.cbar.levels() == pytest.approx(w.ds.value_range)
+    finally:
+        w.close()
+
+
+def test_a_map_range_alone_leaves_the_graph_on_the_dataset_range(qapp, run_dir,
+                                                                 isolated_config):
+    configure(isolated_config, '[fields.T_2M]\nunits = "C"\nmap_scale = [15, 30]\n')
+    w = open_window(qapp, run_dir / T2M)
+    try:
+        assert w.scale_combo.currentIndex() == SCALE_FIXED
+        assert w.map.cbar.levels() == pytest.approx((15.0, 30.0))
+        lo, hi = _graph_range(w)
+        ds_lo, ds_hi = w.ds.value_range
+        assert hi == pytest.approx(ds_hi, abs=2.0) and lo < 15.0
+    finally:
+        w.close()
+
+
+def test_the_dialog_shows_and_saves_the_map_range(qapp, isolated_config):
+    configure(isolated_config, MAP_SCALE)
+    d = settingsdialog.SettingsDialog(config.load(isolated_config))
+    try:
+        cell = d.fields_table.cellWidget
+        assert settingsdialog.FIELD_COLUMNS[-2:] == ['Map min', 'Map max']
+        assert cell(0, settingsdialog.COL['Map min']).text() == '15'
+        assert cell(0, settingsdialog.COL['Max']).text() == '40'
+        cell(0, settingsdialog.COL['Map max']).setText('32')
+        saved = d.save()
+        assert saved is not None and saved.warnings == []
+        assert saved.fields['T_2M'].map_scale == (15.0, 32.0)
+        assert saved.fields['T_2M'].fixed_range == (10.0, 40.0)
+        cell(0, settingsdialog.COL['Map max']).setText('')
+        assert d.save() is None and 'Map min and Map max' in d.error.text()
+    finally:
+        d.close()
