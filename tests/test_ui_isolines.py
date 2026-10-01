@@ -343,3 +343,203 @@ def test_a_long_title_does_not_crop_the_map(window, qapp):
     after = window.map.plot.vb.viewRange()
     assert np.allclose(before, after)
     assert window.map.cbar.isVisible()
+
+
+# ---- how close the lines are (R5.9) -----------------------------------------------------
+def set_spacing(window, app, step):
+    """Move the slider the way a hand does -- by notch, not by calling the view."""
+    from imsicon import isolines as iso
+    window.isoline_step_slider.setValue(iso.STEP_CHOICES.index(step))
+    settle(app)
+
+
+def test_the_spacing_slider_starts_on_the_field_s_own_interval(window):
+    from imsicon import isolines as iso
+    assert window.isoline_step_slider.isEnabled()
+    assert window.isoline_step_slider.value() == iso.STEP_CHOICES.index(1.0)
+    assert window.isoline_step_label.text() == '1 °C'
+    assert window.map.isoline_step == pytest.approx(1.0)
+
+
+def test_moving_the_slider_spaces_the_lines_further_apart(window, qapp):
+    close = window.map.isoline_levels.size
+    set_spacing(window, qapp, 2.0)
+    levels = window.map.isoline_levels
+    assert window.map.isoline_step == pytest.approx(2.0)
+    assert levels.size < close
+    assert np.allclose(np.diff(levels), 2.0)
+    assert np.allclose(levels % 2.0, 0.0)            # still anchored on 0 °C
+    assert window.isoline_step_label.text() == '2 °C'
+    assert 'isolines 2 °C' in window.map.plot.titleLabel.text
+    assert drawn(window)[0] > 0
+
+    set_spacing(window, qapp, 4.0)
+    assert window.map.isoline_step == pytest.approx(4.0)
+    assert window.map.isoline_levels.size < levels.size
+
+
+def test_the_closest_spacing_draws_more_lines_and_heavies_every_whole_degree(window, qapp):
+    """At 0.5 °C "every 5th" would put the heavy line on 2.5 °C, which is no landmark:
+    the emphasis follows the spacing so it lands on a whole degree instead."""
+    ordinary, _heavy = drawn(window)
+    set_spacing(window, qapp, 0.5)
+    assert window.map.isoline_step == pytest.approx(0.5)
+    assert drawn(window)[0] > ordinary
+    heavy = [level for level in window.map.isoline_levels if level % 1.0 == 0.0]
+    assert len(heavy) > 2 and drawn(window)[1] > 0
+    assert 'isolines 0.5 °C' in window.map.plot.titleLabel.text
+
+
+def test_unticking_isolines_puts_the_slider_out_of_reach_and_gives_it_back(window, qapp):
+    set_spacing(window, qapp, 3.0)
+    window.isolines_check.setChecked(False)
+    settle(qapp)
+    assert not window.isoline_step_slider.isEnabled()
+    assert window.isoline_step_label.text() == ''
+    assert drawn(window) == (0, 0)
+
+    window.isolines_check.setChecked(True)
+    settle(qapp)
+    assert window.isoline_step_slider.isEnabled()
+    assert window.map.isoline_step == pytest.approx(3.0)   # the choice was kept, not reset
+    assert np.allclose(window.map.isoline_levels % 3.0, 0.0)
+
+
+def test_the_label_follows_the_units_while_the_lines_stay_where_they_were(window, qapp):
+    """The notches are canonical degrees and the label is in the units on screen, which
+    is the point of G15: 2 °C reads as 3.6 °F over exactly the same isotherms."""
+    from imsicon import isolines as iso
+    set_spacing(window, qapp, 2.0)
+    celsius = window.map.isoline_levels.copy()
+    window.units_combo.setCurrentText('°F')
+    settle(qapp)
+    assert window.isoline_step_label.text() == '3.6 °F'
+    assert window.isoline_step_slider.value() == iso.STEP_CHOICES.index(2.0)
+    assert window.map.isoline_step == pytest.approx(3.6)
+    assert np.allclose(celsius * 1.8 + 32.0, window.map.isoline_levels)
+
+
+def test_each_field_keeps_the_spacing_it_was_last_read_at(window, qapp):
+    """Per field, because 2 °C on a temperature map and 2 °C on a depression are
+    different readings -- so flipping between them must neither carry one choice onto the
+    other nor throw the first one away."""
+    from imsicon import isolines as iso
+    set_spacing(window, qapp, 3.0)
+
+    choose(window, qapp, derivedialog.DEPRESSION)
+    assert window.isoline_step_slider.value() == iso.STEP_CHOICES.index(0.5)
+    assert window.map.isoline_step == pytest.approx(0.5)
+    set_spacing(window, qapp, 2.0)
+
+    choose(window, qapp, 'base')
+    assert window.ds.field == 'T_2M'
+    assert window.isoline_step_slider.value() == iso.STEP_CHOICES.index(3.0)
+    assert window.map.isoline_step == pytest.approx(3.0)
+
+    choose(window, qapp, derivedialog.DEPRESSION)
+    assert window.map.isoline_step == pytest.approx(2.0)
+
+
+def test_a_field_with_no_interval_leaves_the_slider_out_of_reach(window, qapp):
+    choose(window, qapp, 'file:RELHUM_2M')
+    assert not window.isoline_step_slider.isEnabled()
+    assert window.isoline_step_label.text() == ''
+    assert 'not contoured' in window.isoline_step_slider.toolTip()
+
+
+# ---- R9: the slider offers the field's own ladder -------------------------------------------
+iso = isolines
+
+
+@pytest.fixture
+def height_run(tmp_path):
+    """A geopotential column beside a temperature one, on five levels."""
+    nt, ny, nx = 3, 24, 18
+    lvls = (1000, 925, 850, 700, 500)
+    p = np.asarray(lvls, float)[None, :, None, None]
+    y = np.arange(ny)[None, None, :, None]
+    x = np.arange(nx)[None, None, None, :]
+    t = np.arange(nt)[:, None, None, None]
+    z = (8000.0 * np.log(1000.0 / p) + 6.0 * y + 4.0 * x + 3.0 * t) * iso.G0
+    synth.pressure_field(tmp_path / 'IE_2026083100_geopot.nc', 'geopot', 'm2 s-2',
+                         n_times=nt, ny=ny, nx=nx, levels=lvls,
+                         values=np.broadcast_to(z, (nt, len(lvls), ny, nx)))
+    synth.pressure_field(tmp_path / 'IE_2026083100_temp.nc', 'temp', 'K',
+                         n_times=nt, ny=ny, nx=nx, levels=lvls)
+    return tmp_path
+
+
+@pytest.fixture
+def height(qapp, height_run):
+    w = MainWindow(str(height_run / 'IE_2026083100_geopot.nc'))
+    w.resize(1200, 800)
+    w.show()
+    settle(qapp)
+    finish_scan(w, qapp)
+    yield w
+    w.close()
+
+
+def test_a_height_chart_offers_foot_spacings_and_opens_at_200(height):
+    slider = height.isoline_step_slider
+    assert height.units_combo.currentText() == 'ft'
+    assert height.isolines_check.isEnabled() and slider.isEnabled()
+    assert slider.maximum() == len(iso.HEIGHT.steps) - 1
+    assert slider.value() == iso.HEIGHT.steps.index(200.0)
+    assert height.isoline_step_label.text() == '200 ft'
+    assert height.map.isoline_step == pytest.approx(200.0)
+    assert 'ft' in slider.toolTip() and '250' in slider.toolTip()
+    assert 'isolines 200 ft' in height.map.plot.titleLabel.text
+
+
+def test_moving_the_slider_on_a_height_chart_spaces_the_lines_in_feet(height, qapp):
+    height.isoline_step_slider.setValue(iso.HEIGHT.steps.index(500.0))
+    settle(qapp)
+    assert height.isoline_step_label.text() == '500 ft'
+    assert height.map.isoline_step == pytest.approx(500.0)
+    levels = np.array(height.map.isoline_levels)
+    assert levels.size and np.allclose(levels / 500.0, np.rint(levels / 500.0))
+    assert 'isolines 500 ft' in height.map.plot.titleLabel.text
+
+
+def test_metres_and_decametres_relabel_the_same_lines(height, qapp):
+    height.isoline_step_slider.setValue(iso.HEIGHT.steps.index(500.0))
+    settle(qapp)
+    in_ft = np.array(height.map.isoline_levels)
+    height.units_combo.setCurrentText('gpm')
+    settle(qapp)
+    assert height.isoline_step_label.text() == '152.4 gpm'
+    np.testing.assert_allclose(np.array(height.map.isoline_levels) / 0.3048, in_ft)
+    height.units_combo.setCurrentText('dam')
+    settle(qapp)
+    assert height.isoline_step_label.text() == '15.24 dam'
+    assert height.map.isoline_step == pytest.approx(15.24)
+    np.testing.assert_allclose(np.array(height.map.isoline_levels) / 0.03048, in_ft)
+    assert height.isoline_step_slider.value() == iso.HEIGHT.steps.index(500.0)
+
+
+def test_switching_to_a_temperature_puts_the_degree_ladder_back(height, qapp):
+    keys = [height.field_combo.itemData(i) for i in range(height.field_combo.count())]
+    height.field_combo.setCurrentIndex(keys.index('file:temp'))
+    settle(qapp)
+    for worker in (height.decompressor, height.builder, height._height_builder):
+        if worker is not None and worker.isRunning():
+            worker.wait(30000)
+    settle(qapp)
+    assert height.ds.field == 'temp'
+    assert height.isoline_step_slider.maximum() == len(iso.STEP_CHOICES) - 1
+    assert height.isoline_step_slider.value() == iso.STEP_CHOICES.index(1.0)
+    assert height.isoline_step_label.text() == '1 °C'
+
+
+def test_the_command_line_spacing_is_snapped_to_the_field_s_ladder(height, capsys):
+    """`--isoline-step 300` on a height chart means 300 ft, and the nearest notch is 250."""
+    import argparse
+    from imsicon.__main__ import _apply_display
+    args = argparse.Namespace(derive=None, difference=None, units=None, rate=None,
+                              isolines=None, isoline_step=300.0, level=None, barbs=None,
+                              topo=None, profile=None, sort=False, write=None,
+                              screenshot=None)
+    _apply_display(height, args, None)
+    assert height.isoline_step_label.text() == '250 ft'
+    assert 'using 250' in capsys.readouterr().err

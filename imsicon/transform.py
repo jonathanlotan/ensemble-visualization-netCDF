@@ -183,9 +183,13 @@ UNITS.update({
     # Pa s-1, and NEGATIVE is rising air. No conversion: the sign convention is the thing
     # to know about omega, and hPa h-1 would invite reading it as a speed.
     'OMEGA':   FieldUnits(('pa s-1',), []),
-    # Geopotential is published as m2 s-2; a chart is drawn in geopotential metres, which
-    # is that divided by the standard gravity. Exact by definition of gpm, so it leads.
-    'GEOPOT':  FieldUnits(('m2 s-2',), [Affine('gpm', 1.0 / 9.80665), Affine('m2 s-2')]),
+    # Geopotential is published as m2 s-2. Divided by the standard gravity it is the
+    # geopotential height in metres; feet lead (R9, as asked -- flight levels are read in
+    # feet), with gpm and decametres (what a synoptic chart is labelled in) behind it.
+    # 1 ft = 0.3048 m exactly, by the definition of the international foot.
+    'GEOPOT':  FieldUnits(('m2 s-2',), [Affine('ft', 1.0 / (9.80665 * 0.3048)),
+                                         Affine('gpm', 1.0 / 9.80665),
+                                         Affine('dam', 1.0 / 98.0665), Affine('m2 s-2')]),
     # Surface.
     'T_G':     FieldUnits(('K',), _TEMPERATURE),
     'TMAX_2M': FieldUnits(('K',), _TEMPERATURE),

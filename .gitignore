@@ -14,3 +14,8 @@ dist/
 
 # CLAUDE.md 0.1: the IMS product PDFs carry the server credentials.
 ims_products_*.pdf
+
+# R10: the user settings file can hold the IMS password. It lives in the per-user config
+# directory, never here -- this only guards a copy pointed into the checkout by IMSICON_CONFIG.
+config.toml
+config.toml.bak

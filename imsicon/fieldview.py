@@ -37,6 +37,12 @@ class FieldView:
         self.rate_hours = 0
         self.rate_note = None
 
+        # R5.9: the spacing the user chose, in CANONICAL units, or None for the
+        # registry's own. Held on the view rather than in the window because everything
+        # else about "how is this field contoured" already is, and because the affine
+        # that turns it into display units lives here.
+        self._iso_step = None
+
     # ---- everything else is EnsembleFile's ------------------------------------------
     def __getattr__(self, name):
         # Only called when normal lookup fails. Guarded so an access before __init__
@@ -199,10 +205,40 @@ class FieldView:
         contoured field ever accumulated, its 1 h window would be a different quantity
         from the value the interval was chosen for.
         """
+        interval = self._interval()
+        if interval is None:
+            return None
+        return interval.scaled(self._units, difference=self.is_difference_view)
+
+    def _interval(self):
+        """-> the `Interval` in CANONICAL units, chosen spacing applied, or None."""
         interval = isolines.interval_for(self.field)
         if interval is None or self.rate_hours:
             return None
-        return interval.scaled(self._units, difference=self.is_difference_view)
+        return interval.at_step(self._iso_step) if self._iso_step else interval
+
+    @property
+    def isoline_step(self):
+        """The contour spacing in CANONICAL units, or None when not contoured.
+
+        Canonical, not display, so the control that sets it keeps meaning the same thing
+        while the Units combo moves -- see `isolines.STEP_CHOICES`.
+        """
+        interval = self._interval()
+        return None if interval is None else interval.step
+
+    def set_isoline_step(self, step):
+        """Choose the spacing, in canonical units; falsy or invalid restores the
+        registry's own. -> True when this field is contoured at all."""
+        step = abs(float(step or 0.0))
+        self._iso_step = step if np.isfinite(step) and step > 0 else None
+        return isolines.interval_for(self.field) is not None and not self.rate_hours
+
+    @property
+    def isoline_ladder(self):
+        """The spacings the slider offers for this field (R9): degrees on a temperature,
+        geopotential metres on a height chart."""
+        return isolines.ladder_for(self.field)
 
     @property
     def transform_signature(self):

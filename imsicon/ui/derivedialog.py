@@ -36,6 +36,10 @@ WIND = 'wind'
 # The same view from the 3-D components: one kind per ENTRY, because "Map shows" keys its
 # list on the kind and a run can offer both a 10 m wind map and one on pressure levels.
 WIND_UPPER = 'wind-upper'
+# R9: one file, opened as itself, through the same worker -- the run's geopotential held
+# beside a pressure-level map for the heights. Not stamped as derived: it is a plain
+# FieldView that "Map shows" may later install as the geopot map in its own right.
+FIELD = 'field'
 
 
 class DerivedRequest:
@@ -318,6 +322,8 @@ def build(request, opened=None):
         return existing if existing is not None else derived.open_field(path)
 
     views = [field_view(path) for path in request.paths]
+    if request.kind == FIELD:
+        return views[0]
     if request.kind == DEW_POINT:
         view = derived.dew_point(*views)
     elif request.kind == DEPRESSION:

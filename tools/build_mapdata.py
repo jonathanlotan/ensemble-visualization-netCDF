@@ -40,10 +40,12 @@ COASTLINE_URL = BASE + 'ne_10m_coastline.geojson'
 BORDERS_URL = BASE + 'ne_10m_admin_0_boundary_lines_land.geojson'
 LAND_URL = BASE + 'ne_10m_land.geojson'
 
-# The model domain is 28-34.5 N / 33-37 E, and MapView allows panning to domain +- 50 % of
-# the span (G10), so the overlay has to cover everything the user can reach -- otherwise
-# the coastline stops mid-pan and looks like a bug.
-CLIP = dict(lon_min=30.5, lon_max=39.5, lat_min=24.5, lat_max=38.0)
+# MapView allows panning to the domain +- 50 % of its span (G10), so the overlay has to
+# cover everything the user can reach -- otherwise the coastline stops mid-pan and looks
+# like a bug. Two domains now (R7): the ensemble's 28-34.5 N / 33-37 E reaches 24.75-37.75
+# N / 31-39 E, and the deterministic run's 29-36 N / 32-37 E reaches 25.5-39.5 N /
+# 29.5-39.5 E. The box is the union, which is also the clip `tools/build_terrain.py` uses.
+CLIP = dict(lon_min=29.5, lon_max=39.5, lat_min=24.5, lat_max=39.5)
 DECIMALS = 4                    # ~11 m; the model grid is 2.5 km, so this is far finer
 
 # Natural Earth's own classes, mapped to how the viewer draws them. Anything the source
@@ -51,9 +53,22 @@ DECIMALS = 4                    # ~11 m; the model grid is 2.5 km, so this is fa
 SOLID_CLASSES = ('International boundary (verify)',)
 
 
+def _ssl_context():
+    """The python.org macOS build ships no root certificates for `urllib`, so a fetch fails
+    with CERTIFICATE_VERIFY_FAILED on a perfectly good server. `certifi` (a dependency of
+    `requests`, which the downloader already uses) carries them; fall back to the default
+    context where it is not installed."""
+    import ssl
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
+
+
 def fetch(url):
     print(f'  fetching {url.rsplit("/", 1)[-1]} ...', flush=True)
-    with urllib.request.urlopen(url, timeout=120) as response:
+    with urllib.request.urlopen(url, timeout=120, context=_ssl_context()) as response:
         return json.loads(response.read().decode('utf8'))
 
 

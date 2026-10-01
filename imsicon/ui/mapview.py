@@ -3,7 +3,7 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .. import barbs, isolines as iso
+from .. import barbs, isolines as iso, terrain
 
 # row-major must be set before any ImageItem exists: image[row=lat, col=lon]
 pg.setConfigOption('imageAxisOrder', 'row-major')
@@ -21,6 +21,12 @@ pg.setConfigOption('foreground', 'k')
 # at all -- the widget background is already white.
 Z_LAND = -10
 Z_FIELD = 0
+# The shaded relief (R9) sits directly on the field and multiplies it: slopes facing away
+# from the light darken whatever is under them -- the field's colour, or the grey land
+# where the field is transparent -- and nothing else changes. Under the isolines, which
+# are a reading, and above the field, because a multiply under an opaque image would do
+# nothing at all.
+Z_TERRAIN = 1
 # Isolines of the field sit directly on it, under every geographic outline: the coastline
 # is the frame you read the contours against, so it goes on top of them, not under.
 Z_ISOLINE = 5
@@ -29,10 +35,20 @@ Z_BORDER = 12
 # Wind barbs sit above the outlines: they are the reading, and an outline crossing a barb
 # is easier to follow than a barb hidden under a border.
 Z_BARB = 15
+# The user's own points (R10, from the configuration file) sit over the reading layers --
+# they are landmarks the eye navigates by -- and under the picked-point marker, which is
+# the one thing on the map that must never be hidden.
+Z_POINTS = 18
 Z_MARKER = 20
+POINT_SIZE_PX = 9
 
-# Roughly the colorbar column, kept out of the title's wrapping width (G36).
-TITLE_MARGIN_PX = 110
+# The colorbar column plus the layout's own margins, kept out of the title's wrapping
+# width (G36). MEASURED (R9): at 110 px the layout came out 738 px wide in a 718 px
+# widget -- the plot's minimum is the wrapped title plus 41 px of its own frame, and the
+# colorbar is 63 px once its axis sizes itself to four-digit labels -- so the colorbar's
+# last 20 px, and with them the last digit of every label over 999, were off the edge of
+# the widget. 150 px leaves room for a five-digit scale.
+TITLE_MARGIN_PX = 150
 
 # Pale enough to sit under a colour ramp without competing with the lowest values it
 # carries, dark enough to read as land against the white sea at a glance.
@@ -90,6 +106,19 @@ class MapView(pg.GraphicsLayoutWidget):
         self.img = pg.ImageItem(axisOrder='row-major')
         self.img.setZValue(Z_FIELD)
         self.plot.addItem(self.img)
+        # Shaded relief (R9), built on first use from the bundled elevation grid and the
+        # land polygons above, and composited with Multiply so it can only ever darken.
+        # `ignoreBounds`: it covers the whole pan range, and the pan range must not be
+        # allowed to grow to fit it.
+        self.terrain = pg.ImageItem(axisOrder='row-major')
+        self.terrain.setZValue(Z_TERRAIN)
+        self.terrain.setCompositionMode(
+            QtGui.QPainter.CompositionMode.CompositionMode_Multiply)
+        self.terrain.hide()
+        self.plot.addItem(self.terrain, ignoreBounds=True)
+        self.terrain_on = False            # asked for
+        self._terrain_key = None           # what the relief image was built from
+        self._land_ref = None              # the rings the land path was filled from
         # Isolines (R5), in two weights: every line, and every 5th (or 2nd) drawn heavier
         # so the eye can count in fives instead of one at a time. Both `ignoreBounds`, for
         # the reason the barbs are: geometry computed FROM the frame must never feed back
@@ -122,6 +151,13 @@ class MapView(pg.GraphicsLayoutWidget):
         self.barb = self._outline(Z_BARB, '#101010', 1.3, halo=3.0, ignore_bounds=True)
         self.barb_flags = self._flag_layer()
 
+        # R10: the configured points. One scatter for the dots, one text item per name.
+        self.points = pg.ScatterPlotItem(size=POINT_SIZE_PX, pen=pg.mkPen('#ffffff', width=1.5))
+        self.points.setZValue(Z_POINTS)
+        self.plot.addItem(self.points, ignoreBounds=True)
+        self.point_labels = []
+        self.points_shown = True
+
         self.marker = pg.ScatterPlotItem(size=17, symbol='+', pen=pg.mkPen('#ffffff', width=2.5),
                                          brush=None)
         self.marker.setZValue(Z_MARKER + 1)
@@ -135,6 +171,10 @@ class MapView(pg.GraphicsLayoutWidget):
         self.cbar = pg.ColorBarItem(colorMap=self.cmap, interactive=True,
                                     values=(0.0, 1.0))
         self.cbar.setImageItem(self.img)
+        # pyqtgraph pins the colorbar's axis to 45 px, which fits three digits and clips
+        # the fourth: a CAPE scale read 0, 100, 200, 300 for 0..3000 J kg-1, and a 500 hPa
+        # height chart 552 for 5,520 gpm (R9). None lets the axis size itself to its text.
+        self.cbar.axis.setWidth(None)
         self.addItem(self.cbar, row=0, col=1)
 
         # F3.2: wheel zoom is the ViewBox default; keep drag-pan and add a home view.
@@ -236,6 +276,9 @@ class MapView(pg.GraphicsLayoutWidget):
             path.closeSubpath()
         self.land.setPath(path)
         self.land_rings = len(rings)
+        self._land_ref = rings
+        if self.terrain_on:
+            self._ensure_terrain()         # a new land mask means a new relief image
 
     def reset_view(self):
         """Fit the whole domain. Aspect lock means one axis gets slack, not a crop."""
@@ -323,9 +366,120 @@ class MapView(pg.GraphicsLayoutWidget):
         self.isoline_heavy.setData(*drawn['emphasised'])
         self.isoline_levels, self.isoline_step = drawn['levels'], drawn['step']
 
+    # ---- the user's points (R10) ------------------------------------------------------
+    def set_points(self, points, visible=True):
+        """Draw `config.Point`s as dots, named when they have a name. -> the colour
+        strings Qt did not recognise (those points are drawn in the default blue)."""
+        for item in self.point_labels:
+            self.plot.removeItem(item)
+        self.point_labels = []
+        points = list(points or ())
+        unknown, brushes = [], []
+        for point in points:
+            colour = QtGui.QColor(point.colour)
+            if not colour.isValid():
+                unknown.append(point.colour)
+                colour = QtGui.QColor('blue')
+            brushes.append(pg.mkBrush(colour))
+        if points:
+            self.points.setData(x=[p.lon for p in points], y=[p.lat for p in points],
+                                brush=brushes)
+        else:
+            self.points.clear()
+        for point in points:
+            if not point.name:
+                continue
+            label = pg.TextItem(point.name, color='#101010', anchor=(-0.12, 0.5),
+                                fill=pg.mkBrush(255, 255, 255, 170))
+            label.setPos(point.lon, point.lat)
+            label.setZValue(Z_POINTS)
+            self.plot.addItem(label, ignoreBounds=True)
+            self.point_labels.append(label)
+        self.show_points(visible)
+        return unknown
+
+    def show_points(self, on):
+        self.points_shown = bool(on)
+        self.points.setVisible(self.points_shown)
+        for label in self.point_labels:
+            label.setVisible(self.points_shown)
+
+    @property
+    def point_count(self):
+        return len(self.points.data) if self.points_shown else 0
+
     def set_marker(self, lat, lon):
         for item in (self.marker, self.marker_halo):
             item.setData([lon], [lat])
+
+    # ---- shaded relief (R9) ------------------------------------------------------------
+    def set_terrain(self, on):
+        """Show or hide the shaded relief. -> True when it is actually drawn.
+
+        Built lazily: a user who never ticks Topography never pays for the hillshade, and
+        one who does pays once -- the image depends on the bundle and the land polygons,
+        neither of which changes with the field, the time step or the zoom.
+        """
+        self.terrain_on = bool(on)
+        drawn = self.terrain_on and self._ensure_terrain()
+        self.terrain.setVisible(drawn)
+        return drawn
+
+    @property
+    def terrain_drawn(self):
+        return self.terrain.isVisible()
+
+    def _ensure_terrain(self):
+        data = terrain.load_terrain()
+        if data is None:
+            self._terrain_key = None
+            return False
+        key = (id(data), id(self._land_ref))
+        if key == self._terrain_key:
+            return True
+        shade = terrain.hillshade(data['z'], data['lat'], data['lon'])
+        rgba = terrain.relief_rgba(shade, self._land_mask(data))
+        self.terrain.setImage(rgba, autoLevels=False)
+        x0, _x1, y0, _y1 = terrain.extent(data)
+        dlon = float(np.diff(data['lon']).mean())
+        dlat = float(np.diff(data['lat']).mean())
+        tr = QtGui.QTransform()
+        tr.translate(x0, y0)
+        tr.scale(dlon, dlat)
+        self.terrain.setTransform(tr)
+        self._terrain_key = key
+        return True
+
+    def _land_mask(self, data):
+        """True on land, on the elevation grid -- rasterised from the land polygons.
+
+        The same rings, the same odd-even rule and the same painter as the grey fill, so
+        the relief ends exactly where the grey does and the sea stays white whatever the
+        sea floor under it looks like. Without rings (an older bundle) it falls back to
+        'above sea level', which loses the Dead Sea shore and nothing else.
+        """
+        path = self.land.path()
+        if path.isEmpty():
+            return terrain.land_from_elevation(data['z'])
+        ny, nx = data['z'].shape
+        x0, _x1, y0, _y1 = terrain.extent(data)
+        dlon = float(np.diff(data['lon']).mean())
+        dlat = float(np.diff(data['lat']).mean())
+        image = QtGui.QImage(nx, ny, QtGui.QImage.Format.Format_ARGB32)
+        image.fill(QtGui.QColor(0, 0, 0, 255))
+        painter = QtGui.QPainter(image)
+        try:
+            painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
+            # degrees -> pixels: translate the grid's south-west edge to the origin, then
+            # scale a cell to one pixel. Row 0 is the SOUTH edge, which is also row 0 of
+            # the elevation array, so the mask needs no flip.
+            painter.setTransform(QtGui.QTransform.fromTranslate(-x0, -y0)
+                                 * QtGui.QTransform.fromScale(1.0 / dlon, 1.0 / dlat))
+            painter.fillPath(path, QtGui.QColor(255, 255, 255, 255))
+        finally:
+            painter.end()
+        pixels = pg.functions.imageToArray(image, copy=True, transpose=False)
+        return np.asarray(pixels[..., 1]) > 127
 
     # ---- wind barbs ------------------------------------------------------------
     def set_wind(self, source):

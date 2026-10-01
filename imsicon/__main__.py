@@ -4,7 +4,7 @@ import sys
 
 from PySide6 import QtCore, QtWidgets
 
-from . import derived, ingest, ncwrite, products, transform
+from . import derived, ingest, isolines, ncwrite, products, transform
 from .ui import derivedialog
 from .ui.main import MainWindow
 
@@ -47,11 +47,38 @@ def main(argv=None):
                     help="draw the run's wind barbs over the map, whatever field it "
                          'shows (needs the run\'s wind components beside the file); the '
                          'wind map draws its own either way')
+    ap.add_argument('--isoline-step', type=float, default=None, metavar='SPACING',
+                    help='how close the isolines are, snapped to the nearest spacing the '
+                         'field offers: '
+                         + ', '.join(f'{step:g}' for step in isolines.DEGREES.steps)
+                         + ' degrees Celsius on a temperature or a difference such as '
+                           'T-Td; '
+                         + ', '.join(f'{step:g}' for step in isolines.HEIGHT.steps)
+                         + " ft on a geopotential height chart (default: the field's "
+                           'own, 1 degC on a temperature, 0.5 on a difference, 200 ft '
+                           'on a height)')
+    ap.add_argument('--topo', choices=('on', 'off'), default=None,
+                    help='shaded relief under the map, from the bundled ETOPO1 elevation '
+                         'grid (default: as last used)')
+    ap.add_argument('--profile', choices=('on', 'off'), default=None,
+                    help='on a pressure-level file, draw the right-hand panel as a '
+                         'vertical profile (value across, geopotential height up) '
+                         'instead of the time graph (default: on for rh, off otherwise)')
     ap.add_argument('--sort', action='store_true',
                     help='T-Td only: colour the map only where the depression is under '
                          '2 degC (2 white, 1 yellow-orange, 0 red), leaving drier air '
                          'uncoloured')
+    ap.add_argument('--settings', action='store_true',
+                    help='open the Settings window on its own (credentials, points on '
+                         'the map, per-map defaults) and exit when it closes')
     args = ap.parse_args(argv)
+    if args.settings:
+        from .ui.settingsdialog import SettingsDialog
+        app = QtWidgets.QApplication(sys.argv[:1])
+        app.setApplicationName('IMS ICON Ensemble Viewer')
+        dialog = SettingsDialog()
+        dialog.exec()
+        return 0
     if args.derive and args.difference:
         ap.error('--derive and --difference choose the same thing; give only one')
 
@@ -61,11 +88,12 @@ def main(argv=None):
     window.show()
 
     wants_post = any((args.units, args.rate is not None, args.derive, args.difference,
-                      args.write, args.isolines is not None, args.sort,
-                      args.level is not None, args.barbs is not None))
+                      args.write, args.isolines is not None, args.isoline_step is not None,
+                      args.sort, args.level is not None, args.barbs is not None,
+                      args.topo is not None, args.profile is not None))
     if wants_post and not args.path:
-        ap.error('--units/--rate/--derive/--difference/--write/--isolines/--sort/--level'
-                 '/--barbs need a file path')
+        ap.error('--units/--rate/--derive/--difference/--write/--isolines/--isoline-step'
+                 '/--sort/--level/--barbs/--topo/--profile need a file path')
     if args.screenshot:
         if not args.path:
             ap.error('--screenshot needs a file path')
@@ -165,6 +193,36 @@ def _apply_display(window, args, ap, tries=0):
             print(f'--isolines on: {window.ds.display_name} is not a contoured field',
                   file=sys.stderr)
         window.isolines_check.setChecked(args.isolines == 'on')
+    if args.isoline_step is not None:
+        # Set after --isolines, and deliberately even when the lines are switched off:
+        # the spacing is a property of the field, so ticking Isolines afterwards draws
+        # the interval that was asked for rather than the default.
+        if not window.isolines_check.isEnabled():
+            print(f'--isoline-step: {window.ds.display_name} is not a contoured field',
+                  file=sys.stderr)
+        else:
+            # In the field's natural unit -- degrees on a temperature, gpm on a height --
+            # and snapped to the ladder the slider offers, as the slider itself would.
+            ladder = window.ds.isoline_ladder
+            chosen = ladder.nearest(args.isoline_step)
+            if abs(chosen - args.isoline_step) > 1e-9:
+                print(f'--isoline-step {args.isoline_step:g}: {window.ds.display_name} '
+                      f'offers {", ".join(f"{s:g}" for s in ladder.steps)} {ladder.unit}; '
+                      f'using {chosen:g}', file=sys.stderr)
+            window.isoline_step_slider.setValue(ladder.steps.index(chosen))
+    if args.topo is not None:
+        if args.topo == 'on' and not window.topo_check.isEnabled():
+            print('--topo on: the bundled elevation grid is missing, so there is no '
+                  'relief to draw', file=sys.stderr)
+        window.topo_check.setChecked(args.topo == 'on')
+    if args.profile is not None:
+        if args.profile == 'on' and not window.profile_check.isEnabled():
+            print(f'--profile on: {window.ds.display_name} is not on pressure levels, so '
+                  'there is no column to draw as a profile', file=sys.stderr)
+        window.profile_check.setChecked(args.profile == 'on')
+        if window._height_builder is not None and window._height_builder.isRunning():
+            window._height_builder.wait(60000)
+            QtWidgets.QApplication.processEvents()
     if args.level is not None:
         _apply_level(window, args.level)
     if args.barbs is not None:
@@ -216,9 +274,13 @@ def _shoot(app, window, args):
         if window.scan is not None and window.scan.isRunning():
             window.scan.wait(5000)
             window._on_scan_done(window.ds.value_range)
+        if window._height_builder is not None and window._height_builder.isRunning():
+            window._height_builder.wait(60000)
+            app.processEvents()
         if any((args.units, args.rate is not None, args.derive, args.difference,
-                args.write, args.isolines is not None, args.sort,
-                args.level is not None, args.barbs is not None)):
+                args.write, args.isolines is not None, args.isoline_step is not None,
+                args.sort, args.level is not None, args.barbs is not None,
+                args.topo is not None, args.profile is not None)):
             _apply_display(window, args, None)
         if args.point:
             window.select_point(*window.ds.nearest_index(*args.point))

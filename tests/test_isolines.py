@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 import synth
-from imsicon import derived, isolines, ncwrite
+from imsicon import derived, isolines, ncwrite, transform
 from imsicon.dataset import EnsembleFile
 from imsicon.fieldview import FieldView
 from imsicon.transform import Affine
@@ -433,3 +433,154 @@ def test_a_depression_built_from_a_saved_dew_point_file_is_the_same_map(tmp_path
     live = derived.dew_point_depression(FieldView(EnsembleFile(temperature)),
                                         FieldView(EnsembleFile(humidity)))
     assert np.allclose(view.agg_frame(1, 'mean'), live.agg_frame(1, 'mean'), atol=1e-5)
+
+
+# ---- choosing the spacing (R5.9) --------------------------------------------------------
+def test_the_five_offered_spacings_are_degrees_a_reader_would_name():
+    assert isolines.STEP_CHOICES == (0.5, 1.0, 2.0, 3.0, 4.0)
+    # every field's own interval is one of them, so the slider always has somewhere to sit
+    assert isolines.interval_for('T_2M').step in isolines.STEP_CHOICES
+    assert isolines.DIFFERENCE.step in isolines.STEP_CHOICES
+    assert isolines.nearest_step(0.51) == 0.5
+    assert isolines.nearest_step(2.4) == 2.0
+    assert isolines.nearest_step(99.0) == 4.0
+
+
+def test_a_chosen_spacing_keeps_the_anchor_and_moves_the_emphasis():
+    """Re-spacing must re-read the map, not redraw it somewhere else: every choice still
+    puts a line on 0 degC, and the heavy line still lands on a number worth naming."""
+    interval = isolines.Interval(1.0, 5, isolines.ZERO_CELSIUS_K)
+    assert interval.at_step(2.0) == isolines.Interval(2.0, 5, isolines.ZERO_CELSIUS_K)
+    assert interval.at_step(0.5).emphasis == 2          # heavy every 1 degC, not every 2.5
+    heavy_at = {step: step * interval.at_step(step).emphasis
+                for step in isolines.STEP_CHOICES}
+    assert heavy_at == {0.5: 1.0, 1.0: 5.0, 2.0: 10.0, 3.0: 6.0, 4.0: 20.0}
+    for step, spacing in heavy_at.items():
+        assert spacing % 1.0 == 0.0, step
+
+
+def test_a_spacing_that_is_not_a_number_leaves_the_interval_alone():
+    """It is reached from a slider and a command line, so a bad value has to cost the map
+    its spacing choice and never its lines."""
+    interval = isolines.Interval(1.0, 5, isolines.ZERO_CELSIUS_K)
+    assert interval.at_step(0.0) is interval
+    assert interval.at_step(np.nan) is interval
+    assert interval.at_step(-2.0) == interval.at_step(2.0)      # a spacing has no sign
+
+
+def test_a_chosen_spacing_still_anchors_on_whole_degrees(pair):
+    temperature, _humidity = pair
+    assert temperature.set_isoline_step(3.0)
+    interval = temperature.isolines
+    assert (interval.step, interval.anchor) == (3.0, 0.0)
+    levels, step = isolines.levels_for(10.0, 20.0, interval.step, interval.anchor)
+    assert list(levels) == [12.0, 15.0, 18.0]       # multiples of 3 degC, not of the frame
+    assert step == 3.0
+
+
+def test_a_chosen_spacing_is_canonical_so_a_unit_change_relabels_it(pair):
+    """G15 applied to the user's own choice: picking 2 with the Units combo on degF draws
+    the lines picking 2 on degC drew, called 3.6 degF -- not a new set on whole degF."""
+    temperature, _humidity = pair
+    temperature.set_isoline_step(2.0)
+    celsius = temperature.isolines
+    temperature.set_units('°F')
+    fahrenheit = temperature.isolines
+    assert temperature.isoline_step == 2.0          # the choice itself never moved
+    assert fahrenheit.step == pytest.approx(3.6)
+    assert fahrenheit.anchor == pytest.approx(32.0)
+    here, _ = isolines.levels_for(10.0, 20.0, celsius.step, celsius.anchor)
+    there, _ = isolines.levels_for(50.0, 68.0, fahrenheit.step, fahrenheit.anchor)
+    assert np.allclose(here * 1.8 + 32.0, there)
+
+
+def test_the_registry_interval_comes_back_when_the_choice_is_cleared(pair):
+    temperature, _humidity = pair
+    temperature.set_isoline_step(4.0)
+    assert temperature.isoline_step == 4.0
+    temperature.set_isoline_step(0)
+    assert temperature.isolines == isolines.Interval(1.0, 5, 0.0)
+
+
+def test_a_field_with_no_interval_cannot_be_spaced(pair):
+    _temperature, humidity = pair
+    assert not humidity.set_isoline_step(2.0)
+    assert humidity.isolines is None and humidity.isoline_step is None
+
+
+def test_a_derived_view_is_spaced_on_its_own_and_not_on_its_operand_s(pair):
+    """The `_iso_step` class attribute on DerivedView, in the place it matters: without
+    it `__getattr__` would hand the lookup to the operand FieldView and contour a
+    depression at the spacing chosen for the temperature underneath it."""
+    temperature, humidity = pair
+    temperature.set_isoline_step(4.0)
+    view = derived.dew_point_depression(temperature, humidity)
+    assert view.isolines == isolines.Interval(0.5, 2, 0.0)
+
+    assert view.set_isoline_step(3.0)
+    assert view.isolines == isolines.Interval(3.0, 2, 0.0)
+    assert temperature.isolines.step == 4.0        # and the operand did not move with it
+
+
+# ---- R9: a ladder per quantity, and the geopotential height -------------------------------
+def test_a_ladder_converts_between_its_natural_unit_and_the_canonical_one():
+    ladder = isolines.HEIGHT
+    assert ladder.unit == 'ft'
+    assert isolines.FT == pytest.approx(0.3048 * isolines.G0)
+    assert ladder.canonical(500.0) == pytest.approx(500.0 * isolines.FT)
+    assert ladder.natural(500.0 * isolines.FT) == pytest.approx(500.0)
+    assert ladder.nearest(300.0) == 250.0 and ladder.nearest(800.0) == 1000.0
+    assert ladder.index_of(2000.0 * isolines.FT) == ladder.steps.index(2000.0)
+    assert ladder.index_of(0.0) == 0
+    assert isolines.DEGREES.steps == isolines.STEP_CHOICES
+    assert isolines.DEGREES.emphasis_for(0.5) == 2
+    # every notch puts the heavy line on a whole thousand feet
+    for step in ladder.steps:
+        assert step * ladder.emphasis_for(step) == pytest.approx(1000.0) or step >= 1000.0
+
+
+def test_the_geopotential_is_contoured_every_200_ft_whatever_the_units_say():
+    """The file is m2 s-2; the chart is read in ft, gpm or dam. Same lines, four labels."""
+    interval = isolines.interval_for('geopot')
+    assert interval is isolines.interval_for('GEOPOT')
+    assert interval.ladder is isolines.HEIGHT
+    assert interval.step == pytest.approx(200.0 * isolines.FT) and interval.anchor == 0.0
+    ft, gpm, dam, raw = transform.choices_for('geopot', 'm2 s-2')[0]
+    assert (ft.label, gpm.label, dam.label, raw.label) == ('ft', 'gpm', 'dam', 'm2 s-2')
+    assert interval.scaled(ft).step == pytest.approx(200.0)
+    assert interval.scaled(gpm).step == pytest.approx(60.96)
+    assert interval.scaled(dam).step == pytest.approx(6.096)
+    assert interval.scaled(raw).step == pytest.approx(200.0 * isolines.FT)
+    # the same lines: 18,000 ft is 5,486.4 gpm is 548.64 dam
+    for affine, value in ((ft, 18000.0), (gpm, 5486.4), (dam, 548.64),
+                          (raw, 18000.0 * isolines.FT)):
+        levels, _ = isolines.levels_for(value - 1e-6, value + 1e-6,
+                                        interval.scaled(affine).step, 0.0)
+        assert levels.size == 1 and levels[0] == pytest.approx(value)
+
+
+def test_ladder_for_names_the_right_ladder_and_a_re_spaced_height_keeps_it():
+    assert isolines.ladder_for('geopot') is isolines.HEIGHT
+    assert isolines.ladder_for('T_2M') is isolines.DEGREES
+    assert isolines.ladder_for('temp') is isolines.DEGREES
+    assert isolines.ladder_for('CAPE_ML') is isolines.DEGREES      # not contoured: the default
+    coarse = isolines.interval_for('geopot').at_step(500.0 * isolines.FT)
+    assert coarse.ladder is isolines.HEIGHT and coarse.emphasis == 2
+    assert coarse.step == pytest.approx(500.0 * isolines.FT)
+    assert coarse.scaled(transform.choices_for('geopot', 'm2 s-2')[0][0]).ladder \
+        is isolines.HEIGHT
+
+
+def test_a_view_offers_its_own_ladder(tmp_path):
+    synth.pressure_field(tmp_path / 'IE_2026083100_geopot.nc', 'geopot', 'm2 s-2')
+    height = FieldView(EnsembleFile(tmp_path / 'IE_2026083100_geopot.nc'))
+    assert height.isoline_ladder is isolines.HEIGHT
+    assert height.units == 'ft'
+    assert height.isolines.step == pytest.approx(200.0)
+    assert height.set_isoline_step(isolines.HEIGHT.canonical(1000.0))
+    assert height.isolines.step == pytest.approx(1000.0)
+    assert height.isoline_step == pytest.approx(1000.0 * isolines.FT)
+    assert height.set_units('gpm') and height.isolines.step == pytest.approx(304.8)
+    synth.temperature(tmp_path / 'ICON_ENS_2026082300_T_2M.nc')
+    warm = FieldView(EnsembleFile(tmp_path / 'ICON_ENS_2026082300_T_2M.nc'))
+    assert warm.isoline_ladder is isolines.DEGREES
