@@ -442,9 +442,17 @@ class DerivedView:
             return None
         return interval.scaled(self.units_affine, difference=self.is_difference_view)
 
+    def _base_interval(self):
+        """The view's own interval, else one the user's configuration gives its name (R10:
+        a spacing for `WSPD_10M` in the config file contours the wind map)."""
+        if self.isoline_interval is not None:
+            return self.isoline_interval
+        return (isolines.CUSTOM.get(products.field_key(self.field))
+                or isolines.CUSTOM.get(products.field_key(self.display_name)))
+
     def _interval(self):
         """-> the `Interval` in CANONICAL units, chosen spacing applied, or None."""
-        interval = self.isoline_interval
+        interval = self._base_interval()
         if interval is None:
             return None
         return interval.at_step(self._iso_step) if self._iso_step else interval
@@ -460,11 +468,11 @@ class DerivedView:
         registry's own. -> True when this view is contoured at all."""
         step = abs(float(step or 0.0))
         self._iso_step = step if np.isfinite(step) and step > 0 else None
-        return self.isoline_interval is not None
+        return self._base_interval() is not None
 
     @property
     def isoline_ladder(self):
-        interval = self.isoline_interval
+        interval = self._base_interval()
         return (interval.ladder if interval is not None and interval.ladder
                 else isolines.DEGREES)
 

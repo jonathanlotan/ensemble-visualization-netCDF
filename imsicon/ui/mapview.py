@@ -35,7 +35,12 @@ Z_BORDER = 12
 # Wind barbs sit above the outlines: they are the reading, and an outline crossing a barb
 # is easier to follow than a barb hidden under a border.
 Z_BARB = 15
+# The user's own points (R10, from the configuration file) sit over the reading layers --
+# they are landmarks the eye navigates by -- and under the picked-point marker, which is
+# the one thing on the map that must never be hidden.
+Z_POINTS = 18
 Z_MARKER = 20
+POINT_SIZE_PX = 9
 
 # The colorbar column plus the layout's own margins, kept out of the title's wrapping
 # width (G36). MEASURED (R9): at 110 px the layout came out 738 px wide in a 718 px
@@ -145,6 +150,13 @@ class MapView(pg.GraphicsLayoutWidget):
         self.barb_stride = (0, 0)          # grid cells skipped between them (y, x)
         self.barb = self._outline(Z_BARB, '#101010', 1.3, halo=3.0, ignore_bounds=True)
         self.barb_flags = self._flag_layer()
+
+        # R10: the configured points. One scatter for the dots, one text item per name.
+        self.points = pg.ScatterPlotItem(size=POINT_SIZE_PX, pen=pg.mkPen('#ffffff', width=1.5))
+        self.points.setZValue(Z_POINTS)
+        self.plot.addItem(self.points, ignoreBounds=True)
+        self.point_labels = []
+        self.points_shown = True
 
         self.marker = pg.ScatterPlotItem(size=17, symbol='+', pen=pg.mkPen('#ffffff', width=2.5),
                                          brush=None)
@@ -353,6 +365,48 @@ class MapView(pg.GraphicsLayoutWidget):
         self.isoline.setData(*drawn['ordinary'])
         self.isoline_heavy.setData(*drawn['emphasised'])
         self.isoline_levels, self.isoline_step = drawn['levels'], drawn['step']
+
+    # ---- the user's points (R10) ------------------------------------------------------
+    def set_points(self, points, visible=True):
+        """Draw `config.Point`s as dots, named when they have a name. -> the colour
+        strings Qt did not recognise (those points are drawn in the default blue)."""
+        for item in self.point_labels:
+            self.plot.removeItem(item)
+        self.point_labels = []
+        points = list(points or ())
+        unknown, brushes = [], []
+        for point in points:
+            colour = QtGui.QColor(point.colour)
+            if not colour.isValid():
+                unknown.append(point.colour)
+                colour = QtGui.QColor('blue')
+            brushes.append(pg.mkBrush(colour))
+        if points:
+            self.points.setData(x=[p.lon for p in points], y=[p.lat for p in points],
+                                brush=brushes)
+        else:
+            self.points.clear()
+        for point in points:
+            if not point.name:
+                continue
+            label = pg.TextItem(point.name, color='#101010', anchor=(-0.12, 0.5),
+                                fill=pg.mkBrush(255, 255, 255, 170))
+            label.setPos(point.lon, point.lat)
+            label.setZValue(Z_POINTS)
+            self.plot.addItem(label, ignoreBounds=True)
+            self.point_labels.append(label)
+        self.show_points(visible)
+        return unknown
+
+    def show_points(self, on):
+        self.points_shown = bool(on)
+        self.points.setVisible(self.points_shown)
+        for label in self.point_labels:
+            label.setVisible(self.points_shown)
+
+    @property
+    def point_count(self):
+        return len(self.points.data) if self.points_shown else 0
 
     def set_marker(self, lat, lon):
         for item in (self.marker, self.marker_halo):

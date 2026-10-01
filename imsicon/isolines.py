@@ -205,8 +205,43 @@ def interval_for(field):
 
     Keyed on `products.field_key`, so the two families' spellings of one quantity
     (`T_2M` and `t_2m`) are contoured identically rather than one of them not at all.
+    The built-in table wins; a field it does not contour may still have a spacing from
+    the user's configuration file (`set_custom`).
     """
-    return STEPS.get(products.field_key(field))
+    key = products.field_key(field)
+    return STEPS.get(key) or CUSTOM.get(key)
+
+
+# R10: fields the built-in table does not contour, made contourable by a spacing in the
+# user's configuration file -- CAPE at 500 J kg-1, say, which R5.7 left as "a one-line
+# registry entry each". Stated in the FILE's units (scale 1), anchored at 0, every 5th
+# line heavier; the slider offers half, the same, twice and four times that spacing.
+# Replaced wholesale by `set_custom` whenever the configuration is (re)loaded.
+CUSTOM = {}
+CUSTOM_FACTORS = (0.5, 1.0, 2.0, 4.0)
+
+
+def custom_interval(step, unit='units'):
+    step = abs(float(step))
+    ladder = Ladder(tuple(step * f for f in CUSTOM_FACTORS), 1.0, {}, unit or 'units')
+    return Interval(step, 5, 0.0, ladder)
+
+
+def set_custom(steps, units=None):
+    """Install `{field: step}` from the configuration; built-in fields are skipped (their
+    configured step is a default spacing on their own ladder, not a new interval).
+    `units` maps a field to the name of its file units, for the slider's help text.
+    """
+    CUSTOM.clear()
+    for field, step in (steps or {}).items():
+        key = products.field_key(field)
+        try:
+            step = float(step)
+        except (TypeError, ValueError):
+            continue
+        if key in STEPS or not np.isfinite(step) or step <= 0:
+            continue
+        CUSTOM[key] = custom_interval(step, (units or {}).get(key))
 
 
 def levels_for(lo, hi, step, anchor=0.0, cap=None):

@@ -68,7 +68,17 @@ def main(argv=None):
                     help='T-Td only: colour the map only where the depression is under '
                          '2 degC (2 white, 1 yellow-orange, 0 red), leaving drier air '
                          'uncoloured')
+    ap.add_argument('--settings', action='store_true',
+                    help='open the Settings window on its own (credentials, points on '
+                         'the map, per-map defaults) and exit when it closes')
     args = ap.parse_args(argv)
+    if args.settings:
+        from .ui.settingsdialog import SettingsDialog
+        app = QtWidgets.QApplication(sys.argv[:1])
+        app.setApplicationName('IMS ICON Ensemble Viewer')
+        dialog = SettingsDialog()
+        dialog.exec()
+        return 0
     if args.derive and args.difference:
         ap.error('--derive and --difference choose the same thing; give only one')
 

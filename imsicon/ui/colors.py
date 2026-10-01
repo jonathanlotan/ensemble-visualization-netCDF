@@ -38,6 +38,23 @@ from functools import lru_cache
 import numpy as np
 import pyqtgraph as pg
 
+# The ramps the Colours combo offers. Here rather than in `main.py` so the Settings dialog
+# (R10) can offer the same list without importing the window.
+SEQUENTIAL_MAPS = ['turbo', 'viridis', 'inferno', 'plasma', 'magma', 'CET-L17']
+# Diverging, for a difference map: a single hue ramp cannot show which side of zero a
+# value is on, which is the only thing a difference map is for.
+DIVERGING_MAPS = ['CET-D1A', 'CET-D9', 'CET-D3']
+COLORMAPS = SEQUENTIAL_MAPS + DIVERGING_MAPS
+DIVERGING_DEFAULT = 'CET-D1A'
+SEQUENTIAL_DEFAULT = 'turbo'
+
+
+def ramp_named(name):
+    """`'Viridis'` -> `'viridis'`: a ramp name as the combo spells it, or None."""
+    wanted = str(name or '').strip().lower()
+    return next((m for m in COLORMAPS if m.lower() == wanted), None)
+
+
 # Fraction of the scale over which alpha climbs from nothing to opaque. 5 % of a CAPE
 # scale is ~160 J kg-1 -- below the threshold of anything a forecaster would act on, and
 # wide enough to swallow the skirt of small values that a hard cut at 0.0 would leave.

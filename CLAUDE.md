@@ -2565,3 +2565,152 @@ venv/bin/python tools/build_terrain.py --fetch                                 #
 Toolbar row 2 gained **Topography** (after Wind barbs) and **Profile** (at the end); the
 Isolines slider's notches are now the field's own. The readout on a pressure-level map
 reads, in order: time, level, value, **height**, highest and lowest in the column.
+
+---
+
+# Release 10 — the settings file, and a Settings window
+
+Requested 2026-10-01: *an easily configurable config file and a simple GUI holding the
+credentials; optional points with colours (`31.1234, 32.1234, blue`, blue when the colour
+is empty) drawn as dots that can be toggled; optional default scales and colours per
+parameter; optional defaults for which maps have Profile on, which have isolines and at
+what spacing, and the default units -- all still changeable in the app.* Sections 0 and
+R1–R9 are unchanged and still the contract.
+
+## R10.1 The shape of it
+
+```
+  config.toml ──config.load()──► Config ──► MainWindow   (defaults when a map OPENS)
+   (TOML, hand-editable)          │          units · colours · scale · isolines · profile
+        ▲                          │          points layer on MapView ("Points" tick)
+        │                          ├──► download.stored_credentials  (env → file → keychain)
+  Settings... (Ctrl+, / Cmd+,)     └──► isolines.set_custom  (a spacing makes CAPE contourable)
+  ui/settingsdialog.py
+```
+
+| file | responsibility |
+|---|---|
+| `imsicon/config.py` | the file: location, `load` (never raises), `dumps`/`save` (0600, atomic, self-documenting). No Qt |
+| `imsicon/ui/settingsdialog.py` | three tabs — IMS account, Points on the map, Map defaults — plus *Open in text editor* and *Reload from file* |
+| `imsicon/ui/main.py` | `_defaults`, `_apply_initial_units`, `_fixed_range`/`convert_range`, `_sync_scale_combo`, `apply_config`, the **Settings...** action and **Points** tick |
+| `imsicon/ui/mapview.py` | `set_points` / `show_points`, a layer at `Z_POINTS = 18` (over barbs, under the marker) |
+| `imsicon/isolines.py` | `CUSTOM` / `set_custom`: contour intervals for fields the built-in table does not cover |
+| `imsicon/ui/colors.py` | the colour-ramp lists moved here from `main.py` so the dialog can offer them |
+
+## R10.2 The file
+
+Per user, never in the repository (it can hold the password):
+`%APPDATA%\IMSIconViewer\config.toml`, `~/Library/Application Support/IMSIconViewer/
+config.toml`, `~/.config/imsicon/config.toml`; `IMSICON_CONFIG` overrides. The file the
+app writes carries its own instructions as comments, so it can be edited without this
+document. Example:
+
+```toml
+[credentials]
+user = "..."
+password = "..."
+
+[map]
+show_points = true
+points = [
+  "31.7683, 35.2137, red, Jerusalem",
+  "32.0853, 34.7818, , Tel Aviv",      # empty colour -> blue
+]
+
+[fields.CAPE_ML]
+colours = "inferno"
+scale = [0, 3000]          # or "dataset" / "frame"
+isoline_step = 500         # makes CAPE contourable, in J kg-1
+isolines = false           # ...but off until ticked
+
+[fields.T_2M]              # also covers the deterministic t_2m (names ignore case)
+units = "C"                # aliases: C, F, degC, degF
+isoline_step = 2           # degrees C; ft on geopot
+
+[fields.rh]
+profile = false
+
+[fields.T-Td]              # derived maps by their names on screen
+scale = [0, 6]
+```
+
+## R10.3 Precedence — a default, not an override
+
+For every per-map setting: **a choice made in the app this session → the file → (units
+only) the choice remembered from an earlier session in QSettings → the app's own
+default.** The window keeps `_units_chosen`, `_iso_on` and the existing `_iso_steps` /
+`_profile_choices` per field, so flipping between maps under *Map shows* never lets the
+file undo what the reader just set. Isolines on a field the file does not mention follow
+the last choice made on any field (R5's carry-over), then on.
+
+* **Scale.** The combo gained a third entry, **Fixed**, live only on a map the file gives
+  a range for, and labelled with that range in the units on screen
+  (`Fixed 0 to 2000 J kg-1`). The range is stated in the field's configured `units` (or
+  `scale_units`, or its default units) and converted through the view's own affines when
+  the Units combo moves — `[10, 40]` °C is `50..104` °F — with the scale only on a
+  difference view (**G15**). It drives the **graph's value axis too**, so a reading on the
+  curves is a reading on the colours. Not applied to `spread` (a width, which starts at
+  zero) nor to a Rate view (a different quantity from the stored one the range was
+  written for); and a fixed range on a difference map is used as written, not
+  symmetrised.
+* **Colours** must name a ramp the Colours combo offers (case-insensitive); anything else
+  is reported and the field's usual ramp used.
+* **Isoline spacing** is in the field's natural unit — degrees C on a temperature, ft on
+  geopotential — snapped to the nearest notch. On any other field it is in the **file's
+  units** and *creates* an interval (`isolines.set_custom`): anchored at 0, every 5th
+  line heavier, the slider offering ½×, 1×, 2× and 4× the configured spacing. Derived
+  views consult it by `field` and by `display_name` (`DerivedView._base_interval`).
+* **Units** the field does not offer are passed over with a status-bar sentence naming
+  what is offered.
+* Saving in the dialog applies at once (`MainWindow.apply_config`): points and custom
+  intervals immediately, and every default the reader has not overridden this session to
+  the map on screen.
+
+## R10.4 Credentials
+
+`download.stored_credentials` now reads `IMS_USER`/`IMS_PASS`, then the file, then the
+keychain. The file is created `0600` (via `os.open`, so there is no moment it is
+world-readable), written atomically, and lives in the per-user directory; `.gitignore`
+also lists `config.toml` in case `IMSICON_CONFIG` is ever pointed into the checkout.
+Credentials still never touch `QSettings`, and are never logged.
+
+## R10.5 Rules this release keeps
+
+* **Loading never raises** (the G21 rule for a hand-edited file). Invalid TOML opens the
+  app with nothing applied and a warning; a bad value costs that one key with a
+  sentence naming the table, the key and why; the first problem is shown in the status
+  bar on launch and all of them at the top of the Settings window.
+* **Saving over a file that could not be parsed keeps it as `config.toml.bak`** — the
+  dialog cannot show what it could not read, so a Save must not silently discard it.
+* **The dialog validates before it writes** and shows errors in red inside itself rather
+  than in a modal (G30/G38), and reads the file back after writing, so what the window
+  then uses is exactly what the next launch will read.
+* **G49 — the settings file is per test, like QSettings.** `tests/conftest.py` points
+  `IMSICON_CONFIG` at a temp file for every test and clears `isolines.CUSTOM` (module
+  state) before and after. Without it a developer's real file — their points, their
+  colours, their password — would decide what every UI test sees.
+* **G50 — `range and range[0]` is not "the minimum if there is one".** A fixed range
+  starting at 0, the usual CAPE or precipitation scale, read as *no minimum* in the
+  dialog's Min column, which then refused to save the user's own file. Caught in a
+  screenshot, pinned by `test_a_range_from_zero_keeps_its_zero`.
+
+## R10.6 Verified
+
+43 new tests: `tests/test_config.py` (25 — the points grammar including the empty-colour
+rule, case folding, every bad-value path, broken TOML, round-trip, 0600, `.bak`, the
+credential order, custom intervals) and `tests/test_ui_settings.py` (18 — on real
+widgets: a map opens in the configured units/colours/fixed scale, the range converts on a
+units change and pins the graph, the app can still change everything, an in-app choice
+survives a field switch, a spacing makes humidity contourable, points drawn and hidden,
+an empty or broken file still opens the map, the profile default on the deterministic
+run, and the dialog's populate/round-trip/validate/apply). End to end on the real 407 MB
+CAPE file: inferno, `Fixed 0 to 2000 J kg-1` on map and graph, isolines every 500 J kg-1,
+four named points over the shaded relief.
+
+## R10.7 Running it
+
+```bash
+venv/bin/python -m imsicon --settings          # the Settings window on its own
+venv/bin/python -m imsicon                     # Settings... on the toolbar, Ctrl+, / Cmd+,
+IMSICON_CONFIG=~/other.toml venv/bin/python -m imsicon <file>
+```

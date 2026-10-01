@@ -10,8 +10,10 @@ Security rules, all of them load-bearing:
   plain `-u` returns 401, so `requests` alone is not enough; `requests_ntlm` is required.
   Both are imported lazily so the app (and its frozen exe) does not carry an HTTP stack it
   only needs for this one dialog.
-* **Credentials never touch `QSettings`** -- that is plaintext on disk. Keyring (Windows
-  Credential Manager / macOS Keychain) first, `IMS_USER`/`IMS_PASS` second, prompt last.
+* **Credentials never touch `QSettings`.** `IMS_USER`/`IMS_PASS` first, then the user's
+  own configuration file (R10, `config.py` -- written 0600, outside the repository, and
+  only when the user puts them there), then the keychain (Windows Credential Manager /
+  macOS Keychain), then a prompt.
   They are never logged, never put in a URL or query string, and a failure says
   "authentication failed" without echoing what was tried.
 * **The listing is UNTRUSTED input.** Only a name matching the family's grammar --
@@ -123,13 +125,18 @@ def keyring_module():
 
 
 def stored_credentials():
-    """-> (user, password) from the OS keychain or the environment, else None.
+    """-> (user, password) from the environment, the configuration file (R10) or the OS
+    keychain, in that order, else None.
 
     Never reads QSettings, and never returns a partially-filled pair.
     """
     user, password = os.environ.get('IMS_USER'), os.environ.get('IMS_PASS')
     if user and password:
         return user, password
+    from . import config
+    configured = config.load().credentials()
+    if configured:
+        return configured
     keyring = keyring_module()
     if keyring is None:
         return None
