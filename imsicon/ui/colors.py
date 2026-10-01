@@ -49,10 +49,42 @@ DIVERGING_DEFAULT = 'CET-D1A'
 SEQUENTIAL_DEFAULT = 'turbo'
 
 
+# A ramp of the user's own, from the settings file's `[display] custom_colours` (R12). It
+# is offered as one more entry, under this name, only while it is defined.
+CUSTOM = 'custom'
+_custom_stops = ()
+
+
+def custom_stops():
+    """The custom ramp's colours, bottom to top, or () when none is defined."""
+    return _custom_stops
+
+
+def set_custom_ramp(colours):
+    """Define (or with an empty list, remove) the custom ramp. -> the names Qt could not
+    read as colours. Fewer than two good colours is no ramp, and removes it."""
+    global _custom_stops
+    good, bad = [], []
+    for colour in colours or ():
+        text = str(colour).strip()
+        (good if text and pg.QtGui.QColor(text).isValid() else bad).append(text)
+    stops = tuple(good) if len(good) >= 2 else ()
+    if stops != _custom_stops:
+        _custom_stops = stops
+        map_colormap.cache_clear()
+    return bad
+
+
+def ramps():
+    """Every ramp the Colours combo offers right now: the built-in ones, then the
+    user's own when the settings file defines one."""
+    return COLORMAPS + ([CUSTOM] if _custom_stops else [])
+
+
 def ramp_named(name):
     """`'Viridis'` -> `'viridis'`: a ramp name as the combo spells it, or None."""
     wanted = str(name or '').strip().lower()
-    return next((m for m in COLORMAPS if m.lower() == wanted), None)
+    return next((m for m in ramps() if m.lower() == wanted), None)
 
 
 # Fraction of the scale over which alpha climbs from nothing to opaque. 5 % of a CAPE
@@ -118,10 +150,18 @@ def map_colormap(name, transparent_zero=False, punchy=True):
     raising, for the reason `transform.normalise_units` never raises -- a colour choice
     must not be able to stop a forecast being opened.
     """
-    try:
-        base = pg.colormap.get(name)
-    except Exception:
-        base = pg.colormap.get('viridis')
+    if name == CUSTOM and _custom_stops:
+        # The user's own colours are drawn as given: not made vivid, which would move
+        # them, only faded at a zero floor like every other sequential ramp.
+        rgba = np.array([pg.colorTuple(pg.mkColor(c)) for c in _custom_stops],
+                        dtype=float) / 255.0
+        base = _build(np.linspace(0.0, 1.0, len(rgba)), rgba)
+        punchy = False
+    else:
+        try:
+            base = pg.colormap.get(name)
+        except Exception:
+            base = pg.colormap.get('viridis')
     if not punchy and not transparent_zero:
         return base
     rgba = _table(base)

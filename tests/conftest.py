@@ -61,15 +61,19 @@ def isolated_config(monkeypatch, tmp_path):
     """R10: the user's settings file is per test as well -- the same lesson as G25/G47,
     applied before it could bite. Without it a developer's real config (their points,
     their CAPE colours, their IMS password) would decide what every UI test sees.
-    Custom isoline intervals and the display clock are module state, so they are reset too."""
+    Custom isoline intervals, the display clock and the custom colour ramp (R12) are
+    module state, so they are reset too."""
     from imsicon import isolines, timefmt
+    from imsicon.ui import colors
     path = tmp_path / 'imsicon-config.toml'
     monkeypatch.setenv('IMSICON_CONFIG', str(path))
     isolines.CUSTOM.clear()
     timefmt.set_zone(timefmt.ZULU)      # R11: the clock is module state too
+    colors.set_custom_ramp(())
     yield path
     isolines.CUSTOM.clear()
     timefmt.set_zone(timefmt.ZULU)
+    colors.set_custom_ramp(())
 
 
 @pytest.fixture(scope='session')

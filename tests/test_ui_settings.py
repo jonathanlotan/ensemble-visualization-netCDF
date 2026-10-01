@@ -390,3 +390,96 @@ def test_the_dialog_saves_the_clock(dialog, isolated_config):
     saved = dialog.save()
     assert saved is not None and saved.time_zone == 'IL'
     assert 'time = "Israel"' in isolated_config.read_text(encoding='utf-8')
+
+
+# ---- R12: a colour scale for every map -------------------------------------------------
+def _lut_rgb(window):
+    """The map's colour scale, as 0..255 RGB stops from bottom to top."""
+    return np.asarray(window.map.cmap.getLookupTable(0.0, 1.0, 64, alpha=True))[:, :3]
+
+
+def test_the_file_s_scale_replaces_the_usual_one_on_every_map(qapp, run_dir,
+                                                               isolated_config):
+    from imsicon.ui import derivedialog
+    configure(isolated_config, '[display]\ncolours = "magma"\n'
+                               'difference_colours = "CET-D9"\n')
+    w = open_window(qapp, run_dir / T2M)
+    try:
+        assert w.cmap_combo.currentText() == 'magma'
+        choose(w, qapp, 'file:RELHUM_2M')
+        assert w.cmap_combo.currentText() == 'magma'
+        choose(w, qapp, derivedialog.DEPRESSION)     # a difference keeps its own kind
+        assert w.cmap_combo.currentText() == 'CET-D9'
+    finally:
+        w.close()
+
+
+def test_a_map_s_own_colours_beat_the_file_wide_scale(qapp, run_dir, isolated_config):
+    configure(isolated_config, '[display]\ncolours = "magma"\n'
+                               '[fields.RELHUM_2M]\ncolours = "CET-L17"\n')
+    w = open_window(qapp, run_dir / T2M)
+    try:
+        assert w.cmap_combo.currentText() == 'magma'
+        choose(w, qapp, 'file:RELHUM_2M')
+        assert w.cmap_combo.currentText() == 'CET-L17'
+        w.cmap_combo.setCurrentText('plasma')        # and the toolbar still changes it
+        settle(qapp)
+        assert w.cmap_combo.currentText() == 'plasma'
+    finally:
+        w.close()
+
+
+def test_a_custom_scale_is_drawn_in_exactly_the_colours_given(qapp, run_dir,
+                                                               isolated_config):
+    configure(isolated_config, '[display]\ncolours = "custom"\n'
+                               'custom_colours = ["#0000ff", "#ffffff", "#ff0000"]\n')
+    w = open_window(qapp, run_dir / T2M)     # a temperature: no fade at its floor
+    try:
+        assert w.cmap_combo.currentText() == 'custom'
+        assert 'custom' in [w.cmap_combo.itemText(i) for i in range(w.cmap_combo.count())]
+        rgb = _lut_rgb(w)
+        assert tuple(rgb[0]) == (0, 0, 255) and tuple(rgb[-1]) == (255, 0, 0)
+        assert np.all(rgb[len(rgb) // 2] > 240)       # white in the middle, not made vivid
+    finally:
+        w.close()
+
+
+def test_without_a_custom_scale_the_combo_does_not_offer_one(qapp, run_dir,
+                                                             isolated_config):
+    configure(isolated_config, '[display]\ncolours = "custom"\n')
+    w = open_window(qapp, run_dir / T2M)
+    try:
+        offered = [w.cmap_combo.itemText(i) for i in range(w.cmap_combo.count())]
+        assert 'custom' not in offered and w.cmap_combo.currentText() == 'turbo'
+        assert any('custom' in problem for problem in w.config.warnings)
+    finally:
+        w.close()
+
+
+def test_the_dialog_saves_the_scale_and_the_window_uses_it(window, qapp, isolated_config):
+    d = settingsdialog.SettingsDialog(window.config, current=window.ds)
+    d.map_ramp_combo.setCurrentText('custom')
+    d.custom_edit.setText('white, gold, red')
+    # T_2M has its own colours in SETTINGS; clear them so the file-wide scale shows.
+    d.fields_table.cellWidget(0, settingsdialog.COL['Colours']).setCurrentText(
+        settingsdialog.DEFAULT)
+    saved = d.save()
+    d.close()
+    assert saved is not None and saved.map_colours == 'custom'
+    assert saved.custom_colours == ('white', 'gold', 'red')
+    text = isolated_config.read_text(encoding='utf-8')
+    assert 'colours = "custom"' in text and '"gold"' in text
+    window.apply_config(saved)
+    settle(qapp)
+    assert window.cmap_combo.currentText() == 'custom'
+    assert tuple(_lut_rgb(window)[-1]) == (255, 0, 0)
+
+
+def test_the_dialog_refuses_a_custom_scale_it_cannot_draw(dialog, isolated_config):
+    before = isolated_config.read_text(encoding='utf-8')
+    dialog.custom_edit.setText('white, notacolour')
+    assert dialog.save() is None and 'notacolour' in dialog.error.text()
+    dialog.custom_edit.setText('')
+    dialog.map_ramp_combo.setCurrentText('custom')
+    assert dialog.save() is None and 'no colours' in dialog.error.text()
+    assert isolated_config.read_text(encoding='utf-8') == before

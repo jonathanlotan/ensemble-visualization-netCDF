@@ -214,3 +214,44 @@ def test_a_spacing_makes_an_uncontoured_field_contourable():
     assert isolines.interval_for('T_2M') is isolines.STEPS['T_2M']
     isolines.set_custom({})
     assert isolines.interval_for('CAPE_ML') is None
+
+
+# ---- R12: the map's colour scale --------------------------------------------------------
+def test_the_display_colour_scale_is_read_and_round_trips(tmp_path):
+    cfg = config.loads('[display]\ncolours = "viridis"\ndifference_colours = "CET-D9"\n'
+                       'custom_colours = ["white", "#ffcc00", "red"]\n')
+    assert cfg.warnings == []
+    assert (cfg.map_colours, cfg.difference_colours) == ('viridis', 'CET-D9')
+    assert cfg.custom_colours == ('white', '#ffcc00', 'red')
+    path = config.save(cfg, tmp_path / 'c.toml')
+    again = config.load(path)
+    assert (again.map_colours, again.difference_colours, again.custom_colours) == \
+        (cfg.map_colours, cfg.difference_colours, cfg.custom_colours)
+
+
+def test_an_empty_colour_scale_means_the_usual_one(tmp_path):
+    cfg = config.loads('[display]\ncolours = ""\ncustom_colours = []\n')
+    assert cfg.map_colours is None and cfg.custom_colours == () and cfg.warnings == []
+    again = config.load(config.save(config.Config(), tmp_path / 'c.toml'))
+    assert again.map_colours is None and again.custom_colours == () and not again.warnings
+
+
+def test_a_custom_scale_can_be_one_comma_separated_line():
+    cfg = config.loads('[display]\ncustom_colours = "white, gold , red"\n')
+    assert cfg.custom_colours == ('white', 'gold', 'red')
+
+
+def test_a_one_colour_custom_scale_is_a_warning_not_a_scale():
+    cfg = config.loads('[display]\ncustom_colours = ["red"]\n')
+    assert cfg.custom_colours == () and any('two' in w for w in cfg.warnings)
+    cfg = config.loads('[display]\ncustom_colours = 3\n')
+    assert cfg.custom_colours == () and cfg.warnings
+
+
+def test_the_custom_ramp_skips_what_is_not_a_colour():
+    from imsicon.ui import colors
+    assert colors.set_custom_ramp(['white', 'nonsense', 'red']) == ['nonsense']
+    assert colors.custom_stops() == ('white', 'red')
+    assert colors.ramp_named('CUSTOM') == 'custom' and colors.ramps()[-1] == 'custom'
+    assert colors.set_custom_ramp(['red']) == [] and colors.custom_stops() == ()
+    assert colors.ramp_named('custom') is None

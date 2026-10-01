@@ -111,6 +111,10 @@ class Config:
     password: str = ''
     show_points: bool = True
     time_zone: str = timefmt.ZULU  # R11: the clock every time on screen is written in
+    # R12: the colour scale every map opens with, unless its [fields] table names one
+    map_colours: str | None = None         # sequential maps; None = turbo
+    difference_colours: str | None = None  # difference maps; None = CET-D1A
+    custom_colours: tuple = ()             # the "custom" ramp, bottom to top
     points: list = dc_field(default_factory=list)
     fields: dict = dc_field(default_factory=dict)      # field_key -> FieldDefaults
     warnings: list = dc_field(default_factory=list)
@@ -300,6 +304,27 @@ def from_dict(data, path=None):
             cfg.time_zone = timefmt.parse(display['time'])
         except ValueError as exc:
             cfg.warnings.append(f'[display] time: {exc}; using Z')
+    for key, attr in (('colours', 'map_colours'), ('colors', 'map_colours'),
+                      ('difference_colours', 'difference_colours'),
+                      ('difference_colors', 'difference_colours')):
+        if key in display:
+            text = str(display[key] or '').strip()
+            if text:
+                setattr(cfg, attr, text)
+    custom = display.get('custom_colours', display.get('custom_colors'))
+    if custom is not None:
+        if isinstance(custom, str):
+            custom = custom.split(',')
+        if not isinstance(custom, list):
+            cfg.warnings.append('[display] custom_colours must be a list of colours; '
+                                'ignored')
+        else:
+            stops = tuple(str(c).strip() for c in custom if str(c).strip())
+            if len(stops) == 1:
+                cfg.warnings.append('[display] custom_colours needs at least two '
+                                    'colours; ignored')
+            else:
+                cfg.custom_colours = stops
 
     tables = data.get('fields', {})
     if not isinstance(tables, dict):
@@ -360,6 +385,15 @@ DISPLAY_HELP = """
 # The clock every time on screen is written in: "Z" (UTC, as the model files are) or
 # "Israel" (IDT in summer, IST in winter -- decided per time step, so a forecast that
 # crosses the change shows it). The "Time" combo on the toolbar changes it for a session.
+#
+# The colour scale every map opens with, instead of the usual one (turbo on an ordinary
+# map, CET-D1A on a difference map). A [fields.<NAME>] colours line still wins for its
+# own map, and the "Colours" combo still changes it on screen. Leave empty for the usual.
+#   colours            = "viridis"   turbo viridis inferno plasma magma CET-L17, or custom
+#   difference_colours = "CET-D9"    CET-D1A CET-D9 CET-D3, or custom
+# A scale of your own, called "custom" in the Colours combo: two or more colours from the
+# bottom of the scale to the top, as names (white, gold, red...) or #rrggbb.
+#   custom_colours = ["white", "gold", "orange", "red", "purple"]
 """
 
 MAP_HELP = """
@@ -381,7 +415,7 @@ FIELDS_HELP = """
 #
 #   units        = "°C"          a choice from the Units combo ("C" and "F" also work)
 #   colours      = "viridis"     turbo viridis inferno plasma magma CET-L17
-#                                (diverging: CET-D1A CET-D9 CET-D3)
+#                                (diverging: CET-D1A CET-D9 CET-D3), or custom
 #   scale        = [0, 3000]     a fixed colour scale, in `units` (or `scale_units`);
 #                                or "dataset" / "frame" to pick that Scale entry
 #   isolines     = true          contour lines on or off when the map opens
@@ -421,6 +455,10 @@ def dumps(cfg):
            f'password = {_toml_string(cfg.password)}',
            DISPLAY_HELP,
            f'time = {_toml_string("Israel" if cfg.time_zone == timefmt.ISRAEL else "Z")}',
+           f'colours = {_toml_string(cfg.map_colours or "")}',
+           f'difference_colours = {_toml_string(cfg.difference_colours or "")}',
+           'custom_colours = [' + ', '.join(_toml_string(c) for c in cfg.custom_colours)
+           + ']',
            MAP_HELP,
            f'show_points = {"true" if cfg.show_points else "false"}']
     if cfg.points:

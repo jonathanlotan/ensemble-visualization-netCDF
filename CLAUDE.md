@@ -2782,3 +2782,37 @@ venv/bin/python -m imsicon --tz Israel data/ICON_ENS_..._CAPE_ML.nc
 
 or pick *Israel (IDT/IST)* in the combo at the right of the time bar, or set it in
 *Settings… → Display*.
+
+---
+
+# Release 12 — a colour scale of your choosing
+
+Requested 2026-10-01: *an option in the settings to change the map's colour scale to be
+different from the normal scale.*
+
+`[display]` gained three keys, all on the Settings window's **Display** tab:
+
+```toml
+[display]
+colours            = "custom"     # every ordinary map; empty = turbo
+difference_colours = "CET-D9"     # every difference map; empty = CET-D1A
+custom_colours     = ["white", "gold", "orange", "red", "purple"]   # bottom -> top
+```
+
+* **Precedence** is R10's: the toolbar's Colours combo this session → the map's own
+  `[fields.<NAME>] colours` → the file-wide `colours` / `difference_colours` → turbo /
+  CET-D1A. A difference map keeps a diverging default of its own, because a sequential
+  ramp cannot show which side of zero a value is on (R3.4).
+* **`custom`** is the user's own ramp, evenly spaced, offered in the Colours combo (and
+  usable as any `colours` value) only while `custom_colours` defines at least two valid
+  colours. It is drawn **exactly as given** — not run through R6's `vivid`, which would
+  move the user's colours — but still fades at a zero floor like every sequential ramp.
+* The custom stops are module state in `ui/colors.py` (`set_custom_ramp`, which clears
+  the `map_colormap` cache), part of `_apply_colormap`'s key so a re-saved ramp under the
+  same name is redrawn, and reset per test in `conftest.isolated_config` (G49's family).
+* Loading never raises: an unknown ramp name or an unreadable colour is a warning naming
+  it, and the usual scale is used. The dialog refuses to save a colour Qt cannot read, or
+  `custom` chosen with no custom colours, and previews the custom ramp as you type.
+
+Verified by 11 new tests in `tests/test_config.py` and `tests/test_ui_settings.py`, and
+end to end on the real CAPE file with a white→purple custom ramp.

@@ -371,6 +371,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.config = user_config.load()
         timefmt.set_zone(self.config.time_zone)     # R11: before any label is written
         self._install_config_isolines()
+        self._custom_colour_problems = colors.set_custom_ramp(self.config.custom_colours)
         self._units_chosen = {}
         self._iso_on = {}
         self._iso_last_choice = None
@@ -574,7 +575,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         tb.addWidget(QtWidgets.QLabel('  Colours: '))
         self.cmap_combo = QtWidgets.QComboBox()
-        self.cmap_combo.addItems(COLORMAPS)
+        self.cmap_combo.addItems(colors.ramps())
         self.cmap_combo.currentTextChanged.connect(self._on_cmap_changed)
         tb.addWidget(self.cmap_combo)
 
@@ -1129,9 +1130,13 @@ class MainWindow(QtWidgets.QMainWindow):
         which is also what the sort scale overrides -- so there is one place that decides
         the colours, and choosing a field cannot quietly undo the sort band.
         """
+        diverging = getattr(ds, 'diverging', False)
+        # The map's own line in the file, then the file's scale for every map of its
+        # kind (R12), then the usual one.
         wanted = (colors.ramp_named(self._defaults(ds).colours)
-                  or (DIVERGING_DEFAULT if getattr(ds, 'diverging', False)
-                      else SEQUENTIAL_DEFAULT))
+                  or colors.ramp_named(self.config.difference_colours if diverging
+                                       else self.config.map_colours)
+                  or (DIVERGING_DEFAULT if diverging else SEQUENTIAL_DEFAULT))
         if self.cmap_combo.currentText() != wanted:
             self.cmap_combo.setCurrentText(wanted)      # fires _on_cmap_changed
         else:
@@ -1310,7 +1315,10 @@ class MainWindow(QtWidgets.QMainWindow):
             # A diverging ramp is left alone: its centre is a reading ("no difference"),
             # not an absence, and its neutral colour is already pale.
             sequential = name not in DIVERGING_MAPS
-            key = ('map', name, sequential, sequential and transparent_zero)
+            # The custom ramp's colours are in the key: the same name can mean another
+            # ramp after Settings... is saved.
+            key = ('map', name, sequential, sequential and transparent_zero,
+                   colors.custom_stops() if name == colors.CUSTOM else None)
         else:
             key = ('sort', round(sort.top, 6))
         if key == self._cmap_state:
@@ -1497,12 +1505,39 @@ class MainWindow(QtWidgets.QMainWindow):
                 'unknown point colour(s) ' + ', '.join(repr(c) for c in unknown)
                 + '; drawn in blue')
 
+    def _sync_ramp_list(self):
+        """The Colours combo offers the custom ramp only while the file defines one."""
+        wanted = colors.ramps()
+        have = [self.cmap_combo.itemText(i) for i in range(self.cmap_combo.count())]
+        if have == wanted:
+            return
+        current = self.cmap_combo.currentText()
+        self.cmap_combo.blockSignals(True)
+        self.cmap_combo.clear()
+        self.cmap_combo.addItems(wanted)
+        self.cmap_combo.setCurrentText(current if current in wanted else wanted[0])
+        self.cmap_combo.blockSignals(False)
+
     def _report_config_problems(self):
         """A broken line in the settings file costs that line, and is said out loud."""
+        for key, value in (('colours', self.config.map_colours),
+                           ('difference_colours', self.config.difference_colours)):
+            if value and colors.ramp_named(value) is None:
+                problem = (f'[display] {key} {value!r} is not one of '
+                           f'{", ".join(colors.ramps())}; using the usual scale')
+                if problem not in self.config.warnings:
+                    self.config.warnings.append(problem)
+        if self._custom_colour_problems:
+            problem = ('[display] custom_colours: ' + ', '.join(
+                repr(c) for c in self._custom_colour_problems) + ' not a colour; skipped'
+                + ('' if colors.custom_stops() else ' (fewer than two left: no custom '
+                   'scale)'))
+            if problem not in self.config.warnings:
+                self.config.warnings.append(problem)
         for defaults in self.config.fields.values():
             if defaults.colours and colors.ramp_named(defaults.colours) is None:
                 problem = (f'[fields.{defaults.name}] colours {defaults.colours!r} is not '
-                           f'one of {", ".join(COLORMAPS)}; ignored')
+                           f'one of {", ".join(colors.ramps())}; ignored')
                 if problem not in self.config.warnings:
                     self.config.warnings.append(problem)
         if self.config.warnings:
@@ -1605,6 +1640,8 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         self.config = cfg
         self._install_config_isolines()
+        self._custom_colour_problems = colors.set_custom_ramp(cfg.custom_colours)
+        self._sync_ramp_list()
         self.set_time_zone(cfg.time_zone)
         self.points_check.blockSignals(True)
         self.points_check.setChecked(bool(cfg.show_points))

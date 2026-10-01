@@ -157,7 +157,51 @@ class SettingsDialog(QtWidgets.QDialog):
         note.setWordWrap(True)
         note.setStyleSheet('color:#666;')
         form.addRow(note)
+
+        # R12: a colour scale for every map, instead of the usual one.
+        self.map_ramp_combo = QtWidgets.QComboBox()
+        self.map_ramp_combo.addItems([f'{DEFAULT} {colors.SEQUENTIAL_DEFAULT}']
+                                     + colors.COLORMAPS + [colors.CUSTOM])
+        form.addRow('Map colour scale:', self.map_ramp_combo)
+        self.diff_ramp_combo = QtWidgets.QComboBox()
+        self.diff_ramp_combo.addItems([f'{DEFAULT} {colors.DIVERGING_DEFAULT}']
+                                      + colors.DIVERGING_MAPS + colors.SEQUENTIAL_MAPS
+                                      + [colors.CUSTOM])
+        form.addRow('Difference maps:', self.diff_ramp_combo)
+        row = QtWidgets.QHBoxLayout()
+        self.custom_edit = QtWidgets.QLineEdit()
+        self.custom_edit.setPlaceholderText('white, gold, orange, red, purple')
+        self.custom_edit.textChanged.connect(self._preview_custom)
+        row.addWidget(self.custom_edit, 1)
+        self.custom_preview = QtWidgets.QLabel()
+        self.custom_preview.setFixedSize(160, 18)
+        row.addWidget(self.custom_preview)
+        form.addRow('Custom scale:', row)
+        note = QtWidgets.QLabel(
+            'The colour scale every map opens with. A map with its own Colours under Map '
+            'defaults keeps it, and the "Colours" combo on the toolbar still changes it on '
+            'screen. "custom" is a scale of your own: two or more colours from the bottom '
+            'of the scale to the top, as names or #rrggbb, separated by commas.')
+        note.setWordWrap(True)
+        note.setStyleSheet('color:#666;')
+        form.addRow(note)
         return page
+
+    @staticmethod
+    def _custom_list(text):
+        return [c.strip() for c in str(text).split(',') if c.strip()]
+
+    def _preview_custom(self, text):
+        stops = [c for c in self._custom_list(text) if QtGui.QColor(c).isValid()]
+        if len(stops) < 2:
+            self.custom_preview.setStyleSheet('border:1px solid #bbb;')
+            return
+        gradient = ', '.join(
+            f'stop:{i / (len(stops) - 1):.4f} {QtGui.QColor(c).name()}'
+            for i, c in enumerate(stops))
+        self.custom_preview.setStyleSheet(
+            'border:1px solid #bbb; background: qlineargradient(x1:0, y1:0, x2:1, y2:0, '
+            f'{gradient});')
 
     def _build_points(self):
         page = QtWidgets.QWidget()
@@ -247,6 +291,13 @@ class SettingsDialog(QtWidgets.QDialog):
         self.password_edit.setText(cfg.password)
         self.show_points.setChecked(cfg.show_points)
         self.time_combo.setCurrentIndex(max(0, self.time_combo.findData(cfg.time_zone)))
+        for combo, value in ((self.map_ramp_combo, cfg.map_colours),
+                             (self.diff_ramp_combo, cfg.difference_colours)):
+            index = next((i for i in range(1, combo.count())
+                          if combo.itemText(i).lower() == str(value or '').lower()), 0)
+            combo.setCurrentIndex(index)
+        self.custom_edit.setText(', '.join(cfg.custom_colours))
+        self._preview_custom(self.custom_edit.text())
         self.points_table.setRowCount(0)
         for point in cfg.points:
             self.add_point(point)
@@ -324,8 +375,10 @@ class SettingsDialog(QtWidgets.QDialog):
         table.setCellWidget(row, COL['Units'], units)
 
         ramps = QtWidgets.QComboBox()
-        ramps.addItems([DEFAULT] + colors.COLORMAPS)
-        ramps.setCurrentText(colors.ramp_named(defaults.colours) or DEFAULT)
+        ramps.addItems([DEFAULT] + colors.COLORMAPS + [colors.CUSTOM])
+        wanted = str(defaults.colours or '').strip().lower()
+        ramps.setCurrentText(colors.ramp_named(wanted) or
+                             (colors.CUSTOM if wanted == colors.CUSTOM else DEFAULT))
         table.setCellWidget(row, COL['Colours'], ramps)
 
         scale = QtWidgets.QComboBox()
@@ -471,11 +524,32 @@ class SettingsDialog(QtWidgets.QDialog):
             errors.extend(p.replace('; ignored', '') for p in problems)
             entries.append(defaults)
 
+        custom = self._custom_list(self.custom_edit.text())
+        bad = [c for c in custom if not QtGui.QColor(c).isValid()]
+        if bad:
+            errors.append('Custom scale: ' + ', '.join(repr(c) for c in bad)
+                          + ' not a colour (try a name such as red, or #rrggbb)')
+        elif len(custom) == 1:
+            errors.append('Custom scale: needs at least two colours')
+        ramps_chosen = [self.map_ramp_combo.currentIndex() and
+                        self.map_ramp_combo.currentText(),
+                        self.diff_ramp_combo.currentIndex() and
+                        self.diff_ramp_combo.currentText()]
+        ramps_chosen += [e.colours for e in entries]
+        if not custom and any(r == colors.CUSTOM for r in ramps_chosen if r):
+            errors.append('"custom" is chosen as a colour scale, but the custom scale has '
+                          'no colours (Display tab)')
+
         cfg = config.with_fields(self.cfg, entries)
         cfg.user = self.user_edit.text().strip()
         cfg.password = self.password_edit.text()
         cfg.show_points = self.show_points.isChecked()
         cfg.time_zone = self.time_combo.currentData()
+        cfg.map_colours = (self.map_ramp_combo.currentText()
+                           if self.map_ramp_combo.currentIndex() else None)
+        cfg.difference_colours = (self.diff_ramp_combo.currentText()
+                                  if self.diff_ramp_combo.currentIndex() else None)
+        cfg.custom_colours = tuple(custom)
         cfg.points = points
         cfg.path = self.path
         return cfg, errors
