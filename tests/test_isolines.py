@@ -584,3 +584,88 @@ def test_a_view_offers_its_own_ladder(tmp_path):
     synth.temperature(tmp_path / 'ICON_ENS_2026082300_T_2M.nc')
     warm = FieldView(EnsembleFile(tmp_path / 'ICON_ENS_2026082300_T_2M.nc'))
     assert warm.isoline_ladder is isolines.DEGREES
+
+
+# ---- the values written on the lines (R15) ----------------------------------------------
+def _ramp_labels(view=(0.0, 10.0, 0.0, 8.0), px=0.01, py=0.01, **kw):
+    """A plane z = 2x + y on a 0.1 degree grid, contoured every 1, and labelled."""
+    x = np.arange(0.0, 10.01, 0.1)
+    y = np.arange(0.0, 8.01, 0.1)
+    z = 2.0 * x[None, :] + y[:, None]
+    drawn = isolines.contour_set(x, y, z, isolines.Interval(1.0, 5, 0.0), cap=0)
+    chosen = isolines.place_labels(drawn['segments'], view, px, py, **kw)
+    return drawn, chosen
+
+
+def test_label_decimals_follow_the_levels_not_just_the_step():
+    assert isolines.label_decimals([14.0, 15.0, 16.0]) == 0
+    assert isolines.label_decimals([0.0, 0.5, 1.0]) == 1
+    assert isolines.label_decimals([59.0, 60.8, 62.6]) == 1      # 1 degC in degF
+    assert isolines.label_decimals([288.15, 289.15]) == 2         # whole degC, in K
+    assert isolines.label_decimals([]) == 0
+
+
+def test_a_label_never_reads_minus_zero():
+    assert isolines.label_text(-0.0001, 1) == '0.0'
+    assert isolines.label_text(-2.5, 1) == '-2.5'
+    assert isolines.label_text(18000.0, 0) == '18000'
+
+
+def test_every_label_sits_on_the_line_it_names():
+    drawn, chosen = _ramp_labels()
+    assert chosen.size > 10
+    mid_x, mid_y, line, _heavy = drawn['segments']
+    value = drawn['levels'][line[chosen]]
+    assert np.allclose(2.0 * mid_x[chosen] + mid_y[chosen], value, atol=1e-9)
+
+
+def test_no_two_labels_overlap_and_all_of_them_fit_on_screen():
+    view = (0.0, 10.0, 0.0, 8.0)
+    box_w, box_h = isolines.LABEL_BOX_PX
+    drawn, chosen = _ramp_labels(view)
+    sx = drawn['segments'][0][chosen] / 0.01
+    sy = drawn['segments'][1][chosen] / 0.01
+    for i in range(chosen.size):
+        for j in range(i + 1, chosen.size):
+            assert abs(sx[i] - sx[j]) >= box_w or abs(sy[i] - sy[j]) >= box_h
+    assert sx.min() >= view[0] / 0.01 + box_w / 2 and sx.max() <= view[1] / 0.01 - box_w / 2
+    assert sy.min() >= view[2] / 0.01 + box_h / 2 and sy.max() <= view[3] / 0.01 - box_h / 2
+
+
+def test_the_heavy_lines_are_labelled_first():
+    drawn, chosen = _ramp_labels(cap=3)
+    assert chosen.size == 3
+    assert drawn['segments'][3][chosen].all()
+    assert np.allclose(drawn['levels'][drawn['segments'][2][chosen]] % 5.0, 0.0)
+
+
+def test_a_pan_slides_the_labels_rather_than_choosing_new_ones():
+    """The lattice is anchored to the data, so a label well inside the window before a
+    small pan is the same label after it -- the R4.3 rule for barbs, for text."""
+    drawn, before = _ramp_labels((2.0, 8.0, 2.0, 6.0))
+    _drawn, after = _ramp_labels((2.3, 8.3, 2.0, 6.0))
+    x = drawn['segments'][0]
+    inner = lambda idx: set(idx[(x[idx] > 3.0) & (x[idx] < 7.0)].tolist())
+    assert inner(before) and inner(before) == inner(after)
+
+
+def test_zooming_in_labels_more_of_the_lines():
+    _drawn, wide = _ramp_labels((0.0, 10.0, 0.0, 8.0), px=0.02, py=0.02)
+    _drawn, close = _ramp_labels((0.0, 10.0, 0.0, 8.0), px=0.005, py=0.005)
+    assert close.size > wide.size
+
+
+def test_labels_degrade_to_none_rather_than_raising():
+    drawn, _chosen = _ramp_labels()
+    for px in (0.0, -1.0, float('nan')):
+        assert isolines.place_labels(drawn['segments'], (0, 10, 0, 8), px, 0.01).size == 0
+    assert isolines.place_labels(isolines.NO_SEGMENTS, (0, 10, 0, 8), 0.01, 0.01).size == 0
+    assert isolines.place_labels(drawn['segments'], (20, 30, 20, 30), 0.01, 0.01).size == 0
+
+
+def test_lines_named_by_value_are_placed_as_lines_named_by_index():
+    drawn, by_index = _ramp_labels()
+    mid_x, mid_y, line, heavy = drawn['segments']
+    by_value = isolines.place_labels((mid_x, mid_y, drawn['levels'][line], heavy),
+                                     (0.0, 10.0, 0.0, 8.0), 0.01, 0.01)
+    assert np.array_equal(by_index, by_value)

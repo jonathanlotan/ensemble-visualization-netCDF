@@ -57,6 +57,8 @@ def main(argv=None):
                          + " ft on a geopotential height chart (default: the field's "
                            'own, 1 degC on a temperature, 0.5 on a difference, 200 ft '
                            'on a height)')
+    ap.add_argument('--isoline-labels', choices=('on', 'off'), default=None,
+                    help="write each isoline's value on it (default: as last used)")
     ap.add_argument('--topo', choices=('on', 'off'), default=None,
                     help='shaded relief under the map, from the bundled ETOPO1 elevation '
                          'grid (default: as last used)')
@@ -99,11 +101,12 @@ def main(argv=None):
 
     wants_post = any((args.units, args.rate is not None, args.derive, args.difference,
                       args.write, args.isolines is not None, args.isoline_step is not None,
+                      args.isoline_labels is not None,
                       args.sort, args.level is not None, args.barbs is not None,
                       args.topo is not None, args.profile is not None))
     if wants_post and not args.path:
         ap.error('--units/--rate/--derive/--difference/--write/--isolines/--isoline-step'
-                 '/--sort/--level/--barbs/--topo/--profile need a file path')
+                 '/--isoline-labels/--sort/--level/--barbs/--topo/--profile need a file path')
     if args.screenshot:
         if not args.path:
             ap.error('--screenshot needs a file path')
@@ -220,6 +223,11 @@ def _apply_display(window, args, ap, tries=0):
                       f'offers {", ".join(f"{s:g}" for s in ladder.steps)} {ladder.unit}; '
                       f'using {chosen:g}', file=sys.stderr)
             window.isoline_step_slider.setValue(ladder.steps.index(chosen))
+    if args.isoline_labels is not None:
+        if args.isoline_labels == 'on' and not window.isoline_labels_check.isEnabled():
+            print(f'--isoline-labels on: {window.ds.display_name} has no isolines on '
+                  'screen to label', file=sys.stderr)
+        window.isoline_labels_check.setChecked(args.isoline_labels == 'on')
     if args.topo is not None:
         if args.topo == 'on' and not window.topo_check.isEnabled():
             print('--topo on: the bundled elevation grid is missing, so there is no '
@@ -289,7 +297,7 @@ def _shoot(app, window, args):
             app.processEvents()
         if any((args.units, args.rate is not None, args.derive, args.difference,
                 args.write, args.isolines is not None, args.isoline_step is not None,
-                args.sort, args.level is not None, args.barbs is not None,
+                args.isoline_labels is not None, args.sort, args.level is not None, args.barbs is not None,
                 args.topo is not None, args.profile is not None)):
             _apply_display(window, args, None)
         if args.point:

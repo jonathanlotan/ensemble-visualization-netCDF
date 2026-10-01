@@ -30,6 +30,10 @@ Z_TERRAIN = 1
 # Isolines of the field sit directly on it, under every geographic outline: the coastline
 # is the frame you read the contours against, so it goes on top of them, not under.
 Z_ISOLINE = 5
+# The values written on the isolines (R15) sit over every outline and under the barbs: a
+# number half-hidden under a border is unreadable, while a coastline running under a small
+# label box is still a coastline either side of it.
+Z_ISOLINE_LABEL = 14
 Z_COAST = 10
 Z_BORDER = 12
 # Wind barbs sit above the outlines: they are the reading, and an outline crossing a barb
@@ -129,6 +133,15 @@ class MapView(pg.GraphicsLayoutWidget):
                                            ignore_bounds=True)
         self.isoline_levels = np.empty(0)     # what is drawn, for the status bar and tests
         self.isoline_step = 0.0               # the interval actually used (see G35)
+        # R15: the values written on the lines. A pool of text items reused across frames,
+        # because creating and destroying a hundred of them on every scrub step is what
+        # would cost the frame, not drawing them.
+        self.isoline_labels_on = False
+        self._iso_segments = iso.NO_SEGMENTS
+        self._iso_decimals = 0
+        self._iso_label_key = None
+        self._iso_label_pool = []
+        self.isoline_label_texts = []         # what is written, in order (tests, status)
         # Coastline and borders, each drawn twice: a pale halo underneath and the line on
         # top. Over turbo or a diverging ramp there is no single ink colour that stays
         # legible against both ends of the scale, and an outline that disappears over the
@@ -185,6 +198,8 @@ class MapView(pg.GraphicsLayoutWidget):
         # -- not the time step. Barbs are added with ignoreBounds, so they can never feed
         # their own extent back into the range that produced them.
         self.plot.vb.sigRangeChanged.connect(lambda *_: self._redraw_barbs())
+        # The labels are placed on a screen-pixel lattice, so they follow the zoom too.
+        self.plot.vb.sigRangeChanged.connect(lambda *_: self._redraw_isoline_labels())
         self.scene().sigMouseClicked.connect(self._on_click)
         self.scene().sigMouseMoved.connect(self._on_move)
 
@@ -360,11 +375,77 @@ class MapView(pg.GraphicsLayoutWidget):
             self.isoline.clear()
             self.isoline_heavy.clear()
             self.isoline_levels, self.isoline_step = np.empty(0), 0.0
+            self._iso_segments = iso.NO_SEGMENTS
+            self._redraw_isoline_labels(force=True)
             return
         drawn = iso.contour_set(self.ds.lon, self.ds.lat, self._frame, interval)
         self.isoline.setData(*drawn['ordinary'])
         self.isoline_heavy.setData(*drawn['emphasised'])
         self.isoline_levels, self.isoline_step = drawn['levels'], drawn['step']
+        self._iso_segments = drawn['segments']
+        self._iso_decimals = iso.label_decimals(drawn['levels'])
+        self._redraw_isoline_labels(force=True)
+
+    # ---- the values on the isolines (R15) -----------------------------------------------
+    def set_isoline_labels(self, on):
+        """Write each isoline's value on it, or take the values down."""
+        self.isoline_labels_on = bool(on)
+        self._redraw_isoline_labels(force=True)
+
+    @property
+    def isoline_label_count(self):
+        return len(self.isoline_label_texts)
+
+    def _label_item(self, i):
+        """The `i`th pooled label, made on first use. White-boxed, so the box itself is the
+        gap in the line a contour label conventionally sits in, and the number stays
+        legible over every colour of the ramp."""
+        while len(self._iso_label_pool) <= i:
+            item = pg.TextItem('', color='#1c1c1c', anchor=(0.5, 0.5),
+                               fill=pg.mkBrush(255, 255, 255, 215))
+            item.setZValue(Z_ISOLINE_LABEL)
+            item.hide()
+            self.plot.addItem(item, ignoreBounds=True)
+            self._iso_label_pool.append(item)
+        return self._iso_label_pool[i]
+
+    def _redraw_isoline_labels(self, force=False):
+        """Place the labels for the frame and the view as they are now."""
+        if not force and not self.isoline_labels_on and not self.isoline_label_texts:
+            return
+        chosen = np.empty(0, dtype=np.intp)
+        px = py = None
+        if self.isoline_labels_on and self.ds is not None and self._iso_segments[0].size:
+            vb = self.plot.vb
+            px, py = (float(value) for value in vb.viewPixelSize())
+            (x0, x1), (y0, y1) = vb.viewRange()
+            key = (id(self._iso_segments), round(px, 12), round(py, 12),
+                   round(x0 / px), round(x1 / px), round(y0 / py), round(y1 / py))
+            if not force and key == self._iso_label_key:
+                return
+            self._iso_label_key = key
+            chosen = iso.place_labels(self._iso_segments, (x0, x1, y0, y1), px, py)
+        else:
+            self._iso_label_key = None
+        mid_x, mid_y, line, heavy = self._iso_segments
+        level = self.isoline_levels
+        texts = []
+        for i, k in enumerate(chosen):
+            item = self._label_item(i)
+            text = iso.label_text(level[line[k]], self._iso_decimals)
+            font = item.textItem.font()
+            if font.bold() != bool(heavy[k]):
+                font.setBold(bool(heavy[k]))
+                item.setFont(font)
+            if item.textItem.toPlainText() != text:
+                item.setText(text)
+            item.setPos(float(mid_x[k]), float(mid_y[k]))
+            item.show()
+            texts.append(text)
+        for item in self._iso_label_pool[len(chosen):]:
+            if item.isVisible():
+                item.hide()
+        self.isoline_label_texts = texts
 
     # ---- the user's points (R10) ------------------------------------------------------
     def set_points(self, points, visible=True):

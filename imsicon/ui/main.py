@@ -86,6 +86,11 @@ def _isoline_step_tooltip(ds, live):
             f'{example} rather than drawing a different set of them.')
 
 
+ISOLINE_LABELS_TOOLTIP = (
+    "Write each isoline's value on it, in the units on screen. Spread out so they never "
+    'overlap -- the heavier lines are labelled first -- and re-placed as you zoom, so '
+    'zooming in shows more of them.')
+
 TOPO_TOOLTIP = ('Shade the terrain under the map: slopes facing away from a north-west '
                 'sun are darkened, flat ground and the sea are left alone, so the hills '
                 'show through whatever field is drawn over them. From the bundled ETOPO1 '
@@ -659,6 +664,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.isoline_step_label = QtWidgets.QLabel('')
         self.isoline_step_label.setMinimumWidth(64)
         row2.addWidget(self.isoline_step_label)
+
+        # R15: each line's value written on it. Off by default -- text over a map is
+        # something to ask for -- and remembered, like Topography, because a reader who
+        # wants the numbers on the lines wants them on every map. Live only while the
+        # lines themselves are, for the reason the spacing slider is.
+        self.isoline_labels_check = QtWidgets.QCheckBox('  Values')
+        self.isoline_labels_check.setEnabled(False)
+        remembered = str(self.settings.value('display/isoline_labels', 'false')).lower()
+        self.isoline_labels_check.setChecked(remembered in ('true', '1'))
+        self.isoline_labels_check.toggled.connect(self._on_isoline_labels_toggled)
+        self.map.set_isoline_labels(self.isoline_labels_check.isChecked())
+        row2.addWidget(self.isoline_labels_check)
 
         self.sort_check = QtWidgets.QCheckBox('  Sort')
         self.sort_check.setChecked(False)
@@ -1363,6 +1380,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._sync_isoline_step_slider()
         self.refresh_map()
 
+    def _on_isoline_labels_toggled(self, on):
+        self.settings.setValue('display/isoline_labels', bool(on))
+        self.map.set_isoline_labels(on)
+
     def _on_isoline_step_changed(self, index):
         """R5.9: the chosen spacing, in canonical degrees, pushed onto the view.
 
@@ -1428,6 +1449,12 @@ class MainWindow(QtWidgets.QMainWindow):
         canonical = getattr(self.ds, 'isoline_step', None) if self.ds is not None else None
         live = interval is not None and self.isolines_check.isChecked()
         self.isoline_step_slider.setEnabled(live)
+        self.isoline_labels_check.setEnabled(live)
+        self.isoline_labels_check.setToolTip(
+            ISOLINE_LABELS_TOOLTIP if live else
+            'Write each isoline\'s value on it. Tick Isolines first'
+            + ('' if interval is not None else
+               ' -- and this map has none (see the Isolines tooltip)') + '.')
         # The notches are the FIELD's ladder (R9): five degree spacings on a temperature,
         # seven gpm spacings on a height chart. Re-ranged under blocked signals, because
         # a shorter range clamps the value and would otherwise fire a choice nobody made.

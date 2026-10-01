@@ -345,6 +345,133 @@ def test_a_long_title_does_not_crop_the_map(window, qapp):
     assert window.map.cbar.isVisible()
 
 
+# ---- the values written on the lines (R15) -----------------------------------------------
+def label_values(window):
+    return [float(text) for text in window.map.isoline_label_texts]
+
+
+def visible_labels(window):
+    return [item for item in window.map._iso_label_pool if item.isVisible()]
+
+
+def test_values_are_off_until_ticked_and_then_written_on_the_drawn_lines(window, qapp):
+    assert window.isoline_labels_check.isEnabled()
+    assert not window.isoline_labels_check.isChecked()
+    assert window.map.isoline_label_count == 0 and not visible_labels(window)
+
+    window.isoline_labels_check.setChecked(True)
+    settle(qapp)
+    values = label_values(window)
+    assert values
+    assert set(values) <= set(window.map.isoline_levels.tolist())
+    assert all(value == int(value) for value in values)     # whole degrees read '15'
+    assert len(visible_labels(window)) == len(values)
+
+    window.isoline_labels_check.setChecked(False)
+    settle(qapp)
+    assert window.map.isoline_label_count == 0 and not visible_labels(window)
+
+
+def test_the_round_lines_are_written_bold(window, qapp):
+    window.isoline_labels_check.setChecked(True)
+    settle(qapp)
+    for item in visible_labels(window):
+        bold = item.textItem.font().bold()
+        assert bold == (float(item.textItem.toPlainText()) % 5.0 == 0.0)
+
+
+def test_no_isolines_means_no_values_and_no_values_control(window, qapp):
+    window.isoline_labels_check.setChecked(True)
+    settle(qapp)
+    assert window.map.isoline_label_count > 0
+    window.isolines_check.setChecked(False)
+    settle(qapp)
+    assert not window.isoline_labels_check.isEnabled()
+    assert window.map.isoline_label_count == 0 and not visible_labels(window)
+    window.isolines_check.setChecked(True)
+    settle(qapp)
+    assert window.isoline_labels_check.isEnabled()
+    assert window.map.isoline_label_count > 0               # the tick was kept
+
+
+def test_the_values_follow_the_time_step_the_spacing_and_the_units(window, qapp):
+    window.isoline_labels_check.setChecked(True)
+    settle(qapp)
+    window.set_time(3)
+    settle(qapp)
+    assert set(label_values(window)) <= set(window.map.isoline_levels.tolist())
+
+    set_spacing(window, qapp, 0.5)
+    assert any(value % 1.0 == 0.5 for value in label_values(window))
+    assert any('.' in text for text in window.map.isoline_label_texts)
+
+    set_spacing(window, qapp, 2.0)
+    window.units_combo.setCurrentText('°F')
+    settle(qapp)
+    values = label_values(window)
+    assert values and set(values) <= {round(v, 1) for v in window.map.isoline_levels}
+    assert all(text.endswith(('.0', '.2', '.4', '.6', '.8'))
+               for text in window.map.isoline_label_texts)     # 3.6 °F spacings
+
+
+def test_zooming_in_writes_more_values_per_degree(window, qapp):
+    window.isoline_labels_check.setChecked(True)
+    settle(qapp)
+    whole = window.map.isoline_label_count
+    vb = window.map.plot.vb
+    (x0, x1), (y0, y1) = vb.viewRange()
+    window.map._user_zoomed = True                         # G33
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    vb.setRange(xRange=(cx - (x1 - x0) / 6, cx + (x1 - x0) / 6),
+                yRange=(cy - (y1 - y0) / 6, cy + (y1 - y0) / 6), padding=0)
+    settle(qapp)
+    # a ninth of the area on screen, written at least twice as densely
+    assert whole > 0 and window.map.isoline_label_count * 9 > 2 * whole
+    for item in visible_labels(window):
+        pos = item.pos()
+        assert cx - (x1 - x0) / 6 <= pos.x() <= cx + (x1 - x0) / 6
+
+
+def test_scrubbing_reuses_the_label_items(window, qapp):
+    window.isoline_labels_check.setChecked(True)
+    settle(qapp)
+    pool = len(window.map._iso_label_pool)
+    for t in range(4):
+        window.set_time(t)
+    settle(qapp)
+    assert len(window.map._iso_label_pool) <= max(pool, 3 * window.map.isoline_label_count)
+    items = list(window.map._iso_label_pool)
+    window.set_time(0)
+    settle(qapp)
+    assert window.map._iso_label_pool[:len(items)] == items
+
+
+def test_the_values_choice_is_remembered_for_the_next_window(window, qapp, run_dir):
+    window.isoline_labels_check.setChecked(True)
+    settle(qapp)
+    again = MainWindow(str(run_dir / 'ICON_ENS_2026082300_T_2M.nc'))
+    try:
+        again.show()
+        settle(qapp)
+        finish_scan(again, qapp)
+        assert again.isoline_labels_check.isChecked()
+        assert again.map.isoline_label_count > 0
+    finally:
+        again.close()
+
+
+def test_the_values_follow_the_field_and_leave_with_its_lines(window, qapp):
+    window.isoline_labels_check.setChecked(True)
+    settle(qapp)
+    choose(window, qapp, 'file:RELHUM_2M')
+    assert not window.isoline_labels_check.isEnabled()
+    assert window.map.isoline_label_count == 0 and not visible_labels(window)
+    choose(window, qapp, 'depression')
+    assert window.isoline_labels_check.isEnabled()
+    assert window.map.isoline_label_count > 0
+    assert any('.' in text for text in window.map.isoline_label_texts)   # 0.5 °C
+
+
 # ---- how close the lines are (R5.9) -----------------------------------------------------
 def set_spacing(window, app, step):
     """Move the slider the way a hand does -- by notch, not by calling the view."""
@@ -537,7 +664,7 @@ def test_the_command_line_spacing_is_snapped_to_the_field_s_ladder(height, capsy
     import argparse
     from imsicon.__main__ import _apply_display
     args = argparse.Namespace(derive=None, difference=None, units=None, rate=None,
-                              isolines=None, isoline_step=300.0, level=None, barbs=None,
+                              isolines=None, isoline_step=300.0, isoline_labels=None, level=None, barbs=None,
                               topo=None, profile=None, sort=False, write=None,
                               screenshot=None)
     _apply_display(height, args, None)

@@ -2868,3 +2868,65 @@ find `TOT_PREC`, and `u10m` finds `U_10M`. A count beside it says `4 of 15 maps`
   `test_enter_in_the_search_never_presses_the_dialog_s_buttons` fails without the filter.
 
 Verified by `tests/test_ui_download.py` (8).
+
+---
+
+# Release 15 — the values written on the isolines
+
+Requested 2026-10-01: *for the isolines, add an option to display the values on the
+isolines.* This is R5.7's first deliberate omission ("labels along the contours"), built.
+
+**Values** on toolbar row 2, right after the spacing label. Off by default (text over a
+map is something to ask for), remembered in QSettings (`display/isoline_labels`) like
+Topography, and live only while Isolines is ticked on a contoured map — disabled, not
+hidden. `--isoline-labels on|off` sets it from the command line.
+
+| where | what |
+|---|---|
+| `isolines.py` | `contour_set` also returns `segments` = `(mid_x, mid_y, line, heavy)`; `place_labels`, `label_decimals`, `label_text`. No Qt |
+| `ui/mapview.py` | a pool of `TextItem`s at `Z_ISOLINE_LABEL = 14` (over the outlines, under the barbs), `set_isoline_labels`, re-placed on every frame and every range change |
+| `ui/main.py`, `__main__.py` | the tick, its tooltip, the setting, the flag |
+
+**Placement** (`place_labels`), three rules, cheapest first:
+
+1. only where the whole label fits on screen — a number cut by the frame edge is worse
+   than none;
+2. at most one label per line per **200 px lattice cell**, the segment nearest the cell's
+   centre. The lattice is anchored to the data, not the window — R4.3's rule for barbs — so
+   a pan slides the same labels rather than choosing new spots each frame, and zooming in
+   labels each line more often;
+3. no two label boxes (58×22 px) overlap, placed greedily with the **heavy lines first**,
+   since those are the round numbers a reader counts from; at most 120.
+
+Labels are **horizontal**, in a white box that is itself the conventional gap in the line.
+Rotating them along the line was rejected: a segment is one 2.5 km cell of a marching-
+squares contour, so its direction is jagged, and an upright number reads faster anyway.
+Heavy lines' values are bold. The text is in **display units**, with the decimals the
+levels need (`label_decimals`): `15` in °C, `2.5` at 0.5 °C, `60.8` in °F, `288.15` in K,
+`19000` on a height chart in ft — and never `-0`.
+
+**Measured** on the real deterministic `t_2m` (281×201), at 0.5 °C — the densest case, 53
+levels and 57,283 segments: `place_labels` **2.5 ms** (7.8 ms in the first cut, which
+spent most of it in a two-key `lexsort` and an `np.unique` of the level values; one
+`argsort` on a folded `(cell, line) + distance` key and the integer line index
+`contour_set` already holds removed both). `set_time` 11.2 ms with values against 6.9 ms
+without, i.e. ~4 ms a step for ~46 labels; at 1 °C it is less. A pan re-places them in the
+same 2.5 ms.
+
+**Verified** by 10 tests in `tests/test_isolines.py` (every label sits on the line it
+names, none overlap, all fit, heavy first, a pan keeps the inner labels, zooming in adds
+more, bad inputs give none rather than raising, decimals and `-0`) and 8 in
+`tests/test_ui_isolines.py` on the real widgets (off until ticked, the values are drawn
+levels, bold on the round lines, gone and disabled with the isolines, following time,
+spacing and units, denser when zoomed, pooled items reused across a scrub, remembered for
+the next window, following the field under *Map shows*). End to end on real IMS data
+(run 2026093012): `t_2m` at +12 h labelled every 1 °C over the shaded relief, and the
+500 hPa `geopot` labelled `19000` / `19200` ft.
+
+```bash
+venv/bin/python -m imsicon --isoline-labels on data/IE_..._t_2m.nc
+venv/bin/python -m imsicon --isoline-labels on --level 500 data/IE_..._geopot.nc
+```
+
+**Not done:** labels that follow the line's angle (above), and a per-field or settings-file
+default — the tick is one preference for every map, like Topography.

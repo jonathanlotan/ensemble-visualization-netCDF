@@ -488,7 +488,8 @@ def contour_set(x, y, z, interval, cap=None):
     good = z[np.isfinite(z)]
     blank = {'ordinary': (np.empty(0), np.empty(0)),
              'emphasised': (np.empty(0), np.empty(0)),
-             'levels': np.empty(0), 'step': float(interval.step) if interval else 0.0}
+             'levels': np.empty(0), 'step': float(interval.step) if interval else 0.0,
+             'segments': NO_SEGMENTS}
     if interval is None or good.size == 0:
         return blank
     levels, step = levels_for(good.min(), good.max(), interval.step, interval.anchor,
@@ -504,4 +505,123 @@ def contour_set(x, y, z, interval, cap=None):
     heavy = emphasis_mask(levels, step, interval.emphasis, interval.anchor)[at]
     return {'ordinary': (xs[~heavy].ravel(), ys[~heavy].ravel()),
             'emphasised': (xs[heavy].ravel(), ys[heavy].ravel()),
-            'levels': levels, 'step': step}
+            'levels': levels, 'step': step,
+            # Where each segment is and which line it belongs to, for the value labels.
+            # Midpoints rather than the segments themselves: a label sits ON a line, and
+            # half a 2.5 km cell is far below a pixel at any zoom the app offers.
+            'segments': ((xs[:, 0] + xs[:, 1]) * 0.5, (ys[:, 0] + ys[:, 1]) * 0.5,
+                         at, heavy)}
+
+
+# ---- the values written on the lines (R15) ------------------------------------------------
+NO_SEGMENTS = (np.empty(0), np.empty(0), np.empty(0, dtype=np.intp),
+               np.empty(0, dtype=bool))
+
+# Labels are spread on a lattice of this many screen pixels: each line gets at most one
+# label per lattice cell, so a long isotherm is labelled every ~200 px along its length
+# rather than once (lost off-screen after a pan) or at every cell (a line of numbers).
+LABEL_SPACING_PX = 200
+# The room one label takes, with a little air: no two labels may come closer than this,
+# whichever lines they belong to, which is what keeps a tight gradient -- where ten lines
+# cross one lattice cell -- legible instead of a stack of overprinted numbers.
+LABEL_BOX_PX = (58, 22)
+# A hard ceiling, so a zoomed-out 0.5 degC map can never cost more text than a frame holds.
+MAX_LABELS = 120
+
+
+def label_decimals(levels):
+    """-> how many decimals the labels need: 0 for whole degrees, 1 for 0.5 degC or for
+    the 1.8 degF spacing, 2 for a Kelvin map anchored at 273.15.
+
+    Decided from the LEVELS, not the step, because the anchor counts too: a 1 K spacing is
+    whole, but the lines it draws sit at 288.15, 289.15. Capped at 2 -- nothing this app
+    contours is read to a hundredth, and a float that needs more is float noise.
+    """
+    levels = np.asarray(levels, dtype=float)
+    levels = levels[np.isfinite(levels)]
+    for decimals in (0, 1, 2):
+        scaled = levels * 10 ** decimals
+        if np.all(np.abs(scaled - np.rint(scaled)) < 1e-6 * np.maximum(1.0, np.abs(scaled))):
+            return decimals
+    return 2
+
+
+def label_text(value, decimals=0):
+    """`15`, `-2.5`, `288.15` -- and never `-0`, which reads as a different line from `0`."""
+    text = f'{float(value):.{int(decimals)}f}'
+    return text[1:] if text.startswith('-') and float(text) == 0.0 else text
+
+
+def place_labels(segments, view, px, py, spacing_px=None, box_px=None, cap=None):
+    """-> indices into `segments` of the ones to write a value on, in drawing order.
+
+    `segments` is `contour_set(...)['segments']`: `(mid_x, mid_y, line, heavy)`, where
+    `line` names the level -- its integer index, or its value. `view` is the visible
+    `(x0, x1, y0, y1)` in degrees and `px`/`py` how many degrees one screen pixel spans.
+    Three rules, cheapest first:
+
+    1. **Only where the whole label fits on screen.** A number cut by the frame edge is
+       worse than none.
+    2. **One per line per lattice cell, nearest the cell's centre.** The lattice is
+       anchored to the DATA (whole multiples of `spacing_px` from 0 degrees), never to
+       the window, for the reason the barb lattice is (R4.3): a pan then slides the same
+       labels across the screen instead of choosing new spots for them on every frame.
+    3. **No two labels overlap**, greedily, the heavy lines first -- those are the round
+       numbers a reader counts from, so they are the ones that must survive a tight
+       gradient -- and within each weight the best-centred first.
+    """
+    mid_x, mid_y, level, heavy = (np.asarray(part) for part in segments)
+    spacing = float(LABEL_SPACING_PX if spacing_px is None else spacing_px)
+    box_w, box_h = (float(v) for v in (LABEL_BOX_PX if box_px is None else box_px))
+    cap = MAX_LABELS if cap is None else int(cap)
+    px, py = float(px), float(py)
+    if (mid_x.size == 0 or cap <= 0 or not (np.isfinite(px) and np.isfinite(py))
+            or px <= 0 or py <= 0):
+        return np.empty(0, dtype=np.intp)
+    x0, x1, y0, y1 = (float(v) for v in view)
+    inside = ((mid_x >= x0 + box_w * 0.5 * px) & (mid_x <= x1 - box_w * 0.5 * px)
+              & (mid_y >= y0 + box_h * 0.5 * py) & (mid_y <= y1 - box_h * 0.5 * py)
+              & np.isfinite(level))
+    index = np.flatnonzero(inside)
+    if index.size == 0:
+        return index
+
+    sx, sy = mid_x[index] / px, mid_y[index] / py          # screen pixels, data-anchored
+    cell_x, cell_y = np.floor(sx / spacing), np.floor(sy / spacing)
+    off = np.hypot(sx - (cell_x + 0.5) * spacing, sy - (cell_y + 0.5) * spacing) / spacing
+    # One number per (cell, line), with the distance from the cell's centre folded in
+    # below the integer part (`off` < 0.71 of a cell): a single argsort then puts every
+    # group's best-centred segment first. It is the cheapest spelling by some way -- a
+    # two-key lexsort and an np.unique of the levels each cost more than all the rest.
+    if level.dtype.kind == 'f':                    # level values: rank them
+        line = np.unique(level[index], return_inverse=True)[1].astype(np.int64)
+    else:                                          # contour_set's integer index already is
+        line = level[index].astype(np.int64)
+        line -= line.min()
+    cx = (cell_x - cell_x.min()).astype(np.int64)
+    cy = (cell_y - cell_y.min()).astype(np.int64)
+    n_line = int(line.max()) + 1
+    group = (cx * (int(cy.max()) + 1) + cy) * n_line + line
+    order = np.argsort(group + off * 0.5)
+    first = np.ones(order.size, dtype=bool)
+    first[1:] = group[order[1:]] != group[order[:-1]]
+    best = order[first]
+
+    # Heavy lines first, then the best-centred; the greedy pass keeps what does not collide.
+    best = best[np.lexsort((off[best], ~heavy[index[best]]))]
+    # A few hundred candidates at most, so a Python loop -- over a bucket grid one label
+    # box in size, so each candidate is checked against its neighbours only.
+    taken = {}
+    chosen = []
+    for k in best:
+        x, y = float(sx[k]), float(sy[k])
+        bx, by = int(x // box_w), int(y // box_h)
+        if any(abs(ox - x) < box_w and abs(oy - y) < box_h
+               for nx in (bx - 1, bx, bx + 1) for ny in (by - 1, by, by + 1)
+               for ox, oy in taken.get((nx, ny), ())):
+            continue
+        taken.setdefault((bx, by), []).append((x, y))
+        chosen.append(index[k])
+        if len(chosen) >= cap:
+            break
+    return np.asarray(chosen, dtype=np.intp)
