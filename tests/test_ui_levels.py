@@ -195,7 +195,8 @@ def test_the_readout_reports_the_level_rather_than_ensemble_statistics(column, q
     column.select_point(1, 2)
     settle(qapp)
     assert column.readout.mode == 'level'
-    assert set(column.readout.values) == {'time', 'level', 'value', 'max', 'min'}
+    assert set(column.readout.values) == {'time', 'level', 'value', 'height', 'max',
+                                           'min'}
     assert column.readout.values['level'].text() == '850 hPa'
     at_level = column.ds.series(1, 2)[column.t, column.level]
     assert f'{at_level:,.2f}' in column.readout.values['value'].text()

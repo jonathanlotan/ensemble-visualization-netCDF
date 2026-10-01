@@ -246,7 +246,9 @@ ICON = Family(
     # the wind map can be drawn at the surface or at 850 hPa out of the same machinery.
     roles={'temperature': 't_2m', 'humidity': 'rh_2m',
            'zonal': 'u_10m', 'meridional': 'v_10m',
-           'zonal_upper': 'u', 'meridional_upper': 'v'},
+           'zonal_upper': 'u', 'meridional_upper': 'v',
+           # R9: the geopotential, read as the height of every pressure level.
+           'height': 'geopot'},
     default_axis='pressure', lower=True)
 
 FAMILIES = (ENSEMBLE, ICON)

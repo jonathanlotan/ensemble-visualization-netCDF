@@ -357,6 +357,12 @@ class DerivedView:
     rate_note = None
     window_steps = 0
     isoline_interval = None          # R5: an `isolines.Interval` in CANONICAL units
+    # R5.9: the chosen spacing, in canonical units. A CLASS attribute rather than an
+    # instance one set in __init__, and that is not a style choice: `__getattr__` hands
+    # any name it cannot find to the operand view, which is a FieldView and has an
+    # `_iso_step` of its own -- so a missing default here would silently contour a
+    # derived map at the spacing chosen for the field underneath it.
+    _iso_step = None
     sort_stops = None                # R5: `SortScale` stops in canonical units, or None
 
     def __init__(self, operands, field, long_name, provenance, display_name=None):
@@ -431,10 +437,36 @@ class DerivedView:
     @property
     def isolines(self):
         """Contour interval in DISPLAY units, or None when this view is not contoured."""
-        interval = self.isoline_interval
+        interval = self._interval()
         if interval is None:
             return None
         return interval.scaled(self.units_affine, difference=self.is_difference_view)
+
+    def _interval(self):
+        """-> the `Interval` in CANONICAL units, chosen spacing applied, or None."""
+        interval = self.isoline_interval
+        if interval is None:
+            return None
+        return interval.at_step(self._iso_step) if self._iso_step else interval
+
+    @property
+    def isoline_step(self):
+        """The contour spacing in CANONICAL units, or None when not contoured."""
+        interval = self._interval()
+        return None if interval is None else interval.step
+
+    def set_isoline_step(self, step):
+        """Choose the spacing, in canonical units; falsy or invalid restores the
+        registry's own. -> True when this view is contoured at all."""
+        step = abs(float(step or 0.0))
+        self._iso_step = step if np.isfinite(step) and step > 0 else None
+        return self.isoline_interval is not None
+
+    @property
+    def isoline_ladder(self):
+        interval = self.isoline_interval
+        return (interval.ladder if interval is not None and interval.ladder
+                else isolines.DEGREES)
 
     @property
     def sort_scale(self):

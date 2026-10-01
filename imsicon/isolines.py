@@ -30,16 +30,89 @@ import numpy as np
 from . import products
 
 
+# ---- the spacings on offer -------------------------------------------------------------
+class Ladder(NamedTuple):
+    """The spacings the Isolines slider offers for one kind of quantity (R5.9, R9).
+
+    `steps` are stated in the quantity's NATURAL unit -- degrees for a temperature, gpm
+    for a geopotential height -- and `scale` is how many canonical units one natural unit
+    is (1 K per degC, 9.80665 m2 s-2 per gpm), so the view is always handed a canonical
+    spacing and G15 keeps applying. A ladder per kind rather than one for the app, because
+    "every 2" has to mean something on a 500 hPa height chart too, and 2 gpm would be a
+    hatch pattern there while 2 degC is a reading.
+    """
+    steps: tuple
+    scale: float = 1.0
+    emphasis: dict = {}      # natural step -> every Nth line heavier
+    unit: str = 'degrees'    # how the natural unit is called in help text
+
+    def canonical(self, step):
+        return float(step) * self.scale
+
+    def natural(self, canonical):
+        return float(canonical) / self.scale
+
+    def nearest(self, step):
+        """-> the offered NATURAL spacing closest to `step` (natural units)."""
+        return min(self.steps, key=lambda choice: abs(choice - float(step)))
+
+    def index_of(self, canonical):
+        """-> slider notch for a CANONICAL spacing (the nearest one)."""
+        return self.steps.index(self.nearest(self.natural(canonical)))
+
+    def emphasis_for(self, step, default=5):
+        """-> how many lines apart the heavy ones are, for a NATURAL spacing."""
+        return self.emphasis.get(round(float(step), 6), default)
+
+
+# The temperature ladder: canonical (i.e. Celsius) degrees, which is the whole of G15
+# applied to a user's choice. Picking 2 with the Units combo on degF draws the SAME lines
+# as picking 2 on degC did, labelled 3.6 degF; anything else would move every line on the
+# map as a side effect of relabelling the colorbar. The emphasis puts the heavy line on a
+# number a forecaster would name -- 1, 5, 10, 6 and 20 degrees -- which is a table rather
+# than a formula because 3 has no round multiple near 5.
+DEGREES = Ladder((0.5, 1.0, 2.0, 3.0, 4.0), 1.0,
+                 {0.5: 2, 1.0: 5, 2.0: 5, 3.0: 2, 4.0: 5}, '°C')
+
+# Standard gravity: the m2 s-2 of geopotential per geopotential metre, by definition.
+G0 = 9.80665
+# The height ladder, in geopotential metres. A 500 hPa chart is conventionally drawn at
+# 4 dam (40 gpm) and an 850 hPa one at 3 dam; 120 gpm is what a 300 hPa jet-level chart
+# needs to stay readable. The heavy line lands on a round multiple every time.
+HEIGHT = Ladder((10.0, 20.0, 30.0, 40.0, 60.0, 80.0, 120.0), G0,
+                {10.0: 5, 20.0: 5, 30.0: 5, 40.0: 5, 60.0: 5, 80.0: 5, 120.0: 5}, 'gpm')
+
+
 # ---- the interval policy ---------------------------------------------------------------
 class Interval(NamedTuple):
     """How a quantity is contoured: lines at `anchor + k * step`, every `emphasis`th heavy.
 
     Held in the view's canonical units by the registry, and in display units once
-    `scaled` has been through it.
+    `scaled` has been through it. `ladder` is what the slider offers for it.
     """
     step: float
     emphasis: int = 5        # every Nth line from the anchor is drawn heavier
     anchor: float = 0.0      # a value a line must pass through: 273.15 K, i.e. 0 degC
+    ladder: Ladder = DEGREES
+
+    def at_step(self, step):
+        """-> the same contouring, re-spaced to `step` (in the interval's own units).
+
+        The **anchor is kept**, so every spacing still puts a line on 0 degC and the map
+        is re-read rather than redrawn somewhere else; only the emphasis follows the step,
+        because "every 5th line" means 5 degC at a 1 degC spacing and 2.5 degC at 0.5 --
+        and a heavy line that lands on a number nobody would name is no landmark at all.
+
+        A step that is not a positive number leaves the interval alone: this is reached
+        from a slider and a command line, and a bad value must cost the map its spacing
+        choice, never its lines.
+        """
+        step = abs(float(step))
+        if not np.isfinite(step) or step <= 0:
+            return self
+        ladder = self.ladder or DEGREES
+        return Interval(step, ladder.emphasis_for(ladder.natural(step), self.emphasis),
+                        self.anchor, ladder)
 
     def scaled(self, affine, difference=False):
         """-> the same lines expressed in DISPLAY units.
@@ -55,7 +128,7 @@ class Interval(NamedTuple):
         anchor = (affine.apply_delta(self.anchor) if difference
                   else affine.apply(self.anchor))
         return Interval(abs(float(affine.apply_delta(self.step))), self.emphasis,
-                        float(anchor))
+                        float(anchor), self.ladder)
 
 
 # Contoured at 1 degC, with every 5th line (a round 5 degC) heavier. Keyed by field name
@@ -77,6 +150,11 @@ STEPS = {
     'T_G': _TEMPERATURE,
     'TMAX_2M': _TEMPERATURE,
     'TMIN_2M': _TEMPERATURE,
+    # R9: the geopotential on pressure levels, read as a HEIGHT chart. The file is m2 s-2
+    # (canonical); the lines are every 40 gpm -- 4 dam, the conventional 500 hPa interval
+    # -- anchored at 0 so they sit on whole decametres, with every 5th (200 gpm) heavier.
+    # The HEIGHT ladder is what the slider offers instead of the degrees one.
+    'GEOPOT': Interval(40.0 * G0, 5, 0.0, HEIGHT),
 }
 
 # A DIFFERENCE of two contoured fields -- the dew point depression above all, but equally
@@ -87,6 +165,30 @@ STEPS = {
 # Anchored at zero, which needs no conversion: no difference is no difference in degC,
 # K and degF alike.
 DIFFERENCE = Interval(0.5, 2, 0.0)
+
+# The temperature ladder's steps, by the name R5.9 gave them. Stated as absolute spacings
+# rather than as multiples of the field's own interval, because "every 2 degrees" has to
+# mean the same thing on a temperature map and on a depression -- a multiplier would make
+# one notch 2 degC on T_2M and 1 degC on T-Td while the control read the same.
+STEP_CHOICES = DEGREES.steps
+
+
+def emphasis_for(step, default=5):
+    """-> how many lines apart the heavy ones are, for a chosen spacing in degrees."""
+    return DEGREES.emphasis_for(step, default)
+
+
+def nearest_step(step):
+    """-> the offered degree spacing closest to `step`, for placing the slider on a field
+    whose registry interval (0.5 on a difference, 1 on a temperature) is one of them."""
+    return DEGREES.nearest(step)
+
+
+def ladder_for(field):
+    """-> the `Ladder` the slider should offer for a field: its interval's, else degrees."""
+    interval = interval_for(field)
+    return interval.ladder if interval is not None and interval.ladder else DEGREES
+
 
 # Above this many lines a map is a hatch pattern rather than a reading, so the step is
 # coarsened by a whole-number factor (and `levels_for` reports the step it actually used,

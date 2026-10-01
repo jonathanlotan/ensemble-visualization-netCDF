@@ -185,7 +185,8 @@ UNITS.update({
     'OMEGA':   FieldUnits(('pa s-1',), []),
     # Geopotential is published as m2 s-2; a chart is drawn in geopotential metres, which
     # is that divided by the standard gravity. Exact by definition of gpm, so it leads.
-    'GEOPOT':  FieldUnits(('m2 s-2',), [Affine('gpm', 1.0 / 9.80665), Affine('m2 s-2')]),
+    'GEOPOT':  FieldUnits(('m2 s-2',), [Affine('gpm', 1.0 / 9.80665),
+                                         Affine('dam', 1.0 / 98.0665), Affine('m2 s-2')]),
     # Surface.
     'T_G':     FieldUnits(('K',), _TEMPERATURE),
     'TMAX_2M': FieldUnits(('K',), _TEMPERATURE),

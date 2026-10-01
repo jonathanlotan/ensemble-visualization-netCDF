@@ -1417,6 +1417,130 @@ isolines 0.5 °C | sorted: colour only below 2 °C`.
 
 ---
 
+## R5.9 Follow-up — the isoline switch, and how close the lines are (2026-09-01)
+
+Requested 2026-09-01: *make it possible to choose if the user wants the isolines or not,
+and if it does, add a slider on top that lets the user choose how close they are — 0.5, 1,
+2, 3, 4.*
+
+The switch was already there (R5.2's **Isolines** tick, on by default where a field has
+lines, disabled where it does not) and is unchanged. What is new is the spacing beside it,
+and pairing the two is what makes the tick worth having: 1 °C is the right interval for
+reading a gradient across the domain and the wrong one for reading the 0–5 °C air a fog
+forecast lives in, so "off or on" was really "off, or on at whatever R5 chose".
+
+```
+Isolines [x]  ──|────  2 °C          the notches are 0.5, 1, 2, 3, 4 CANONICAL degrees
+                                      the label is the same spacing in the units on screen
+```
+
+**The notches are canonical (Celsius) degrees, and that is G15 applied to a user's own
+choice.** Picking 2 with the Units combo on °F draws the lines picking 2 on °C drew,
+labelled 3.6 °F — not a new set anchored on whole Fahrenheit. Anything else would move
+every line on the map as a side effect of relabelling the colorbar, which is exactly what
+R5.2 went to some trouble to prevent. The slider therefore sits still through a unit
+change while its label follows the colorbar; the map title, which already reported the
+interval actually drawn, needed no change at all.
+
+**The anchor is kept and only the emphasis follows the step.** Re-spacing has to re-read
+the map, not redraw it somewhere else, so every choice still puts a line on 0 °C. The
+heavy line cannot keep "every 5th" across all five, though — at 0.5 °C that lands on
+2.5 °C, which is no landmark — so `isolines.emphasis_for` is a small table chosen to make
+the heavy line a number a forecaster would name:
+
+| spacing | 0.5 | 1 | 2 | 3 | 4 |
+|---|---|---|---|---|---|
+| every Nth line heavier | 2 | 5 | 5 | 2 | 5 |
+| i.e. a heavy line every | 1 °C | 5 °C | 10 °C | 6 °C | 20 °C |
+
+**The choice is remembered per field**, in the window rather than in `QSettings`. 2 °C on
+a temperature map and 2 °C on a depression are different readings, so flipping between
+them under *Map shows* must neither carry one choice onto the other nor throw the first
+one away. Each field opens on its registry interval — 1 °C on `T_2M`/`T_S`/`TD_2M`,
+0.5 °C on `T-Td` — until it is moved.
+
+Where it lives is the R2/R5 rule again: the spacing is pushed onto the **view**
+(`FieldView.set_isoline_step`, `DerivedView.set_isoline_step`), never held beside the map,
+so the map, the title, the tooltip and the CLI all read one number and the affine that
+turns 2 °C into 3.6 °F is applied in exactly one place. The slider is disabled while
+Isolines is unticked, for the same reason *Colours* and *Scale* are disabled under Sort: a
+control that moves and changes nothing is worse than one that is visibly out of reach.
+
+**Fields that are not contoured are still not contoured** — CAPE, precipitation, humidity
+and the wind leave both controls greyed, as R5.2 set out and R5.7 recorded. The five
+spacings are degrees, so extending them to a `J kg-1` or `mm` map is a different choice of
+numbers per field (R5.7 still has it as a one-line registry entry each), not this control.
+
+### Measured
+
+On the real 261×161 grid, 20 members, a 1500×880 window — the machine R4.4 measured as
+roughly 3× slower than the one v2 and v3 were timed on, against v2's 16.7 ms frame:
+
+| spacing | levels | segments | `contour_set` | `refresh_map` |
+|---|---|---|---|---|
+| isolines off | — | — | — | **0.83 ms** |
+| 0.5 °C | 32 | 5,999 | 0.91 ms | **1.99 ms** |
+| 1 °C | 16 | 3,015 | 0.67 ms | 1.67 ms |
+| 2 °C | 8 | 1,432 | 0.50 ms | 1.50 ms |
+| 3 °C | 5 | 937 | 0.45 ms | 1.45 ms |
+| 4 °C | 4 | 736 | 0.40 ms | 1.36 ms |
+
+So the closest spacing the slider offers costs about **1.2 ms a frame** over drawing no
+lines, and the vectorised marching squares R5.4 built is why choosing it is not a decision
+about performance. (Measuring this wrongly is easy and was done first: whichever variant
+runs first is charged a warm-up of ~1.5 ms, which reported "isolines off" as the slowest
+of the six. Each figure above is a steady-state mean of 30 redraws after 5 warm-up ones —
+the same trap R6.5 hit from the paint side.)
+
+### G39 — a delegating decorator needs a class-level default for every new instance
+attribute
+
+`DerivedView.__getattr__` hands any name it cannot find to its first operand, which is a
+`FieldView` — and `FieldView` now has an `_iso_step` of its own. So a chosen spacing lives
+in the same-named attribute on both, and a `DerivedView` that had not set one yet would
+have silently contoured `T-Td` at the spacing chosen for the `T_2M` underneath it, at the
+wrong emphasis, with the slider showing the right number. `_iso_step = None` is a **class**
+attribute on `DerivedView` for that reason, not an `__init__` line — the same shape as
+`isoline_interval`, `rate_hours` and the rest of the block above it. Any future state
+added to `FieldView` needs the same treatment.
+`test_a_derived_view_is_spaced_on_its_own_and_not_on_its_operand_s` fails without it.
+
+### Verified
+
+`519 passed` (504 from R1–R6, unchanged and green, + 15 new). Eight in
+`tests/test_isolines.py`: the five offered spacings are the registry's own plus four more;
+re-spacing keeps the anchor and moves the emphasis onto a round number; a broken step
+(0, NaN) leaves the interval alone rather than costing the map its lines; a chosen spacing
+still anchors on whole degrees; the same choice in °C and °F is the same isotherms;
+clearing it restores the registry's; an uncontoured field refuses one; and G39. Seven in
+`tests/test_ui_isolines.py`, on the real widgets: the slider starts on the field's own
+interval; moving it spaces the lines and retitles the map; 0.5 °C draws more lines and
+heavies every whole degree; unticking puts the slider out of reach and re-ticking gives
+back the spacing rather than the default; the label follows the units while the lines stay
+put; each field keeps what it was last read at across *Map shows*; and a humidity map
+leaves the slider greyed with a tooltip that says why.
+
+End-to-end under `QT_QPA_PLATFORM=offscreen`, on a 6-step run at the real 261×161×20
+resolution: `--isoline-step 0.5/1/2/4` renders the same map at four densities with the
+title and the toolbar label agreeing at each; `--units F --isoline-step 2` reads
+`isolines 3.6 °F` over the 2 °C isotherms; `--derive depression --sort --isoline-step 1`
+keeps the sort band and re-spaces the lines running through it; `--isoline-step` on
+`RELHUM_2M` prints one sentence and carries on; and an unoffered value is refused by
+argparse with the five choices listed.
+
+### Running it
+
+```bash
+venv/bin/python -m imsicon --isoline-step 2 data/ICON_ENS_..._T_2M.nc
+venv/bin/python -m imsicon --isolines off data/ICON_ENS_..._T_2M.nc
+venv/bin/python -m imsicon --derive depression --isoline-step 1 --sort <T_2M file>
+```
+
+Toolbar row 2: **Isolines** ticks them on, the slider beside it chooses 0.5, 1, 2, 3 or
+4 °C, and the label to its right says that spacing in whatever units are on screen.
+
+---
+
 # Release 6 — a transparent zero, a vivid ramp, and the land underneath
 
 Requested 2026-08-26: *for each map, for the turbo colours, make 0 be transparent and make
@@ -2170,3 +2294,270 @@ venv/bin/python -m imsicon --barbs on --level 850 data/IE_..._temp.nc
 
 The checkbox is on toolbar row 2 where it always was; what changed is that it is no
 longer greyed out unless the map is the wind map.
+
+---
+
+# Release 9 — terrain, spacing on both products, heights, and the humidity profile
+
+Requested 2026-10-01: *for both: add an optional topographic map, isolines difference
+choosing. For single: pressure to geopot height (both optional isolines and level), make
+the date and value more visible, add geopot height next to them (from model). For RH in
+single only: instead of levels height is Y and value is X for the single point.* "Both"
+is the ensemble (R1–R6) and the deterministic run (R7, "single"). Sections 0 and R1–R8 are
+unchanged and still the contract.
+
+**Housekeeping first.** This checkout was behind `origin/main` by R7 and R8 while the R5.9
+isoline-spacing slider sat here uncommitted, so the two were merged by hand (five hunks in
+`__main__.py`, two in `ui/main.py`); the R5.9 work is the "isolines difference choosing"
+half of the request, now applied to both products, and the merged tree passed its 589
+tests before anything new was added.
+
+## R9.1 The shape of it
+
+Four things, and the fourth is the only one that needed a new panel:
+
+```
+  mapdata/levant_etopo1.npz ──► terrain.py ──► MapView.terrain  (Multiply, z = 1)   [both]
+                                   hillshade      "Topography" tick, remembered
+
+  isolines.Ladder  ─► Interval.ladder ─► the slider's notches  (degrees | gpm)      [both]
+                                        GEOPOT: 40 gpm, every 5th heavier           [single]
+
+  the run's geopot ─► MainWindow.height_companion ─► ReadoutPanel 'Height (geopot)' [single]
+                            (opened beside any column, G45-checked)   ─► ProfileView y axis
+
+  ProfileView  (x = value, y = geopotential height)  ◄── "Profile" tick, on for `rh`  [single]
+```
+
+| file | responsibility |
+|---|---|
+| `imsicon/terrain.py` | load the elevation bundle, the hillshade, the RGBA image, `height_at`. No Qt |
+| `imsicon/mapdata/levant_etopo1.npz` | ETOPO1 1-arc-minute elevation, 901×601, clipped to the pan range (592 kB, committed) |
+| `tools/build_terrain.py` | dev-only: fetch the subset from NOAA ERDDAP and write the bundle |
+| `imsicon/isolines.py` | `Ladder` (the slider's notches per quantity), `DEGREES`, `HEIGHT`, the `GEOPOT` interval |
+| `imsicon/ui/profileview.py` | the vertical profile panel |
+| `imsicon/ui/readout.py` | the `height` row; the time and value rows a size up |
+| `imsicon/ui/mapview.py` | the relief layer, the land mask rasteriser, an unpinned colorbar axis |
+| `imsicon/ui/main.py` | **Topography** and **Profile** ticks, the per-ladder slider, the height companion, the graph stack, `app_settings` |
+| `imsicon/products.py` | the `height` role (`geopot`) on the deterministic family |
+| `tools/build_mapdata.py` | the clip box widened to the union of both products' pan ranges |
+
+## R9.2 Topography: shaded relief, multiplied over any map
+
+The land was already pale grey and the sea white (R6); this is the next thing a
+forecaster wants to see through the field: *where the hills are*. A CAPE plume over the
+Judean hills and one over the coastal plain are two different forecasts.
+
+* **The data is ETOPO1**, NOAA's 1-arc-minute global relief, public domain, fetched once
+  as a NetCDF-3 subset that this app's own `nc3` parses, and committed. Not the model's
+  `topo_icon_web.nc`: that covers the inner box only (**G6**), and a relief that faded out
+  mid-domain is exactly what R6.8 declined to ship. The sea floor is clamped at −450 m
+  (below the lowest land on Earth) because it is never drawn and compresses worst: 751 kB
+  without the clamp, 592 kB with it, and not one land cell touched.
+* **Shadow only, by construction.** The layer is composited with the painter's *Multiply*
+  mode, which can darken and never brighten, and the hillshade is normalised to flat
+  ground: flat terrain and slopes facing the north-west light come out white (the field
+  under them is untouched), slopes facing away darken it to no less than `AMBIENT` (0.55).
+  That is the classic way to put relief under a thematic map without washing its colours
+  out; a hypsometric tint would fight the colour scale for the same pixels, and the colour
+  scale is the reading.
+* **The sea stays white** because the relief is masked to the *same land polygons the grey
+  fill uses*, rasterised with the same odd-even rule and the same painter, so the two end on
+  exactly the same coastline — and the Dead Sea shore, 430 m below sea level, is land.
+  Without rings (an older bundle) it falls back to "above sea level", losing that shore and
+  nothing else.
+* **Exaggeration 6.** A 100 m rise over a 1.85 km cell is a 3° slope, which shades by
+  about 4 % at a 45° sun — invisible. The z-factor is the usual trick and is stated as one:
+  the shading says *where* the slopes are, never how steep.
+* Off by default and **remembered** (`display/topography`): a backdrop that appears unasked
+  competes with the field, and a reader who wants the hills wants them on every map. The
+  title says `terrain shading` while it is on, because the shadows change what a colour
+  looks like and a screenshot has to say they are not the field.
+* Built **once per window**, lazily: a reader who never ticks it pays nothing, and the
+  image depends on the bundle and the land polygons, neither of which changes with the
+  field, the step or the zoom.
+
+The clip box of the coastline bundle was widened at the same time, from 30.5–39.5 E /
+24.5–38 N to **29.5–39.5 E / 24.5–39.5 N**: the deterministic domain is bigger than the
+ensemble's (R7.13) and its pan range reached north of the old box, where the coast simply
+stopped. Regenerated from Natural Earth: 141 kB, 24 land rings, the same six disputed and
+38 indefinite lines as before.
+
+## R9.3 Isoline spacing on both products, with a ladder per quantity
+
+R5.9's slider offered five spacings in degrees. On the deterministic run that already
+covered `temp`, `t_2m`, `td_2m`, `t_g`, `tmax_2m` and `tmin_2m` through `field_key`; what it
+could not do was contour a **height chart**, where "every 2" is a hatch pattern and the
+conventional spacing is 4 dam. So an `Interval` now carries a `Ladder`:
+
+| ladder | notches | natural unit | canonical scale | heavy line |
+|---|---|---|---|---|
+| `DEGREES` | 0.5, 1, 2, 3, 4 | °C | 1 K per degree | 1, 5, 10, 6, 20 °C (the R5.9 table) |
+| `HEIGHT` | 10, 20, 30, 40, 60, 80, 120 | gpm | 9.80665 m² s⁻² per gpm | every 5th |
+
+The slider re-ranges to the field's ladder and its label stays in display units, so a
+500 hPa `geopot` map opens at `40 gpm` with seven notches, reads `4 dam` when the Units
+combo says decametres, and draws the **same lines** either way (**G15** — the ladder is
+canonical, the label is not). `--isoline-step` takes the spacing in the field's natural
+unit and snaps to the nearest notch, saying so (`--isoline-step 50` on a height → "offers
+10, 20, 30, 40, 60, 80, 120 gpm; using 40"); it used to refuse anything off the degree
+list, which would have made every height spacing an error.
+
+**Geopotential → height.** `GEOPOT` was already converted to gpm by default (R7); it now has
+`dam` as a second choice and is contoured at `40 gpm × g` in its canonical m² s⁻², anchored
+at 0 so the lines sit on whole decametres. The isolines slider, the Level control, the
+units combo and the map title all work on it unchanged — the request's "both optional
+isolines and level" was the registry entry plus the ladder.
+
+## R9.4 The date, the value, and the height beside them
+
+On the deterministic readout the **Time** and **Value here** rows are set four points
+larger and bold — a size up, which the eye reads as the answer, rather than bold alone,
+which it reads as a heading. The ensemble's six-row panel is untouched.
+
+Between them and the column extremes sits **Height (geopot)**: the geopotential height of
+the level shown, at the chosen point and time, from the run's own `geopot` file. The
+companion is opened automatically beside any pressure-level map whose run has `geopot` on
+disk — automatic rather than opt-in, unlike the wind overlay, because the height is a
+reading *of the map on screen* and it was asked for next to the value — off the UI thread
+on the same `BuildWorker`, under a new request kind `FIELD` that opens one file as itself
+and does **not** stamp it as derived (so "Map shows" can later install the very same view
+as the `geopot` map, and does: the companion is reused, not reopened). It is kept while it
+fits the map (`_overlay_shape`) and checked with `check_pairable` before it is accepted
+(**G45**): a `geopot` with fewer steps than the map is refused with the reason on the row's
+tooltip, and the profile falls back to pressure.
+
+The row is hidden where it would lie: on a 2 m field (no level to be the height of), on
+the ensemble, and on `geopot` itself, whose value *is* the height.
+
+## R9.5 The humidity profile
+
+On `rh` the right-hand panel is a **vertical profile**: the value across, the geopotential
+height up, one point per level, at the time step on the slider — the question a forecaster
+asks of one point and one time ("where in the column is it moist?") rather than the time
+graph's ("how does it change"). Specifically:
+
+* **y is the model's height**, from the companion above, so the levels sit where the model
+  says they are today. Without `geopot` the levels are drawn against **pressure**, inverted
+  so up is still up, and the axis says so — a profile against a guessed height would look
+  just as convincing and be off by hundreds of metres.
+* The right-hand axis names the levels in hPa, **thinned to what fits** (`MIN_TICK_GAP_PX`):
+  the lowest levels are 25 hPa (~220 m) apart, which is a few pixels on a 15 km panel, and
+  22 labels printed over each other name nothing. The map's current level is never thinned.
+* The map's level is marked (a ring and a line); **▲▼** move it; **clicking** a level on
+  the profile moves the map to it; **hovering** one reports that level's value and height
+  to the readout, the way hovering the time graph reports another time, and leaving
+  restores the map's.
+* The value axis is pinned to the dataset range (A1), so a profile at 03Z and one at 15Z
+  are read on one scale.
+* A **Profile** tick on toolbar row 2 is live on any column of pressure levels, ticked by
+  default on `rh` — the field it was asked for — and remembered per field within the
+  window, like the isoline spacing. Unticked, the graph is the R7 time-height section.
+
+## R9.6 Measured, not assumed
+
+On this machine (the one R4.4 measured as roughly 3× slower than v2's), against the
+16.7 ms frame:
+
+| operation | ms |
+|---|---|
+| load the elevation bundle (901×601 int16, once per process) | 9.2 |
+| hillshade of the whole bundle | 7.7 |
+| land-mask rasterise (the painter, 541,501 cells) | 0.9 |
+| the relief image, first build, all in | **8.7** |
+| the cached check on every later `set_terrain` | 0.005 |
+| CAPE +110 h, `refresh_map` + paint, terrain off → on | 15.19 → **15.54** |
+| 21-step scrub with terrain on | 3.75 per step |
+| profile refresh (22 levels, with heights) | 0.58 |
+| height lookup at one level (the readout) | 0.004 |
+| `set_time`, time graph / profile showing | 1.25 / 1.93 |
+
+So the relief costs about a third of a millisecond a frame once built, and the profile
+about 0.7 ms a step over the time graph.
+
+| claim | measurement |
+|---|---|
+| the hillshade is right-way-up | a flat field is exactly 1.0 everywhere; a ramp falling to the north-west is 1.0 (lit) and the same ramp the other way up 0.73; an east-facing ramp is darker than a north-facing one of equal degrees per cell, because a degree of longitude is shorter |
+| the mask is the coastline | Jerusalem and the Dead Sea shore opaque; the Mediterranean off Haifa, Gaza and Beirut clear — 402,649 land cells of 541,501 |
+| the bundle is the real relief | Hermon > 2000 m, Jerusalem 600–1000 m, the Dead Sea < −300 m, the sea off Haifa < 0 |
+| the same lines in gpm, dam and m² s⁻² | 5,560 gpm = 556 dam = 54,524.97 m² s⁻² each land on one level of their own ladder |
+| the profile is the column | x equals `series(iy, ix)[t]` and y the companion's `geopot / g`, at two points and two times |
+
+## R9.7 Gotchas found while building v9
+
+* **G47 — the test suite's `QSettings` isolation did not isolate on macOS.** `conftest.py`
+  set `setDefaultFormat(IniFormat)` and `setPath(...)` (G25), but on macOS
+  `QSettings(org, app)` keeps **NativeFormat** regardless and goes straight to
+  `~/Library/Preferences/com.ims.IconEnsembleViewer.plist`. MEASURED: a marker written
+  natively before a test file was gone after it — every test run since R2 has been wiping
+  the developer's real preferences (`last_dir`, the units choices), and it was found only
+  because a remembered Topography tick vanished between two screenshots while the suite
+  ran in the background. The app now opens its preferences through one seam,
+  `ui.main.app_settings()`, and `clean_settings` points it at a throw-away `.ini` per test.
+  Re-measured: the marker survives.
+* **G48 — pyqtgraph pins the colorbar axis to 45 px, and G36's margin was too small for it
+  anyway.** 45 px fits three digits; a CAPE scale read `0, 100, 200, 300` for 0..3000 and a
+  500 hPa height `552` for 5,520 gpm. Unpinning the axis (`setWidth(None)`) was necessary
+  and not sufficient: with `TITLE_MARGIN_PX = 110` the layout measured 738 px in a 718 px
+  widget — the wrapped title plus 41 px of plot frame plus a 63 px colorbar — so the
+  colorbar's last 20 px, and the last digit of every label over 999, were off the edge of
+  the widget with no error anywhere. The margin is 150 px now, and
+  `test_a_four_digit_colorbar_fits_inside_the_map_widget` holds the layout inside the widget.
+* **The python.org macOS build ships no root certificates for `urllib`.** Both build tools
+  fetch with `certifi`'s bundle when it is importable (it comes with `requests`, which the
+  downloader already needs), else the default context.
+* **A `Map shows` entry for the open file is keyed `base`, not `file:<field>`.** A test that
+  switches fields twice has to recompute the keys after each switch, because the open file
+  changes which entry is `base`.
+
+## R9.8 Verified
+
+`638 passed` (589 from R1–R8 and the merged R5.9, unchanged and green except one row-set
+assertion that gained the height row, + 49 new). Nothing skips here: the 407 MB reference
+file and `netCDF4` are both present.
+
+| what | where | verified by |
+|---|---|---|
+| the relief arithmetic and the bundle | `terrain.py`, `mapdata/levant_etopo1.npz` | `test_terrain.py` (13) — flat is 1.0, lit stays white, away darkens, cos(lat) in the gradient, the mask in the alpha, known places, the clamp, a missing or descending bundle refused |
+| the option | `ui/mapview.py`, `ui/main.py` | `test_ui_terrain.py` (8) — off until ticked; Multiply at z between field and isolines; sea clear and land shaded at named places; built once across time and fields; unticked takes the note down; remembered for the next window; disabled with the reason when the bundle is missing |
+| the ladder | `isolines.py`, `fieldview.py`, `derived.py` | `test_isolines.py` (+4) and `test_ui_isolines.py` (+5) — gpm/dam/raw are the same lines; the slider re-ranges to seven notches and back to five; decametres relabel without moving; the CLI snaps and says so |
+| the readout and the height | `ui/readout.py`, `ui/main.py` | `test_ui_profile.py` — the height row is the run's `geopot / g` at the level, point and time; larger date and value; hidden on `geopot`, on a 2 m field and on the ensemble; a short `geopot` refused (G45); the companion kept across fields and reused as the `geopot` map |
+| the profile | `ui/profileview.py` | `test_ui_profile.py` (19 in all) — `rh` opens as a profile with height up; the column at the point and time; hPa on the right axis; the level marked and following ▲▼; click moves the map, hover the readout; the slider moves it; pinned value axis; `temp` opens on the time graph and can switch; the choice kept per field; pressure fallback without `geopot` |
+| the colorbar | `ui/mapview.py` | `test_ui_profile.py` — a four-digit scale fits inside the widget |
+
+End to end under `QT_QPA_PLATFORM=offscreen`: the real CAPE file at +110 h with
+`--topo on` shows the plume vivid over the shaded Judean hills, white sea and legible
+coastline; a synthetic deterministic run at the real 281×201×22 resolution renders `rh` as
+a profile against its `geopot` heights with the readout's height row at 1,325 gpm, `temp`
+at 850 hPa with 1 °C isolines over the relief, `geopot` at 500 hPa with `--isoline-step
+60` and again with `--isoline-step 500 --units dam` (snapped to 12 dam, with the sentence);
+`--profile on` on the ensemble prints one sentence and carries on.
+
+## R9.9 Deliberately not done
+
+* **Elevation contours.** A "topographic map" can also mean height contours; the isolines
+  machinery would draw ETOPO1 at 250 m in a few lines, but they would compete with the
+  field's own isolines for the same ink. The shading carries the relief for now.
+* **A terrain height for surface fields.** The readout's height row is the height *of a
+  pressure level*; a 2 m field would want the ground height instead, which `terrain.
+  height_at` already answers from ETOPO1 — but that is not "from model", so it was left out
+  rather than labelled as something it is not.
+* **A profile of the other 3-D fields by default.** The Profile tick is live on all of
+  them; only `rh` opens that way, as asked.
+* **Isobars on `pres_msl`.** One registry line (a hPa ladder of 1, 2, 4, 5, 10), not asked
+  for.
+
+## R9.10 Running it
+
+```bash
+venv/bin/python -m imsicon --topo on data/ICON_ENS_..._CAPE_ML.nc            # relief under any map
+venv/bin/python -m imsicon --level 500 --isoline-step 40 data/IE_..._geopot.nc  # a height chart, 4 dam
+venv/bin/python -m imsicon --units dam data/IE_..._geopot.nc
+venv/bin/python -m imsicon --point 31.8 35.2 data/IE_..._rh.nc                 # the profile, if geopot is beside it
+venv/bin/python -m imsicon --profile on --level 700 data/IE_..._temp.nc
+venv/bin/python tools/build_terrain.py --fetch                                 # rebuild the elevation bundle (dev only)
+```
+
+Toolbar row 2 gained **Topography** (after Wind barbs) and **Profile** (at the end); the
+Isolines slider's notches are now the field's own. The readout on a pressure-level map
+reads, in order: time, level, value, **height**, highest and lowest in the column.

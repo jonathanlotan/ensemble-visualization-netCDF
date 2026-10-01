@@ -4,12 +4,13 @@ from pathlib import Path
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .. import derived, geo, ingest, nc3, ncwrite, products, transform
+from .. import derived, geo, ingest, isolines, nc3, ncwrite, products, terrain, transform
 from ..dataset import EnsembleFile, level_stats, member_stats
 from ..fieldview import FieldView
 from . import colors, derivedialog, downloaddialog
 from .mapview import MapView
 from .plotview import PlotView
+from .profileview import ProfileView
 from .readout import ReadoutPanel
 
 FILE_FILTER = ('IMS ICON (*.nc *.nc.bz2);;NetCDF (*.nc);;Compressed (*.nc.bz2);;'
@@ -47,13 +48,54 @@ def _isoline_tooltip(ds):
     if interval is None:
         name = ds.display_name if ds is not None else 'This field'
         return (f'{name} is not contoured. Isolines are drawn on the temperature maps '
-                '(every 1 °C) and on a difference between two of them, such as T-Td '
-                '(every 0.5 °C).')
+                '(every 1 °C by default) and on a difference between two of them, such '
+                'as T-Td (every 0.5 °C).')
     units = f' {ds.units}' if ds.units else ''
-    return (f'Isolines every {interval.step:g}{units}, with every {interval.emphasis} '
-            f'({interval.step * interval.emphasis:g}{units}) drawn heavier. The interval '
-            'is fixed in degrees Celsius, so changing the display units moves the label, '
-            'never the lines.')
+    return (f'Draw contour lines over the map: currently every {interval.step:g}{units}, '
+            f'with every {interval.emphasis} ({interval.step * interval.emphasis:g}'
+            f'{units}) drawn heavier. Use the slider beside it to choose how close they '
+            'are.')
+
+
+def _ladder_of(ds):
+    """The spacings the slider offers for this view: degrees, or gpm on a height chart."""
+    ladder = getattr(ds, 'isoline_ladder', None) if ds is not None else None
+    return ladder or isolines.DEGREES
+
+
+def _isoline_step_tooltip(ds, live):
+    """The slider's own tooltip: the choice, and the one thing about it worth stating."""
+    ladder = _ladder_of(ds)
+    choices = ', '.join(f'{step:g}' for step in ladder.steps)
+    if not live:
+        name = getattr(ds, 'display_name', None) or 'this field'
+        why = ('Tick Isolines to space the lines on ' + name
+               if getattr(ds, 'isolines', None) is not None
+               else f'{name} is not contoured, so there is nothing to space')
+        return f'{why}. The spacings on offer are {choices} {ladder.unit}.'
+    example = (' (2 °C reads as 3.6 °F)' if ladder is isolines.DEGREES
+               else ' (40 gpm reads as 4 dam)')
+    return (f'How close the isolines are: {choices} {ladder.unit}. The spacing is fixed '
+            f'in {ladder.unit}, so switching the display units relabels the lines'
+            f'{example} rather than drawing a different set of them.')
+
+
+TOPO_TOOLTIP = ('Shade the terrain under the map: slopes facing away from a north-west '
+                'sun are darkened, flat ground and the sea are left alone, so the hills '
+                'show through whatever field is drawn over them. From the bundled ETOPO1 '
+                'elevation grid (1 arc-minute, NOAA, public domain), not from the model.')
+
+
+def _profile_tooltip(ds):
+    if ds is None or not getattr(ds.axis, 'is_pressure', False):
+        name = ds.display_name if ds is not None else 'This field'
+        return (f'{name} is not on pressure levels, so there is no column to draw as a '
+                'profile. The graph shows the point through time.')
+    return (f'Draw the column at the chosen point as a profile: {ds.display_name} across, '
+            'height up, one point per pressure level, at the time step on the slider. '
+            'The height is the geopotential height of each level from the run\'s geopot '
+            'file; without it the levels are drawn against pressure instead. Unticked, '
+            'the graph shows every level through time.')
 
 
 def _sort_tooltip(ds):
@@ -155,6 +197,17 @@ def _zero_is_the_floor(lo, hi):
                 and abs(lo) <= 1e-6 * (span or 1.0))
 
 
+def app_settings():
+    """The one place the app's preferences are opened.
+
+    A function rather than a line in `__init__` so the test suite can swap it for a
+    throw-away `.ini` (G47): on macOS `QSettings(org, app)` ignores `setDefaultFormat` and
+    goes straight to `~/Library/Preferences`, so without this seam a test run wiped the
+    developer's real preferences on every test -- the exact failure G25 was written for.
+    """
+    return QtCore.QSettings('IMS', 'IconEnsembleViewer')
+
+
 class ScanWorker(QtCore.QThread):
     """Background pass for the dataset-wide min/max (~0.6 s per 407 MB file)."""
     progressed = QtCore.Signal(int, int)
@@ -232,7 +285,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.resize(1500, 880)
         self.setAcceptDrops(True)
 
-        self.settings = QtCore.QSettings('IMS', 'IconEnsembleViewer')
+        self.settings = app_settings()
         self.ds = None
         self.t = 0
         # Index on the file's SECOND axis: an ensemble member, or a pressure level. One
@@ -268,6 +321,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.wind_overlay = None
         self._overlay_key = None
         self._overlay_builder = None
+        # R5.9: the contour spacing chosen per field, in canonical units. Per field
+        # because 2 degC on a temperature map and 2 degC on a depression are different
+        # readings, so flipping between them under "Map shows" must not carry one choice
+        # onto the other -- and must not throw the first one away either.
+        self._iso_steps = {}
+        # R9: the run's geopotential, held beside a pressure-level map so the readout can
+        # say how high the level shown is at the chosen point, and the profile can put
+        # each level at its real height. Same arrangement as the wind overlay: opened on
+        # demand, kept while it fits the map (`_overlay_shape`), dropped when it does not.
+        self.height_companion = None
+        self._height_key = None
+        self._height_builder = None
+        # R9: whether the right-hand panel is the profile or the time graph, per field.
+        self._profile_choices = {}
 
         self._build_ui()
         self._pending = path
@@ -322,8 +389,15 @@ class MainWindow(QtWidgets.QMainWindow):
         right_box.setContentsMargins(0, 0, 0, 0)
         self.readout = ReadoutPanel()
         right_box.addWidget(self.readout)
+        # Two readings of the same column share the panel: the time graph, and (R9) the
+        # vertical profile at one time. A stack rather than two panels, because the
+        # readout above describes whichever one is showing and must sit directly over it.
         self.plot = PlotView()
-        right_box.addWidget(self.plot, 1)
+        self.profile = ProfileView()
+        self.graph_stack = QtWidgets.QStackedWidget()
+        self.graph_stack.addWidget(self.plot)
+        self.graph_stack.addWidget(self.profile)
+        right_box.addWidget(self.graph_stack, 1)
         self.splitter.addWidget(right)
         self.splitter.setSizes([720, 780])
 
@@ -331,6 +405,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.map.cursorMoved.connect(self._on_map_cursor)
         self.plot.hovered.connect(self._on_hover)
         self.plot.timePicked.connect(self.set_time)
+        self.profile.levelHovered.connect(self._on_profile_hover)
+        self.profile.levelPicked.connect(self.set_level)
 
         self._build_toolbar()
         self.status = self.statusBar()
@@ -473,20 +549,65 @@ class MainWindow(QtWidgets.QMainWindow):
         self.barbs_check.toggled.connect(self._on_barbs_toggled)
         row2.addWidget(self.barbs_check)
 
+        # R9: shaded relief under the map. Off by default -- it is a backdrop, and a
+        # backdrop that appears unasked competes with the field -- and remembered, because
+        # a reader who wants the hills wants them on every map, not on this one.
+        self.topo_check = QtWidgets.QCheckBox('  Topography')
+        self.topo_check.setEnabled(terrain.available())
+        self.topo_check.setToolTip(
+            TOPO_TOOLTIP if terrain.available() else
+            'The bundled elevation grid (imsicon/mapdata/levant_etopo1.npz) is missing, '
+            'so there is no relief to draw.')
+        remembered = str(self.settings.value('display/topography', 'false')).lower()
+        self.topo_check.setChecked(terrain.available() and remembered in ('true', '1'))
+        self.topo_check.toggled.connect(self._on_topo_toggled)
+        row2.addWidget(self.topo_check)
+
         # R5. Isolines are on by default where a field has them -- they are what makes a
         # smooth colour ramp readable as numbers -- while Sort is off, because it hides
         # part of the map and that has to be asked for.
         self.isolines_check = QtWidgets.QCheckBox('  Isolines')
         self.isolines_check.setChecked(True)
         self.isolines_check.setEnabled(False)
-        self.isolines_check.toggled.connect(lambda _: self.refresh_map())
+        self.isolines_check.toggled.connect(self._on_isolines_toggled)
         row2.addWidget(self.isolines_check)
+
+        # R5.9: how close the lines are. A slider rather than a combo because the choice
+        # is one-dimensional and ordered -- "closer" and "further apart" is the whole of
+        # it -- and because a forecaster tries two or three spacings against one frame
+        # before settling, which is a drag rather than three trips through a menu.
+        self.isoline_step_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.isoline_step_slider.setRange(0, len(isolines.STEP_CHOICES) - 1)
+        self.isoline_step_slider.setValue(isolines.STEP_CHOICES.index(1.0))
+        self.isoline_step_slider.setSingleStep(1)
+        self.isoline_step_slider.setPageStep(1)
+        self.isoline_step_slider.setTickPosition(QtWidgets.QSlider.TickPosition.TicksBelow)
+        self.isoline_step_slider.setTickInterval(1)
+        self.isoline_step_slider.setFixedWidth(96)
+        self.isoline_step_slider.setEnabled(False)
+        self.isoline_step_slider.valueChanged.connect(self._on_isoline_step_changed)
+        row2.addWidget(self.isoline_step_slider)
+        # Fixed width and left-aligned, for the reason the readout's numbers are: this
+        # label changes while the slider is being dragged, and a label that resizes as it
+        # changes drags the whole toolbar row about under the cursor.
+        self.isoline_step_label = QtWidgets.QLabel('')
+        self.isoline_step_label.setMinimumWidth(64)
+        row2.addWidget(self.isoline_step_label)
 
         self.sort_check = QtWidgets.QCheckBox('  Sort')
         self.sort_check.setChecked(False)
         self.sort_check.setEnabled(False)
         self.sort_check.toggled.connect(self._on_sort_toggled)
         row2.addWidget(self.sort_check)
+
+        # R9: the right-hand panel as a vertical profile. Enabled on a column of pressure
+        # levels, ticked by default on relative humidity -- the field it was asked for --
+        # and remembered per field within the window, like the isoline spacing.
+        self.profile_check = QtWidgets.QCheckBox('  Profile')
+        self.profile_check.setChecked(False)
+        self.profile_check.setEnabled(False)
+        self.profile_check.toggled.connect(self._on_profile_toggled)
+        row2.addWidget(self.profile_check)
 
         self.units_warning = QtWidgets.QLabel('')
         self.units_warning.setStyleSheet('color:#a05000;')
@@ -617,6 +738,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.map.set_dataset(ds, geo.overlay_for(near or ds.path))
         self.plot.set_dataset(ds)
+        self.profile.set_dataset(ds)
         self.readout.configure(ds)
         # Before the colormap, which can trigger the first redraw: `refresh_map` reads the
         # aggregation combo, and the previous file's mode must not draw this file's frame.
@@ -640,6 +762,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._sync_barbs_check()
         self._sync_isolines_check()
         self._sync_sort_check()
+        self._sync_topo()
+        self._sync_profile_check()
+        self._sync_height_companion()
 
         self.slider.blockSignals(True)
         self.slider.setRange(0, ds.n_times - 1)
@@ -979,6 +1104,7 @@ class MainWindow(QtWidgets.QMainWindow):
         lo, hi = value_range
         self.readout.span = hi - lo
         self.plot.set_yrange(min(0.0, lo) if lo >= 0 else lo, hi)   # A1: pinned to dataset max
+        self.profile.set_xrange(min(0.0, lo) if lo >= 0 else lo, hi)
         self.refresh_map()
 
     def _stop_scan(self):
@@ -1032,7 +1158,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # After the frame, never before: the title names the interval the lines were
         # actually drawn at, which `levels_for` may have coarsened (G35).
         notes = [note for note in (self._push_wind(mode), self._isoline_note(interval),
-                                   self._sort_note(sort)) if note]
+                                   self._sort_note(sort), self._terrain_note()) if note]
         self.map.set_title('  |  '.join(
             [f'{self.ds.display_name}{units} - {what} - {self.ds.label_for(self.t)}']
             + notes))
@@ -1046,6 +1172,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.map.isoline_step > interval.step * 1.000001:
             drawn += f' (too many lines at {interval.step:g}{units})'
         return drawn
+
+    def _terrain_note(self):
+        """`terrain shading` -- said in the title because the shadows change what a colour
+        looks like, and a reader of a screenshot has to know they are not the field."""
+        return 'terrain shading' if self.map.terrain_drawn else ''
 
     def _sort_note(self, sort):
         """`sorted: colour only below 2 °C`. What the colours mean is on the colorbar
@@ -1120,11 +1251,76 @@ class MainWindow(QtWidgets.QMainWindow):
                                                      rows, cols))
         return source.barb_label(mode, over=self.ds.display_name if overlay else None)
 
+    def _on_isolines_toggled(self, _checked):
+        """The tick decides whether the lines are drawn at all; the slider follows it,
+        because a spacing control that is live while nothing is spaced is a control that
+        does nothing when you move it."""
+        self._sync_isoline_step_slider()
+        self.refresh_map()
+
+    def _on_isoline_step_changed(self, index):
+        """R5.9: the chosen spacing, in canonical degrees, pushed onto the view.
+
+        Onto the *view*, not into a variable here, for the reason every other transform
+        lives there: the map, the title and the tooltip then all read one number, and the
+        affine that turns 2 °C into 3.6 °F is applied in exactly one place (G15).
+        """
+        if self.ds is None:
+            return
+        ladder = _ladder_of(self.ds)
+        index = max(0, min(int(index), len(ladder.steps) - 1))
+        step = ladder.canonical(ladder.steps[index])
+        if not self.ds.set_isoline_step(step):
+            return
+        self._iso_steps[self.ds.field] = step
+        self._sync_isoline_step_slider()
+        self.refresh_map()
+
     def _sync_isolines_check(self):
-        """Disabled, not hidden -- the same rule Rate and Wind barbs follow."""
+        """Disabled, not hidden -- the same rule Rate and Wind barbs follow.
+
+        The spacing this window remembers for the field is pushed onto the view first, so
+        that flipping between T_2M and T-Td under "Map shows" gives each of them back the
+        spacing it was last read at rather than the other one's.
+        """
+        remembered = self._iso_steps.get(getattr(self.ds, 'field', None))
+        if remembered is not None and self.ds is not None:
+            self.ds.set_isoline_step(remembered)
         interval = getattr(self.ds, 'isolines', None)
         self.isolines_check.setEnabled(interval is not None)
         self.isolines_check.setToolTip(_isoline_tooltip(self.ds))
+        self._sync_isoline_step_slider()
+
+    def _sync_isoline_step_slider(self):
+        """Put the slider where the view is contoured and say the spacing on screen.
+
+        The label is in DISPLAY units while the slider's notches are canonical degrees,
+        which is not a contradiction but the point of it: one notch is one reading of the
+        map, and the label says what that reading is called in the units the colorbar and
+        the readout are using.
+        """
+        interval = getattr(self.ds, 'isolines', None)
+        canonical = getattr(self.ds, 'isoline_step', None) if self.ds is not None else None
+        live = interval is not None and self.isolines_check.isChecked()
+        self.isoline_step_slider.setEnabled(live)
+        # The notches are the FIELD's ladder (R9): five degree spacings on a temperature,
+        # seven gpm spacings on a height chart. Re-ranged under blocked signals, because
+        # a shorter range clamps the value and would otherwise fire a choice nobody made.
+        ladder = _ladder_of(self.ds)
+        self.isoline_step_slider.blockSignals(True)
+        self.isoline_step_slider.setRange(0, len(ladder.steps) - 1)
+        if canonical:
+            # blockSignals, not a guard on the value: a field whose registry interval is
+            # already where the slider sits would otherwise leave the view unset while
+            # `_iso_steps` says it was chosen.
+            self.isoline_step_slider.setValue(ladder.index_of(canonical))
+        self.isoline_step_slider.blockSignals(False)
+        units = f' {self.ds.units}' if self.ds is not None and self.ds.units else ''
+        self.isoline_step_label.setText(
+            f'{interval.step:g}{units}' if live and interval is not None else '')
+        tip = _isoline_step_tooltip(self.ds, live)
+        self.isoline_step_slider.setToolTip(tip)
+        self.isoline_step_label.setToolTip(tip)
 
     def _sync_sort_check(self):
         """Sort follows the field: available on T-Td, and cleared on anything else.
@@ -1318,6 +1514,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.time_label.setText(self.ds.label_for(t))
         self.plot.set_time(t)
         self.refresh_map()
+        self._refresh_profile()
         self._update_readout(t, hovering=False)
 
     def select_point(self, iy, ix):
@@ -1333,21 +1530,188 @@ class MainWindow(QtWidgets.QMainWindow):
         self.readout.set_point(lat, lon)
         if self.ds.value_range is None:
             self.plot.set_yrange(float(np.nanmin(series)), float(np.nanmax(series)))
+        self._refresh_profile()
         self._update_readout(self.t, hovering=False)
 
-    def _update_readout(self, t, hovering):
+    def _update_readout(self, t, hovering, level=None):
         """The six ensemble statistics, or the column's reading at the chosen level.
 
         Which one is decided by the file's axis, in one place, so the panel and the
-        numbers in it can never disagree about what they are describing.
+        numbers in it can never disagree about what they are describing. `level` lets a
+        hover over the profile report another level than the map's, the way a hover over
+        the time graph reports another time.
         """
         if self.ds is None or self.point is None or self.plot.series is None:
             return
         t = int(np.clip(t, 0, self.ds.n_times - 1))
         values = self.plot.series[t]
-        stats = (member_stats(values) if self.ds.axis.aggregatable else
-                 level_stats(values, self.ds.member_labels, self.level))
+        position = self.level if level is None else int(level)
+        if self.ds.axis.aggregatable:
+            stats = member_stats(values)
+        else:
+            stats = level_stats(values, self.ds.member_labels, position)
+            stats['height'] = self._height_at(t, position)
         self.readout.show_stats(self.ds.label_for(t), stats, hovering)
+
+    # ---- R9: the vertical profile --------------------------------------------------------
+    def _sync_profile_check(self):
+        """Live on a column of pressure levels; ticked by default on relative humidity.
+
+        Per field within the window, like the isoline spacing: a reader who switched the
+        temperature back to the time graph should not find the humidity switched too.
+        """
+        ds = self.ds
+        column = ds is not None and bool(getattr(ds.axis, 'is_pressure', False))
+        remembered = self._profile_choices.get(ds.field) if ds is not None else None
+        wanted = column and (remembered if remembered is not None
+                             else products.field_key(ds.field) == 'RH')
+        self.profile_check.blockSignals(True)
+        self.profile_check.setEnabled(column)
+        self.profile_check.setChecked(bool(wanted))
+        self.profile_check.blockSignals(False)
+        self.profile_check.setToolTip(_profile_tooltip(ds))
+        self._show_graph()
+
+    def _on_profile_toggled(self, on):
+        if self.ds is not None:
+            self._profile_choices[self.ds.field] = bool(on)
+        self._show_graph()
+
+    @property
+    def profile_shown(self):
+        return self.graph_stack.currentIndex() == 1
+
+    def _show_graph(self):
+        """Put the profile or the time graph in front, and draw whichever it is."""
+        column = self.ds is not None and bool(getattr(self.ds.axis, 'is_pressure', False))
+        self.graph_stack.setCurrentIndex(1 if column and self.profile_check.isChecked()
+                                         else 0)
+        self._refresh_profile()
+
+    def _refresh_profile(self):
+        """The column at the chosen point and the current time, at its real heights."""
+        if not self.profile_shown or self.ds is None or self.plot.series is None:
+            return
+        t = int(np.clip(self.t, 0, self.ds.n_times - 1))
+        values = self.plot.series[t]
+        heights = self._height_column(t)
+        pressures = (np.asarray(self.ds.axis.values, dtype=float)
+                     if self.ds.axis.is_pressure else None)
+        units = self.height_companion.units if self.height_companion is not None else 'gpm'
+        self.profile.set_profile(values, heights, pressures, level=self.level,
+                                 height_units=units)
+
+    def _on_profile_hover(self, index):
+        """A hover over the profile names a LEVEL, as one over the time graph names a time."""
+        self._update_readout(self.t, hovering=index >= 0,
+                             level=None if index < 0 else index)
+
+    # ---- R9: the geopotential height beside the value ------------------------------------
+    def _height_request(self):
+        """A request for the run's geopotential, when the map is a column that is not the
+        geopotential itself and the file is on disk; else None."""
+        if self.base_ds is None or self.ds is None:
+            return None
+        if not getattr(self.ds.axis, 'is_pressure', False):
+            return None
+        if products.field_key(self.ds.field) == 'GEOPOT':
+            return None
+        family = self.base_ds.family or products.ENSEMBLE
+        field = family.roles.get('height')
+        if not field:
+            return None
+        run = f'{self.base_ds.run_init:%Y%m%d%H}'
+        on_disk = ingest.fields_of_run(ingest.scan_for_fields(self._search_roots()),
+                                       family, run)
+        if field not in on_disk:
+            return None
+        return derivedialog.DerivedRequest(derivedialog.FIELD, [on_disk[field]],
+                                           f'Heights from {field}')
+
+    def _height_reason(self):
+        """Why the height row reads `--`, for its tooltip."""
+        if self.ds is None or not getattr(self.ds.axis, 'is_pressure', False):
+            return 'Only a column of pressure levels has a level to give the height of.'
+        family = (self.base_ds.family if self.base_ds is not None else None) \
+            or products.ENSEMBLE
+        field = family.roles.get('height') or 'geopot'
+        return (f'The run\'s {field} is not on disk, so the height of this level is not '
+                f'known. Download it (Download... -> {field}) and the height appears here.')
+
+    def _sync_height_companion(self):
+        """Open the run's geopotential beside a pressure-level map, if it is there.
+
+        Automatic rather than opt-in, unlike the wind overlay: the height is a reading of
+        the map on screen, not a second quantity drawn over it, and it was asked for next
+        to the value. Off the UI thread all the same -- a `.nc.bz2` is 16 s.
+        """
+        request = self._height_request()
+        if request is None:
+            self.height_companion, self._height_key = None, None
+            self.readout.set_height_source('', note=self._height_reason())
+            return
+        if self.height_companion is not None and self._height_key == self._overlay_shape():
+            self.readout.set_height_source(self.height_companion.units, note='')
+            return
+        self.height_companion, self._height_key = None, None
+        if self._height_builder is not None and self._height_builder.isRunning():
+            return
+        self.readout.set_height_source('', note='Opening the run\'s geopot for the heights...')
+        self.status_right.setText('opening geopot for the heights...')
+        self._height_builder = derivedialog.BuildWorker(request, dict(self.opened), self)
+        self._height_builder.finished_view.connect(self._on_height_built)
+        self._height_builder.failed.connect(self._on_height_failed)
+        self._height_builder.start()
+
+    def _on_height_built(self, view):
+        """Accept the geopotential only if it fits the map on screen (G45 again)."""
+        self._show_standing_note()
+        if view is None or self.ds is None:
+            return
+        try:
+            derived.check_pairable(self.ds, view)
+        except derived.PairError as exc:
+            self.readout.set_height_source('', note=(
+                f'The run\'s {view.field} cannot be read against this map:\n\n{exc}'))
+            return
+        view.set_units('gpm')
+        self.opened.setdefault(Path(view.path), view)
+        self.height_companion = view
+        self._height_key = self._overlay_shape()
+        self.readout.set_height_source(view.units, note='')
+        self._refresh_profile()
+        self._update_readout(self.t, hovering=False)
+
+    def _on_height_failed(self, message):
+        self._show_standing_note()
+        self.readout.set_height_source('', note=f'The heights could not be read:\n{message}')
+
+    def _height_column(self, t):
+        """(n_levels,) geopotential heights at the chosen point and time, or None."""
+        if self.height_companion is None or self.point is None or self.ds is None:
+            return None
+        try:
+            series = self.height_companion.series(*self.point)
+        except Exception:
+            return None
+        if series.ndim != 2 or series.shape[0] <= t or series.shape[1] != self.ds.n_members:
+            return None
+        return np.asarray(series[t], dtype=float)
+
+    def _height_at(self, t, level):
+        column = self._height_column(t)
+        if column is None or not (0 <= int(level) < column.size):
+            return None
+        return float(column[int(level)])
+
+    # ---- R9: shaded relief ---------------------------------------------------------------
+    def _sync_topo(self):
+        self.map.set_terrain(self.topo_check.isChecked())
+
+    def _on_topo_toggled(self, on):
+        self.settings.setValue('display/topography', bool(on))
+        self._sync_topo()
+        self.refresh_map()                  # the title says when the shading is on
 
     # ---- signals ---------------------------------------------------------------
     def _on_hover(self, t):
@@ -1450,6 +1814,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.level_combo.setCurrentIndex(position)
             self.level_combo.blockSignals(False)
         self.plot.set_level(index)
+        self.profile.set_level(index)
         if self.agg_combo.currentData() == 'member':
             self.refresh_map()
         self._update_readout(self.t, hovering=False)
@@ -1502,7 +1867,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status_left.setText(ds.summary())
         self.plot.getAxis('left').enableAutoSIPrefix(False)   # G12: never 'kJ kg-1'
         self.plot.setLabel('left', ds.display_name, units=ds.units or None)
+        self.profile.set_dataset(ds)        # relabelled; select_point below redraws it
         self.readout.configure(ds)          # select_point below restores the point label
+        self.readout.set_height_source(
+            self.height_companion.units if self.height_companion is not None else '',
+            note='' if self.height_companion is not None else self._height_reason())
         # The interval and the sort band are stated in the units on screen, so both
         # tooltips are stale the moment those change.
         self._sync_isolines_check()
@@ -1572,7 +1941,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def closeEvent(self, ev):
         self._stop_scan()
         for worker in (self.decompressor, self.builder, self.writer,
-                       self._overlay_builder):
+                       self._overlay_builder, self._height_builder):
             if worker is not None and worker.isRunning():
                 worker.cancel()
                 worker.wait(3000)
