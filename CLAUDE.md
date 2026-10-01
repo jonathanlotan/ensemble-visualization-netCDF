@@ -2844,3 +2844,27 @@ Verified by 7 new tests (`test_config.py`, `test_ui_settings.py`): the map and t
 read different ranges at once, both follow a units change, the toolbar still overrides,
 a map range alone leaves the graph on the dataset range, and the dialog round-trips it.
 End to end on the real CAPE file: map 0–1000 J kg⁻¹, graph 0–3000.
+
+---
+
+# Release 14 — searching the download list
+
+Requested 2026-10-01: *for the download, add an option to search for a map, so scrolling
+isn't the only option.*
+
+**Download…** has a **Search** box above the map list (`Ctrl+F` / `Cmd+F` focuses it,
+`Esc` clears it). It hides every row that does not contain *all* the words typed, matched
+case-insensitively against the menu name, the field, the Levels and Size columns and the
+product note — with and without underscores, so `tot prec`, `tot_prec` and `precip` all
+find `TOT_PREC`, and `u10m` finds `U_10M`. A count beside it says `4 of 15 maps`.
+
+* **It only hides.** A ticked map stays ticked, and downloads, while filtered out; the
+  count says so (`2 ticked maps hidden`), so a filter cannot quietly change what is fetched.
+* The filter is re-applied when the run or the product changes, so it survives both.
+* **Enter ticks the map when exactly one is left**, and does nothing otherwise. It is taken
+  by an event filter on the search box, not `returnPressed`: a `QLineEdit` lets Enter
+  through to the dialog, whose default button is **Connect**, so a search would have
+  reconnected (or, with the Download button focused, started a download).
+  `test_enter_in_the_search_never_presses_the_dialog_s_buttons` fails without the filter.
+
+Verified by `tests/test_ui_download.py` (8).

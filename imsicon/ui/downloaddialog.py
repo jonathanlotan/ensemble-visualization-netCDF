@@ -187,6 +187,33 @@ class DownloadDialog(QtWidgets.QDialog):
         row.addWidget(self.wind_button)
         outer.addLayout(row)
 
+        # Search, so a map can be found by typing rather than by scrolling 50 rows.
+        # It only HIDES rows: a ticked map stays ticked (and downloads) while filtered out.
+        search_row = QtWidgets.QHBoxLayout()
+        search_row.addWidget(QtWidgets.QLabel('Search:'))
+        self.search_edit = QtWidgets.QLineEdit()
+        self.search_edit.setPlaceholderText('e.g. cape, precip, wind, temp, 2m, levels')
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.setToolTip(
+            'Shows only the maps whose name, field or description contain every word '
+            'typed. Ticked maps stay ticked while hidden. Enter ticks the map when only '
+            'one is left; Esc clears the search.')
+        self.search_edit.textChanged.connect(lambda _: self._apply_search())
+        # Enter is taken here rather than through returnPressed: a QLineEdit lets Enter
+        # through to the dialog, whose default button would then connect or download.
+        self.search_edit.installEventFilter(self)
+        search_row.addWidget(self.search_edit, 1)
+        self.match_label = QtWidgets.QLabel('')
+        self.match_label.setStyleSheet('color:#666;')
+        search_row.addWidget(self.match_label)
+        outer.addLayout(search_row)
+        QtGui.QShortcut(QtGui.QKeySequence.StandardKey.Find, self,
+                        activated=lambda: (self.search_edit.setFocus(),
+                                           self.search_edit.selectAll()))
+        QtGui.QShortcut(QtGui.QKeySequence('Escape'), self.search_edit,
+                        activated=self.search_edit.clear,
+                        context=QtCore.Qt.ShortcutContext.WidgetShortcut)
+
         self.field_list = QtWidgets.QTreeWidget()
         self.field_list.setHeaderLabels(['Map', 'Field', 'Levels', 'Size', 'On disk'])
         self.field_list.setRootIsDecorated(False)
@@ -319,7 +346,54 @@ class DownloadDialog(QtWidgets.QDialog):
         for column in (1, 2, 3, 4):
             self.field_list.resizeColumnToContents(column)
         self.field_list.blockSignals(False)
+        self._apply_search()
         self._refresh_footer()
+
+    @staticmethod
+    def _haystack(item):
+        text = ' '.join([item.text(c) for c in range(item.columnCount())]
+                        + [item.toolTip(0)]).lower()
+        # 'tot prec' finds TOT_PREC, and 'u10m' finds U_10M.
+        return f'{text} {text.replace("_", " ")} {text.replace("_", "")}'
+
+    def visible_items(self):
+        return [item for item in self._items() if not item.isHidden()]
+
+    def _apply_search(self):
+        """Hide the rows that do not contain every word of the search."""
+        words = self.search_edit.text().lower().split()
+        items = self._items()
+        for item in items:
+            haystack = self._haystack(item)
+            item.setHidden(not all(word in haystack for word in words))
+        shown = len(self.visible_items())
+        if not words:
+            self.match_label.setText('')
+        else:
+            hidden_ticked = sum(1 for item in items if item.isHidden()
+                                and item.checkState(0) == QtCore.Qt.CheckState.Checked)
+            self.match_label.setText(
+                f'{shown} of {len(items)} maps'
+                + (f' ({hidden_ticked} ticked map{"s" if hidden_ticked != 1 else ""} '
+                   'hidden)' if hidden_ticked else '')
+                if shown else 'no map matches')
+
+    def eventFilter(self, watched, event):
+        if (watched is getattr(self, 'search_edit', None)
+                and event.type() == QtCore.QEvent.Type.KeyPress
+                and event.key() in (QtCore.Qt.Key.Key_Return, QtCore.Qt.Key.Key_Enter)):
+            self._tick_single_match()
+            return True
+        return super().eventFilter(watched, event)
+
+    def _tick_single_match(self):
+        """Enter on a search that leaves exactly one map ticks (or unticks) it."""
+        shown = self.visible_items()
+        if len(shown) == 1:
+            item = shown[0]
+            item.setCheckState(0, QtCore.Qt.CheckState.Unchecked
+                               if item.checkState(0) == QtCore.Qt.CheckState.Checked
+                               else QtCore.Qt.CheckState.Checked)
 
     def _items(self):
         return [self.field_list.topLevelItem(i)
